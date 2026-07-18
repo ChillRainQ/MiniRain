@@ -1,10 +1,11 @@
 import os
+
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 from dataset.datasets import PretrainDataset
-from train.train_util import init_model, Logger
+from train.train_util import init_model, Logger, ScalingLawLogger
 from train.train_util import is_main_process
 from contextlib import nullcontext
 import argparse
@@ -19,7 +20,7 @@ from train.train_util import get_lr, init_distributed_mode, setup_seed, get_chec
 
 
 def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, muon, adam, epoch:int, epochs:int,
-                learning_rate:float, device: str, loader, iters, start_step: int = 0, wandb=None):
+                learning_rate:float, device: str, loader, iters, start_step: int = 0, wandb=None, logger=None):
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -76,6 +77,11 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 f'lr_muon: {muon_lr:.8f}, lr_adam: {adam_lr:.8f}, eta: {eta_min:.1f}min'
             )
 
+            # ========== 新增：记录 Scaling Law 数据（仅主进程） ==========
+            if logger is not None and is_main_process():
+                logger.log(step, current_loss)
+            # ========== 新增结束 ==========
+
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -128,7 +134,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
         if muon is not None:
             muon.zero_grad(set_to_none=True)
         adam.zero_grad(set_to_none=True)
-        
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../outputs", help="模型保存目录")
@@ -148,41 +154,68 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_loop', default=0, type=int, choices=[0, 1], help="是否使用LOOP架构（0=否，1=是）")
+    parser.add_argument('--use_bounce', default=0, type=int, choices=[0, 1], help="是否使用Bounce架构（0=否，1=是）")
+    parser.add_argument('--loop_start', type=int , help="Loop起始层")
+    parser.add_argument('--loop_end', type=int, help="Loop结束层")
+    parser.add_argument('--max_loop_iter', type=int, help="Loop最大迭代次数")
     parser.add_argument("--data_path", type=str, default="../data/pretrain_t2t.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniRain-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    # ========== 新增：Scaling Law 日志参数 ==========
+    parser.add_argument("--scaling_log_dir", type=str, default="../train_logs", help="Scaling Law 分析日志保存目录")
+
     args = parser.parse_args()
-    
+
     # 训练环境初始化
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # 训练环境检查
     os.makedirs(args.save_dir, exist_ok=True)
-    config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers, 
-                        use_moe=bool(args.use_moe), use_loop=bool(args.use_loop))
+    config = RainConfig(hidden_size=int(args.hidden_size), n_hidden_layers=int(args.num_hidden_layers),
+                        use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
+                        use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
+                        max_loop_iter=int(args.max_loop_iter))
     print(config)
 
     ckp_data = get_checkpoint(config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
-    # 混合精度 
+
+    # 混合精度
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # 模型...abs
-    model, tokenizer = init_model(config, 
+
+    # 模型...
+    model, tokenizer = init_model(config,
                                   from_weight=args.from_weight, device=args.device)
+
+    # ========== 新增：计算参数量并初始化 Scaling Law Logger ==========
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    Logger(f'[ScalingLaw] 模型参数量: {model_params/1e6:.2f}M, '
+           f'全局batch_size: {args.batch_size * world_size}, '
+           f'每步tokens: {args.batch_size * world_size * args.max_seq_len}')
+
+    scaling_logger = ScalingLawLogger(
+        log_dir=args.scaling_log_dir,
+        model_params=model_params,
+        model_name=args.save_weight,
+        batch_size=args.batch_size,
+        seq_len=args.max_seq_len,
+        world_size=world_size
+    )
+    # ========== 新增结束 ==========
+
     pretrain_dataset = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(pretrain_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
     muon = optim.Muon(get_muon_params(model), lr=args.learning_rate * 30)
     adam = optim.AdamW(get_adam_params(model), lr=args.learning_rate)
-    
+
     # 断点恢复
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -192,14 +225,14 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-        
+
     # 多卡支持与模型编译
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
-        
+
     # run
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
@@ -207,13 +240,16 @@ if __name__ == "__main__":
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(pretrain_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
-                        args.learning_rate, args.device, loader, len(loader) + skip, start_step)
+                        args.learning_rate, args.device, loader, len(loader) + skip, start_step,
+                        logger=scaling_logger)  # 传入 logger
         else:
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
-                        args.learning_rate, args.device, loader, len(loader), 0)
+                        args.learning_rate, args.device, loader, len(loader), 0,
+                        logger=scaling_logger)  # 传入 logger
+    scaling_logger.save()
     print("MiniRain pretrain done!")
     # 保存最终结果
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model

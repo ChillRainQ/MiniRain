@@ -18,7 +18,7 @@ class MiniRainBlock(nn.Module):
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size, bias=False))
-        
+
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         res = hidden_states
         hidden_states, past_key_value = self.attn(

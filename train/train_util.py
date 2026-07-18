@@ -3,11 +3,13 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from architectures.rain import MiniRainForCausalLM
 import math
+import csv
 import os
 import numpy as np
 import torch
 import random
 import torch.distributed as dist
+
 
 
 def save(state_dict, weight_path):
@@ -189,3 +191,107 @@ class LMForRewardModel:
         ]
         score = self.model.get_score(self.tokenizer, eval_messages)
         return max(min(score, 3.0), -3.0)
+
+
+class ScalingLawLogger:
+    """
+    为 Chinchilla-style Scaling Law 分析保存训练日志。
+    自动将多模型数据合并到标准格式 (loss.csv, tokens.csv)。
+    列名格式: loss-P{参数量}M-{模型名}，与 Chinchilla 分析脚本兼容。
+    """
+    def __init__(self, log_dir: str, model_params: int, model_name: str,
+                 batch_size: int, seq_len: int, world_size: int = 1):
+        self.log_dir = log_dir
+        self.model_params = model_params
+        self.model_name = model_name
+        # 每步处理的全局 token 数（数据并行下乘以 world_size）
+        self.tokens_per_step = batch_size * seq_len * world_size
+        self.records = []  # [(step, loss, tokens), ...]
+        os.makedirs(log_dir, exist_ok=True)
+
+        # 列名必须包含 -P{params}M- 以便 Chinchilla 脚本解析
+        params_m = model_params / 1e6
+        self.col_name = f"loss-P{params_m:.2f}M-{model_name}"
+
+    def log(self, step: int, loss: float):
+        """在训练循环中调用，记录当前 step 的 loss"""
+        tokens = step * self.tokens_per_step
+        self.records.append((step, loss, tokens))
+
+    def save(self):
+        """训练结束后调用，合并到标准 CSV 格式"""
+        if not self.records or not is_main_process():
+            return
+
+        loss_path = os.path.join(self.log_dir, 'loss.csv')
+        tokens_path = os.path.join(self.log_dir, 'tokens.csv')
+
+        # 当前模型数据: step -> (loss, tokens)
+        step_data = {step: (loss, tokens) for step, loss, tokens in self.records}
+
+        def read_csv(path):
+            if not os.path.exists(path):
+                return ['step'], {}
+            with open(path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                data = {}
+                for row in reader:
+                    if not row or not row[0].strip():
+                        continue
+                    try:
+                        step = int(row[0])
+                        data[step] = row[1:]
+                    except ValueError:
+                        continue
+                return header, data
+
+        # 读取并更新 loss.csv
+        loss_header, loss_data = read_csv(loss_path)
+        if self.col_name not in loss_header:
+            loss_header.append(self.col_name)
+
+        all_steps = sorted(set(loss_data.keys()) | set(step_data.keys()))
+
+        with open(loss_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(loss_header)
+            for step in all_steps:
+                row = [step]
+                if step in loss_data:
+                    existing = loss_data[step]
+                    # 补齐已有列（防止空值错位）
+                    row.extend(existing + [''] * (len(loss_header) - 1 - len(existing)))
+                else:
+                    row.extend([''] * (len(loss_header) - 1))
+                # 填入当前模型数据（最后一列）
+                if step in step_data:
+                    row[-1] = f"{step_data[step][0]:.6f}"
+                writer.writerow(row)
+
+        # 读取并更新 tokens.csv
+        tokens_header, tokens_data = read_csv(tokens_path)
+        if self.col_name not in tokens_header:
+            tokens_header.append(self.col_name)
+
+        all_steps = sorted(set(tokens_data.keys()) | set(step_data.keys()))
+
+        with open(tokens_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(tokens_header)
+            for step in all_steps:
+                row = [step]
+                if step in tokens_data:
+                    existing = tokens_data[step]
+                    row.extend(existing + [''] * (len(tokens_header) - 1 - len(existing)))
+                else:
+                    row.extend([''] * (len(tokens_header) - 1))
+                if step in step_data:
+                    row[-1] = f"{step_data[step][1]:.0f}"
+                writer.writerow(row)
+
+        Logger(f'[ScalingLaw] 已保存 {self.col_name} 到 {self.log_dir}')
+        Logger(f'[ScalingLaw] 共 {len(self.records)} 条记录，'
+               f'参数量: {self.model_params/1e6:.2f}M, '
+               f'每步tokens: {self.tokens_per_step}')
+# ========== 新增结束 ==========

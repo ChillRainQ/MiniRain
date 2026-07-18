@@ -38,11 +38,7 @@ class MiniRainModel(nn.Module):
         self.vocab_size, self.n_hidden_layers = self.config.vocab_size, self.config.n_hidden_layers
         self.embed_tokens = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
-        
-        # self.first = MiniRainBlock(1, self.config)
         self.layers = nn.ModuleList([MiniRainBlock(i, self.config) for i in range(self.n_hidden_layers)])
-        # self.last = MiniRainBlock(self.n_hidden_layers, self.config)
-        
         self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
@@ -61,42 +57,20 @@ class MiniRainModel(nn.Module):
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
-        for layer, past_key_value in zip(self.layers, past_key_values):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            presents.append(present)
-        
-        # hidden_states, present = self.first(
-        #     hidden_states,
-        #         position_embeddings,
-        #         past_key_value=past_key_values[0],
-        #         use_cache=use_cache,
-        #         attention_mask=attention_mask
-        # )
-        # presents.append(present)
-        # for i, layer in enumerate(self.middle):
-        #     hidden_states, present = layer(
-        #         hidden_states,
-        #         position_embeddings,
-        #         past_key_value=past_key_values[i + 1],
-        #         use_cache=use_cache,
-        #         attention_mask=attention_mask,
-        #     )
-        #     presents.append(present)
-        # hidden_states, present = self.last(
-        #     hidden_states,
-        #         position_embeddings,
-        #         past_key_value=past_key_values[-1],
-        #         use_cache=use_cache,
-        #         attention_mask=attention_mask
-        # )
-        # presents.append(present)
-        
+        if self.config.use_loop:
+            ...
+        elif self.config.use_bounce:
+            ...
+        else:
+            for layer, past_key_value in zip(self.layers, past_key_values):
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask
+                )
+                presents.append(present)
         hidden_states = self.norm(hidden_states)
         aux_loss = hidden_states.new_zeros(1).squeeze()
         return hidden_states, presents, aux_loss

@@ -48,8 +48,8 @@ class GroupQueryAttention(nn.Module):
         self.wv = nn.Linear(config.hidden_size, self.n_key_value_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_attn_heads * self.head_dim, config.hidden_size, bias=False)
         
-        self.q_norm = norm.create_norm(config.norm_type, NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
-        self.k_norm = norm.create_norm(config.norm_type, NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.q_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.k_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
         self.attn_dropout = nn.Dropout(config.n_dropout)
         self.resid_dropout = nn.Dropout(config.n_dropout)
         self.dropout = config.n_dropout
