@@ -10,18 +10,22 @@ model_type: dict[int, str] = {
 }
 
 class RainConfig(PretrainedConfig):
-    def __init__(self, hidden_size=768, n_hidden_layers=8, 
+    def __init__(self, hidden_size=768, n_hidden_layers=8,
                  use_moe=False, use_loop=False, use_bounce=False,  **kwargs):
         super().__init__(**kwargs)
         if use_moe:
             self.type_id = 2
             if use_loop:
                 self.type_id = 4
+            elif use_bounce:
+                self.type_id = 5
         else:
             self.type_id = 1
             if use_loop:
                 self.type_id = 3
-        self.vocab_size: int = 6400
+            elif use_bounce:
+                self.type_id = 6
+        self.vocab_size: int = int(kwargs.get("vocab_size", 6400))
         self.hidden_size: int = hidden_size
         self.n_hidden_layers: int = n_hidden_layers
         self.type: str = model_type[self.type_id]
@@ -33,6 +37,7 @@ class RainConfig(PretrainedConfig):
         self.n_key_value_heads: int = kwargs.get("n_key_value_heads", 4)
         self.head_dim: int = int(kwargs.get("head_dim", self.hidden_size // self.n_attn_heads))
         self.hidden_act: str = kwargs.get("hidden_act", 'silu')
+        self.norm_type: str = kwargs.get("norm_type", "rms")
         self.max_position_embeddings: int = int(kwargs.get("max_position_embeddings", 32768))
         self.intermediate_size: int = int(kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64))
         self.rms_norm_eps: float = float(kwargs.get("rms_norm_eps", 1e-6))
@@ -59,9 +64,11 @@ class RainConfig(PretrainedConfig):
         self.use_loop = use_loop
         # Bounce flag
         self.use_bounce = use_bounce
-        # loop or bounce config
+        # loop config
         self.loop_start: int = int(kwargs.get("loop_start", 0))
         self.loop_end: int = int(kwargs.get("loop_end", self.n_hidden_layers))
         self.max_loop_iter: int = int(kwargs.get("max_loop_iter", 3))
-        
-        
+        # bounce config：区间 [bounce_start, bounce_end] 含端点，首层与末两层不进区间
+        self.bounce_start: int = int(kwargs.get("bounce_start", min(2, self.n_hidden_layers)))
+        self.bounce_end: int = int(kwargs.get("bounce_end", self.n_hidden_layers - 1 - 2))
+        self.phase_init_std: float = float(kwargs.get("phase_init_std", 0.02))

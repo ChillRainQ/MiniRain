@@ -57,20 +57,15 @@ class MiniRainModel(nn.Module):
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
-        if self.config.use_loop:
-            ...
-        elif self.config.use_bounce:
-            ...
-        else:
-            for layer, past_key_value in zip(self.layers, past_key_values):
-                hidden_states, present = layer(
-                    hidden_states,
-                    position_embeddings,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache,
-                    attention_mask=attention_mask
-                )
-                presents.append(present)
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
         hidden_states = self.norm(hidden_states)
         aux_loss = hidden_states.new_zeros(1).squeeze()
         return hidden_states, presents, aux_loss

@@ -136,7 +136,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
         adam.zero_grad(set_to_none=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind Pretraining")
+    parser = argparse.ArgumentParser(description="MiniRain Pretraining")
     parser.add_argument("--save_dir", type=str, default="../outputs", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
