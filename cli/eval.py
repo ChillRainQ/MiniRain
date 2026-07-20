@@ -13,7 +13,7 @@ def model_init(config: PreTrainedConfig, args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     model = MiniRainForCausalLM(config)
     moe_suffix = '_moe' if args.use_moe else ''
-    ckp = f'./{args.save_dir}{args.weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
+    ckp = f'{args.save_dir}/{args.weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
     model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
     get_model_params(model, config)
     return model.half().eval().to(args.device), tokenizer
@@ -39,7 +39,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     config = RainConfig(hidden_size=args.hidden_size,
-                        num_hidden_layers=args.num_hidden_layers)
+                        n_hidden_layers=args.num_hidden_layers)
 
     model, tokenizer = model_init(config, args)
     prompts = [

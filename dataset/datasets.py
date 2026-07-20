@@ -64,10 +64,10 @@ class PretrainDataset(Dataset):
     
     
 class SFTDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_len=1024):
+    def __init__(self, jsonl_path, tokenizer, max_seq_len=1024):
         super().__init__()
         self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.max_len = max_seq_len
         features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
         self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
@@ -86,7 +86,7 @@ class SFTDataset(Dataset):
                 
             if message.get("tool_calls") and isinstance(message.get("tool_calls"), str):
                 message["tool_calls"] = json.loads(message["tool_calls"])
-                
+            messages.append(message)
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
