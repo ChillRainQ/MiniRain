@@ -1,6 +1,6 @@
 
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
-from transformers import GenerationMixin
+from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
 from components.block import MiniRainBlock
 from components.norm import NormArgs
@@ -31,12 +31,12 @@ def precompute_freqs_cis(dim: int, end: int = 32 * 1024, rope_base: float = 1e6,
 
 class MiniRainModel(nn.Module):
     name = "MiniRain"
-    def __init__(self, config: RainConfig):
+    def __init__(self, config: PreTrainedConfig):
         super().__init__()
         self.config = config
         self.model_type = self.config.type
         self.vocab_size, self.n_hidden_layers = self.config.vocab_size, self.config.n_hidden_layers
-        self.embed_tokens = nn.Embedding(self.vocab_size, self.config.hidden_size)
+        self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
         self.layers = nn.ModuleList([MiniRainBlock(i, self.config) for i in range(self.n_hidden_layers)])
         self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
@@ -51,7 +51,7 @@ class MiniRainModel(nn.Module):
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * self.n_hidden_layers
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        hidden_states = self.dropout(self.embed(input_ids))
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
@@ -72,13 +72,13 @@ class MiniRainModel(nn.Module):
         
 
 class MiniRainForCausalLM(PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    def __init__(self, config):
+    _tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
+    def __init__(self, config: PreTrainedConfig):
         super().__init__(config)
         self.config = config if config is not None else RainConfig()
         self.model = MiniRainModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
+        if self.config.tie_word_embeddings: self.model.embed.weight = self.lm_head.weight
         self.post_init()
         
     def forward(self, input_ids, attention_mask=None, past_key_values=None, 

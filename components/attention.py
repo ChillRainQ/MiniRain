@@ -1,3 +1,5 @@
+from transformers import PreTrainedConfig
+
 from components import norm
 from components.norm import *
 from architectures.config import RainConfig
@@ -25,7 +27,7 @@ class AttentionArgs:
     """
     注意力参数。
     """
-    config: RainConfig
+    config: PreTrainedConfig
 
 
 class GroupQueryAttention(nn.Module):

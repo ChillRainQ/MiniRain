@@ -1,3 +1,5 @@
+from transformers import PreTrainedConfig
+
 from components.mlp import SwiGLU
 from components.mlp import MLPArgs
 from components.norm import NormArgs
@@ -11,7 +13,7 @@ from components.norm import RMSNorm
 
 
 class MiniRainBlock(nn.Module):
-    def __init__(self, layer_id: int, config: RainConfig):
+    def __init__(self, layer_id: int, config: PreTrainedConfig):
         super().__init__()
         self.layer_id = layer_id
         self.attn = GroupQueryAttention(AttentionArgs(config))

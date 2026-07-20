@@ -25,7 +25,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(device)
-        labels = input_ids.to(device)
+        labels = labels.to(device)
         last_step = step
         lr = get_lr(epoch * iters + step, epochs * iters, learning_rate)
         if muon is not None:
@@ -37,15 +37,18 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            # 修复：aux_loss 可能为 None（非 MoE 时），与原日志处的判空保持一致
+            aux_loss = res.aux_loss if res.aux_loss is not None else 0.0
+            loss = (res.loss + aux_loss) / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             if muon is not None:
-                # 梯度裁剪前 unscale（只需一个优化器）
+                # 修复：裁剪前两个优化器都要 unscale，
+                # 否则 adam 管的参数在 scaled 状态下被裁剪，阈值失真
                 scaler.unscale_(muon)
+                scaler.unscale_(adam)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 # 分别 step 两个优化器
                 scaler.step(muon)
@@ -77,55 +80,38 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 f'lr_muon: {muon_lr:.8f}, lr_adam: {adam_lr:.8f}, eta: {eta_min:.1f}min'
             )
 
-            # ========== 新增：记录 Scaling Law 数据（仅主进程） ==========
+            # ========== 记录 Scaling Law 数据（仅主进程） ==========
             if logger is not None and is_main_process():
-                logger.log(step, current_loss)
-            # ========== 新增结束 ==========
+                # 修复：传全局步数，否则第二个 epoch 的 step 从头开始，token 曲线回退
+                logger.log(epoch * iters + step, current_loss)
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            moe_suffix = '_moe' if config.use_moe else ''
-            done_suffix = f"_{epoch + 1}done" if step == iters else ''
-            weight_path = f'{args.save_dir}/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}{done_suffix}.pth'
-            save(state_dict, weight_path)
+        # ========== 断点保存：统一走 get_checkpoint ==========
+        if step % args.save_interval == 0 or step == iters:
+            if is_main_process():
+                # 权重导出在每个 epoch 结束时，done 标记第几个 epoch 完成
+                # 命名规则: {训练阶段}_{hidden}_{layers}[_moe]_{epoch}done.pth
+                # 中间步不导出（无 done 后缀的文件没有消费者，纯属重复写盘）
+                if step == iters:
+                    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+                    raw_model = getattr(raw_model, '_orig_mod', raw_model)
+                    moe_suffix = '_moe' if config.use_moe else ''
+                    weight_path = f'{args.save_dir}/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_{epoch + 1}done.pth'
+                    save(raw_model.state_dict(), weight_path)
 
-            # 保存完整检查点（用于续训）
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'muon': muon.state_dict(),
-                'adam': adam.state_dict(),
-                'scaler': scaler.state_dict(),
-                'epoch': epoch,
-                'step': step,
-                'config': config,
-            }
-            ckpt_dir = '../checkpoints'
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = f'{ckpt_dir}/checkpoint_{args.save_weight}_{epoch}_{step}.pt'
-            torch.save(checkpoint, ckpt_path)
-            Logger(f'Checkpoint saved to {ckpt_path}')
-            # ---------- 清理旧检查点：最多保留 3 个 ----------
-            import glob
-            pattern = f'{ckpt_dir}/checkpoint_{args.save_weight}_*.pt'
-            ckpt_files = glob.glob(pattern)
-            if len(ckpt_files) > 3:
-                # 按修改时间排序（最新的在前）
-                ckpt_files.sort(key=os.path.getmtime, reverse=True)
-                # 删除除最新的 3 个之外的所有文件
-                for old_file in ckpt_files[3:]:
-                    os.remove(old_file)
-                    Logger(f'Removed old checkpoint: {old_file}')
-            model.train()
-            del state_dict
+                # 保存完整断点（模型 + 双优化器 + scaler，scaler 走 kwargs 通道）
+                get_checkpoint(config, weight=args.save_weight, model=model,
+                               save_dir='../checkpoints', epoch=epoch, step=step,
+                               muon=muon, adam=adam, scaler=scaler)
+            # 等其他 rank 同步后再继续，避免写盘期间有 rank 提前进入下一步
+            if dist.is_initialized():
+                dist.barrier()
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
+        # 修复：与主循环一致，裁剪前两个优化器都 unscale
         if muon is not None:
             scaler.unscale_(muon)
-        else:
-            scaler.unscale_(adam)
+        scaler.unscale_(adam)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         if muon is not None:
             scaler.step(muon)
@@ -155,16 +141,16 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_loop', default=0, type=int, choices=[0, 1], help="是否使用LOOP架构（0=否，1=是）")
     parser.add_argument('--use_bounce', default=0, type=int, choices=[0, 1], help="是否使用Bounce架构（0=否，1=是）")
-    parser.add_argument('--loop_start', type=int , help="Loop起始层")
-    parser.add_argument('--loop_end', type=int, help="Loop结束层")
-    parser.add_argument('--max_loop_iter', type=int, help="Loop最大迭代次数")
+    # 修复：三个 loop 参数补默认值，否则 int(None) 启动即崩
+    parser.add_argument('--loop_start', type=int, default=0, help="Loop起始层")
+    parser.add_argument('--loop_end', type=int, default=0, help="Loop结束层")
+    parser.add_argument('--max_loop_iter', type=int, default=1, help="Loop最大迭代次数")
     parser.add_argument("--data_path", type=str, default="../data/pretrain_t2t.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniRain-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
-    # ========== 新增：Scaling Law 日志参数 ==========
     parser.add_argument("--scaling_log_dir", type=str, default="../train_logs", help="Scaling Law 分析日志保存目录")
 
     args = parser.parse_args()
@@ -193,7 +179,7 @@ if __name__ == "__main__":
     model, tokenizer = init_model(config,
                                   from_weight=args.from_weight, device=args.device)
 
-    # ========== 新增：计算参数量并初始化 Scaling Law Logger ==========
+    # ========== 计算参数量并初始化 Scaling Law Logger ==========
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f'[ScalingLaw] 模型参数量: {model_params/1e6:.2f}M, '
@@ -208,23 +194,34 @@ if __name__ == "__main__":
         seq_len=args.max_seq_len,
         world_size=world_size
     )
-    # ========== 新增结束 ==========
 
     pretrain_dataset = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(pretrain_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
-    muon = optim.Muon(get_muon_params(model), lr=args.learning_rate * 30)
-    adam = optim.AdamW(get_adam_params(model), lr=args.learning_rate)
+
+    # 修复：参数分组后断言无遗漏、无重叠（embedding/lm_head 归 AdamW）
+    muon_params = get_muon_params(model)
+    adam_params = get_adam_params(model)
+    assert sum(p.numel() for p in muon_params) + sum(p.numel() for p in adam_params) == model_params, \
+        '参数分组有遗漏或重叠，请检查 get_muon_params/get_adam_params'
+    Logger(f'[Optimizer] Muon params: {sum(p.numel() for p in muon_params)/1e6:.2f}M, '
+           f'AdamW params: {sum(p.numel() for p in adam_params)/1e6:.2f}M')
+    muon = optim.Muon(muon_params, lr=args.learning_rate * 30)
+    adam = optim.AdamW(adam_params, lr=args.learning_rate)
 
     # 断点恢复
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
-        muon.load_state_dict(ckp_data['muon'])
-        adam.load_state_dict(ckp_data['adam'])
-        scaler.load_state_dict(ckp_data['scaler'])
+        if 'muon' in ckp_data:
+            muon.load_state_dict(ckp_data['muon'])
+        if 'adam' in ckp_data:
+            adam.load_state_dict(ckp_data['adam'])
+        if 'scaler' in ckp_data:
+            scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+        Logger(f'[Checkpoint] 从 epoch={start_epoch}, step={start_step} 续训')
 
     # 多卡支持与模型编译
     if args.use_compile == 1:
@@ -244,20 +241,21 @@ if __name__ == "__main__":
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader) + skip, start_step,
-                        logger=scaling_logger)  # 传入 logger
+                        logger=scaling_logger)
         else:
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader), 0,
-                        logger=scaling_logger)  # 传入 logger
-    scaling_logger.save()
-    print("MiniRain pretrain done!")
-    # 保存最终结果
-    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-    raw_model = getattr(raw_model, '_orig_mod', raw_model)
-    state_dict = raw_model.state_dict()
-    moe_suffix = '_moe' if config.use_moe else ''
-    weight_path = f'../ready/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
-    save(state_dict, weight_path)
+                        logger=scaling_logger)
+    if is_main_process():
+        scaling_logger.save()
+        print("MiniRain pretrain done!")
+        # 保存最终结果（save() 内部已确保 ../ready 目录存在）
+        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+        state_dict = raw_model.state_dict()
+        moe_suffix = '_moe' if config.use_moe else ''
+        weight_path = f'../ready/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
+        save(state_dict, weight_path)
     # clear
     if dist.is_initialized():
         dist.barrier()
