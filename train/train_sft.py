@@ -110,7 +110,7 @@ if __name__ == '__main__':
     parser.add_argument("--data_path", type=str, default="../data/sft_t2t.jsonl", help="训练数据路径")
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
     # 训练环境初始化
@@ -137,8 +137,8 @@ if __name__ == '__main__':
     # 模型（load_dir 指向 ../ready，init_model 支持匹配 *_ready.pth）
     model, tokenizer = init_model(config, from_weight=args.from_weight,
                                   save_dir=args.load_dir, device=args.device)
-    pretrain_dataset = SFTDataset(args.data_path, tokenizer, max_seq_len=args.max_seq_len)
-    train_sampler = DistributedSampler(pretrain_dataset) if dist.is_initialized() else None
+    sft_dataset = SFTDataset(args.data_path, tokenizer, max_seq_len=args.max_seq_len)
+    train_sampler = DistributedSampler(sft_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -165,10 +165,10 @@ if __name__ == '__main__':
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
-        indices = torch.randperm(len(pretrain_dataset)).tolist()
+        indices = torch.randperm(len(sft_dataset)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(pretrain_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers,
+        loader = DataLoader(sft_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers,
                             pin_memory=True)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')

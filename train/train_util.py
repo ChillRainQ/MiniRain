@@ -77,11 +77,13 @@ def init_model(config, from_weight='pretrain', tokenizer_path='../tokenizers', s
 
     if from_weight != "none":
         moe_suffix = '_moe' if config.use_moe else ''
-        # 修复：训练脚本导出的权重文件名含层数和 done 后缀，
-        # 如 pretrain_768_8_2done.pth，用 glob 匹配；找不到再回退旧命名
-        pattern = f'{save_dir}/{from_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}*done.pth'
-        # 按修改时间取最新的 done 文件（字典序在 epoch >= 10 时会排错，如 10done 排在 2done 前）
-        candidates = sorted(glob.glob(pattern), key=os.path.getmtime)
+        # 修复：训练脚本导出的权重文件名含层数和 done/ready 后缀，
+        # 如 pretrain_768_8_2done.pth / pretrain_768_8_ready.pth，用 glob 匹配
+        # 按修改时间取最新（字典序在 epoch >= 10 时会排错，如 10done 排在 2done 前）
+        candidates = sorted(
+            glob.glob(f'{save_dir}/{from_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}*done.pth')
+            + glob.glob(f'{save_dir}/{from_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}*_ready.pth'),
+            key=os.path.getmtime)
         if candidates:
             weight_path = candidates[-1]
         else:
