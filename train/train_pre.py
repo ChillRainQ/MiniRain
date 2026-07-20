@@ -1,4 +1,7 @@
+import sys
 import os
+# 将项目根目录（当前文件的父目录的父目录）添加到 sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader

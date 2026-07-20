@@ -21,7 +21,7 @@ class RMSNorm(nn.Module):
     """
     name = "rms"
     def __init__(self, args: NormArgs):
-        super().__init__(args)
+        super().__init__()
         self.eps = args.eps
         self.weight = nn.Parameter(torch.ones(args.dim))
 
