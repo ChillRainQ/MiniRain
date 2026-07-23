@@ -80,6 +80,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
 
         # ========== 断点保存：统一走 get_checkpoint ==========
         if step % args.save_interval == 0 or step == iters:
+            model.eval()
             if is_main_process():
                 # 权重导出在每个 epoch 结束（done 命名规则）
                 if step == iters:
@@ -95,6 +96,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                                muon=muon, adam=adam, scaler=scaler)
             if dist.is_initialized():
                 dist.barrier()
+            model.train()
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:

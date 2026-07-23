@@ -14,11 +14,12 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DistributedSampler, DataLoader
-
+import torch.nn.functional as F
 from architectures.config import RainConfig
 from dataset.datasets import RLAIFDataset
 from train.rollout_engine import create_rollout_engine
-from train.train_util import init_distributed_mode, setup_seed, get_checkpoint, init_model, LMForRewardModel, Logger
+from train.train_util import init_distributed_mode, setup_seed, get_checkpoint, init_model, LMForRewardModel, Logger, \
+    is_main_process, SkipBatchSampler, save
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -77,9 +78,10 @@ def calculate_rewards(prompts, responses, reward_model):
 
 
 def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None, use_sglang=False):
-    for step, batch in enumerate(loader, start=start_step):
+    for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch['prompt']
-        prompt_inputs = tokenizer(prompts, return_tensors="pt").to(args.device)
+        prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
+                                  padding_side="left", add_special_tokens=False).to(args.device)
 
         if args.max_seq_len:
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
@@ -101,6 +103,118 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         logp_pos = prompt_lens.unsqueeze(1) - 1 + torch.arange(completion_ids.size(1), device=args.device).unsqueeze(0)
 
         rewards = calculate_rewards(prompts, completions, reward_model).to(args.device)
+
+        model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+
+        with autocast_ctx:
+            res = model_unwrapped(outputs, attention_mask=full_mask)
+            aux_loss = res.aux_loss if config.use_moe else torch.tensor(0.0, device=args.device)
+
+            per_token_logprobs = F.log_softmax(res.logits[:, :-1, :], dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
+
+        with (torch.no_grad()):
+            ref_per_token_logps = F.log_softmax(ref_model(outputs, attention_mask=full_mask).logits[:, :-1, :],dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1).gather(1,
+                                                                                                                   logp_pos)
+        if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
+            for i in range(len(prompts)):
+                Logger(f"[DEBUG] step={step}, sample[{i}]")
+                Logger('-' * 100)
+                Logger(f"{'=' * 30} [DEBUG] sample[{i}] CONTEXT_BEGIN {'=' * 30}")
+                Logger(prompts[i])
+                Logger(f"{'=' * 31} [DEBUG] sample[{i}] CONTEXT_END {'=' * 31}")
+                for j in range(args.num_generations):
+                    idx = i * args.num_generations + j
+                    Logger(f"{'=' * 28} [DEBUG] gen[{j}] RESPONSE_BEGIN {'=' * 28}")
+                    Logger(completions[idx])
+                    Logger(f"{'=' * 29} [DEBUG] gen[{j}] RESPONSE_END {'=' * 29}")
+                    Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
+                Logger('=' * 100)
+        
+        grouped_rewards = rewards.view(-1, args.num_generations)
+        # 求组内均值和标准差
+        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
+        std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)
+        # 计算优势
+        advantages = (rewards - mean_r) / (std_r + 1e-4)
+        # completion掩码
+        completion_pad_mask = rollout_result.completion_mask.to(args.device).bool()
+        # 获取eos标记
+        is_eos = (completion_ids == tokenizer.eos_token_id) & completion_pad_mask
+        # 记录eos索引的张量
+        eos_idx = torch.full(
+            (is_eos.size(0),),  # 形状 [batch_size]
+            is_eos.size(1) - 1,  # 填充值 = seq_len - 1
+            dtype=torch.long,
+            device=args.device
+        )
+        mask = is_eos.any(dim=1)
+        values = is_eos.int().argmax(dim=1)
+        eos_idx[mask] = values[mask]
+
+        completions_mask = torch.arange(is_eos.size(1),device=args.device).expand(is_eos.size(0), -1)
+        completions_mask = (completions_mask <= eos_idx.unsqueeze(1)) & completion_pad_mask
+
+        # kl计算
+        kl_div = ref_per_token_logps - per_token_logprobs
+        per_token_kl = torch.exp(kl_div) - kl_div - 1
+
+        ratio = torch.exp(per_token_logprobs - old_per_token_logps)
+        if args.loss_type == "cispo":
+            """
+            cispo只裁剪上界
+            """
+            clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
+            per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logprobs
+                               - args.beta * per_token_kl)
+        else:
+            raise ValueError("只能使用cispo")
+        # 求每个序列的有效loss，然后取每个序列的均值，最后再做pingjun
+        policy_loss = ((per_token_loss * completions_mask).sum(dim=1) / completions_mask.sum(dim=1).clamp(min=1)).mean()
+        loss = (policy_loss + aux_loss) / args.accumulation_steps
+        loss.backward()
+
+        if step % args.log_interval == 0 or step == iters:
+            policy_loss_val = loss.item() * args.accumulation_steps
+            current_aux_loss = aux_loss.item()
+            avg_reward_val = rewards.mean().item()
+            avg_len_val = completions_mask.sum(dim=1).float().mean().item()
+            kl_ref_val = ((ref_per_token_logps - per_token_logprobs) * completions_mask).sum().item() / max(
+                completions_mask.sum().item(), 1)
+            advantages_mean_val = advantages.mean().item()
+            advantages_std_val = advantages.std().item()
+            current_lr = optimizer.param_groups[0]['lr']
+
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
+                   f'Reward: {avg_reward_val:.4f}, KL_ref: {kl_ref_val:.4f}, '
+                   f'Adv Std: {advantages_std_val:.4f}, Adv Mean: {advantages_mean_val:.4f}, '
+                   f'Actor Loss: {policy_loss_val:.4f}, Avg Response Len: {avg_len_val:.2f}, Learning Rate: {current_lr:.8f}')
+
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+            model.eval()
+            moe_suffix = '_moe' if config.use_moe else ''
+            done_suffix = f"_{epoch + 1}done" if step == iters else ""
+            ckp = f'{args.save_dir}/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}{done_suffix}.pth'
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            get_checkpoint(config, weight=args.save_weight, model=model, optimizer=optimizer,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
+            model.train()
+            del state_dict
+
+        if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(model)
+
+        del prompt_inputs, outputs, completion_ids, per_token_logprobs, ref_per_token_logps
+        del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completions_mask, completion_pad_mask, prompt_lens, logp_pos
+
+        if step > start_step and step % args.accumulation_steps != 0:
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
 
 
 if __name__ == "__main__":
@@ -133,7 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO", help="wandb项目名")
+    parser.add_argument("--wandb_project", type=str, default="MiniRain-GRPO", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--debug_mode", action="store_true", help="是否打印训练调试采样")
     parser.add_argument("--debug_interval", type=int, default=20, help="debug模式下每隔多少step打印一次采样")
@@ -153,9 +267,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
                         max_seq_len=args.max_seq_len + args.max_gen_len,
-                        use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
-                        use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
-                        loop_end=args.loop_end, max_loop_iter=args.max_loop_iter)
+                        use_moe=bool(args.use_moe))
     print(config)
     # 尝试获取断点
     ckp_data = get_checkpoint(config, weight=args.save_weight,
@@ -182,6 +294,7 @@ if __name__ == "__main__":
         sglang_model_path=args.sglang_model_path,
         sglang_shared_path=args.sglang_shared_path,
     )
+    wandb = None
     # 数据集初始化
     rlaif_dataset = RLAIFDataset(args.data_path, tokenizer, max_length=config.max_seq_len, thinking_ratio=args.thinking_ratio)
     train_sampler = DistributedSampler(rlaif_dataset) if dist.is_initialized() else None
@@ -208,4 +321,31 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
     rollout_engine.update_policy(model)
+
+    for epoch in range(start_epoch, args.epochs):
+        train_sampler and train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch);
+        indices = torch.randperm(len(rlaif_dataset)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        loader = DataLoader(rlaif_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
+            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            grpo_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step,
+                             wandb, use_sglang=(args.rollout_engine == "sglang"))
+        else:
+            grpo_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb,
+                             use_sglang=(args.rollout_engine == "sglang"))
+    if is_main_process():
+        print("MiniRain GRPO done!")
+        # 保存最终结果（ready 命名规则，save() 内部已确保目录存在）
+        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+        state_dict = raw_model.state_dict()
+        moe_suffix = '_moe' if config.use_moe else ''
+        weight_path = f'../ready/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
+        save(state_dict, weight_path)
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 

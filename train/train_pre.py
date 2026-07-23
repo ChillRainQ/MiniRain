@@ -90,10 +90,8 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
 
         # ========== 断点保存：统一走 get_checkpoint ==========
         if step % args.save_interval == 0 or step == iters:
+            model.eval()
             if is_main_process():
-                # 权重导出在每个 epoch 结束时，done 标记第几个 epoch 完成
-                # 命名规则: {训练阶段}_{hidden}_{layers}[_moe]_{epoch}done.pth
-                # 中间步不导出（无 done 后缀的文件没有消费者，纯属重复写盘）
                 if step == iters:
                     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
                     raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -108,6 +106,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
             # 等其他 rank 同步后再继续，避免写盘期间有 rank 提前进入下一步
             if dist.is_initialized():
                 dist.barrier()
+            model.eval()
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
