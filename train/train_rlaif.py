@@ -3,9 +3,8 @@ import math
 import os
 import re
 import sys
-
-__package__ = "trainer"
-
+# 将项目根目录（当前文件的父目录的父目录）添加到 sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from contextlib import nullcontext
 
 import torch
@@ -21,7 +20,6 @@ from train.rollout_engine import create_rollout_engine
 from train.train_util import init_distributed_mode, setup_seed, get_checkpoint, init_model, LMForRewardModel, Logger, \
     is_main_process, SkipBatchSampler, save
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 def rep_penalty(text, n=3, cap=0.5):
@@ -31,7 +29,7 @@ def rep_penalty(text, n=3, cap=0.5):
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 
-def calculate_rewards(prompts, responses, reward_model):
+def old_calculate_rewards(prompts, responses, reward_model):
     """
     计算奖励
     :param prompts:
@@ -74,6 +72,57 @@ def calculate_rewards(prompts, responses, reward_model):
                 rewards_scores.append(score)
         reward_model_scores = torch.tensor(rewards_scores, device=args.device)
         rewards += reward_model_scores
+    return rewards
+
+def calculate_rewards(prompts, responses, reward_model):
+    """
+    计算奖励 = 规则奖励（逐条计算） + 评委奖励（批量计算）
+    :param prompts:   list[str]，长度 B（每个 prompt 的原始 chat 模板文本）
+    :param responses: list[str]，长度 B*num_generations（模型采样出的回答）
+    :param reward_model: LMForRewardModel 实例
+    :return: Tensor[B*num_gen]，每条回答的总奖励
+    """
+    rewards = torch.zeros(len(responses), device=args.device)
+    with torch.no_grad():
+        messages_list, answers = [], []          # 收集待评委打分的数据
+        batch_size = len(prompts)
+
+        for i in range(batch_size):
+            for j in range(args.num_generations):
+                response_idx = i * args.num_generations + j
+                response = responses[response_idx]
+                prompt = prompts[i]
+
+                # 从 chat 模板文本中解析出多轮对话历史
+                pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
+                matches = re.findall(pattern, prompt, re.DOTALL)
+                messages = [{"role": role, "content": content.strip()} for role, content in matches]
+
+                answer = response
+                # rule1 鼓励回答在 20-800 字符内（含思考过程的整体长度）
+                rewards[response_idx] += 0.5 if 20 <= len(response.strip()) <= 800 else -0.5
+
+                # rule2 有思考过程时：截取 </think> 之后的最终答案交给评委
+                if "</think>" in response:
+                    think_content, answer_content = response.split("</think>", 1)
+                    # rule2.1 鼓励思考长度在 20-300 字符内
+                    rewards[response_idx] += 0.5 if 20 <= len(think_content.strip()) <= 300 else -0.5
+                    # rule2.2 鼓励只出现一次 </think>
+                    rewards[response_idx] += 0.25 if response.count('</think>') == 1 else -0.25
+                    answer = answer_content.strip()
+
+                # rule3 重复惩罚（只罚最终答案部分）
+                rewards[response_idx] -= rep_penalty(answer)
+
+                # 收集，不立刻打分
+                messages_list.append(messages)
+                answers.append(answer)
+
+        # 评委批量打分：B*num_gen 条一次前向，类内已软压缩到 ±3
+        rewards_scores = reward_model.get_scores_batch(messages_list, answers)
+        reward_model_scores = torch.tensor(rewards_scores, device=args.device)
+        rewards += reward_model_scores
+
     return rewards
 
 
@@ -244,7 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon")
     parser.add_argument("--epsilon_high", type=float, default=5.0, help="epsilon上界")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
+    parser.add_argument("--reward_model_path", type=str, default="../reward/Skywork-Reward-V2-Qwen3-1.7B", help="Reward模型路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniRain-GRPO", help="wandb项目名")
