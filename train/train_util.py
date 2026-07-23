@@ -267,11 +267,8 @@ class LMForRewardModel:
             convs, return_tensors="pt", padding=True, truncation=True, max_length=4096
         ).to(self.device)
 
-        logits = self.model(**inputs).logits  # [B, seq_len, 1]
-        # 每条序列最后一个有效 token 的位置（padding 在右侧，mask 和即长度）
-        last_pos = inputs["attention_mask"].sum(dim=1) - 1  # [B]
-        batch_idx = torch.arange(logits.size(0), device=logits.device)
-        scores = logits[batch_idx, last_pos, 0].float().tolist()
+        logits = self.model(**inputs).logits  # [B, 1]，模型内部已自动取了最后有效token
+        scores = logits.squeeze(-1).float().tolist()  # [B, 1] -> [B]
         return [self._squash(s) for s in scores]
 
 
