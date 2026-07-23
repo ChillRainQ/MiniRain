@@ -129,7 +129,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     Logger(f"{'=' * 29} [DEBUG] gen[{j}] RESPONSE_END {'=' * 29}")
                     Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
                 Logger('=' * 100)
-        
+
         grouped_rewards = rewards.view(-1, args.num_generations)
         # 求组内均值和标准差
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
@@ -281,7 +281,8 @@ if __name__ == "__main__":
     # 模型初始化
     model, tokenizer = init_model(config, from_weight=args.from_weight,
                                   save_dir=args.load_dir, device=args.device)
-    ref_model, _ = init_model(config, from_weight=args.from_weight, device=args.device)
+    ref_model, _ = init_model(config, from_weight=args.from_weight,
+                              save_dir=args.load_dir, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
     reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
     rollout_engine = create_rollout_engine(
