@@ -1,8 +1,6 @@
 from transformers import PreTrainedConfig
 
-from components import norm
 from components.norm import *
-from architectures.config import RainConfig
 from dataclasses import dataclass
 import math
 
@@ -56,7 +54,7 @@ class GroupQueryAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.n_dropout)
         self.dropout = config.n_dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
-        
+
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask = None):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)

@@ -72,6 +72,10 @@ class RainConfig(PretrainedConfig):
         self.bounce_start: int = int(kwargs.get("bounce_start", min(2, self.n_hidden_layers)))
         self.bounce_end: int = int(kwargs.get("bounce_end", self.n_hidden_layers - 1 - 2))
         self.phase_init_std: float = float(kwargs.get("phase_init_std", 0.02))
+        # attn_res
+        self.full_attn_res = bool(kwargs.get("full_attn_res", False))
+        self.block_attn_res = bool(kwargs.get("block_attn_res", False))
+        self.block_number = int(kwargs.get("block_number", 0))
 
 
 class RainOmniConfig(RainConfig):
