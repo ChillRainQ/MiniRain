@@ -23,8 +23,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="MiniRain 模型测试")
     parser.add_argument('--save_dir', default='../ready', type=str, help="模型权重目录")
     parser.add_argument('--tokenizer_path', default='../tokenizers', type=str, help="分词器目录")
-    parser.add_argument('--weight', default='full_sft', type=str,
-                        help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    parser.add_argument('--weight', default='rlaif', type=str,
+                        help="权重名称前缀（pretrain, full_sft, rlaif）")
     parser.add_argument('--hidden_size', default=1152, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")

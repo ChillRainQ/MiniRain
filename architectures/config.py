@@ -72,3 +72,7 @@ class RainConfig(PretrainedConfig):
         self.bounce_start: int = int(kwargs.get("bounce_start", min(2, self.n_hidden_layers)))
         self.bounce_end: int = int(kwargs.get("bounce_end", self.n_hidden_layers - 1 - 2))
         self.phase_init_std: float = float(kwargs.get("phase_init_std", 0.02))
+
+
+class RainOmniConfig(RainConfig):
+    ...
