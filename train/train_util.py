@@ -202,18 +202,33 @@ class SkipBatchSampler(Sampler):
         return max(0, total_batches - self.skip_batches)
 
 
-import os
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+class LMForRewardModel1:
+    def __init__(self, model_path, device="cuda", dtype=torch.float16):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
+        self.model = self.model.to(device).eval()
+        self.device = device
+
+    @torch.no_grad()
+    def get_score(self, messages, response):
+        history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
+        last_query = messages[-1]['content'] if messages else ""
+        message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query
+        eval_messages = [
+            {"role": "user", "content": message_context},
+            {"role": "assistant", "content": response}
+        ]
+        score = self.model.get_score(self.tokenizer, eval_messages)
+        return max(min(score, 3.0), -3.0)
 
 
 class LMForRewardModel:
     """
-    Skywork-Reward-V2 (Qwen3 底座) 奖励模型封装
+    Skywork-Reward-V2-Qwen3-1.7B 奖励模型封装（单条打分版）
     用法:
         rm = LMForRewardModel("~/xin/MiniRain/reward/Skywork-Reward-V2-Qwen3-1.7B")
-        score = rm.get_score(messages, answer)            # 单条
-        scores = rm.get_scores_batch(messages_list, answers)  # 批量（可选，更快）
+        score = rm.get_score(messages, answer)   # messages: 对话历史（不含本次回答）, answer: 待打分的回答文本
     """
 
     def __init__(self, model_path, device="cuda", dtype=torch.bfloat16, clamp=3.0):
@@ -227,11 +242,10 @@ class LMForRewardModel:
             torch_dtype=dtype,
             num_labels=1,
         ).to(device).eval()
+        self.model.config.use_cache = False
         for p in self.model.parameters():
             p.requires_grad_(False)
 
-        # 右 padding + 取各序列最后一个有效 token 的分数（批量打分需要）
-        self.tokenizer.padding_side = "right"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -244,32 +258,45 @@ class LMForRewardModel:
     @torch.no_grad()
     def get_score(self, messages, response):
         """
-        messages: [{"role": ..., "content": ...}, ...] 完整对话历史（支持多轮）
+        messages: [{"role": ..., "content": ...}, ...] 完整对话历史（不含待评回答）
         response: 待评分的回答文本
         return:   float
         """
-        return self.get_scores_batch([messages], [response])[0]
+        conv = self.tokenizer.apply_chat_template(
+            messages + [{"role": "assistant", "content": response}],
+            tokenize=False,
+        )
+        inputs = self.tokenizer(
+            conv, return_tensors="pt", truncation=True, max_length=4096
+        ).to(self.device)
 
+        logits = self.model(**inputs).logits  # [1, 1]
+        score = logits.item()
+
+        del inputs, logits
+        return self._squash(score)
+    
     @torch.no_grad()
     def get_scores_batch(self, messages_list, responses):
         """
-        批量打分：messages_list 与 responses 等长，一一对应
-        return: list[float]
+        messages_list: List[List[dict]]，长度 N
+        responses:     List[str]，长度 N
+        return: List[float]，长度 N
         """
         convs = [
             self.tokenizer.apply_chat_template(
-                msgs + [{"role": "assistant", "content": resp}],
-                tokenize=False,
+                msgs + [{"role": "assistant", "content": resp}], tokenize=False
             )
             for msgs, resp in zip(messages_list, responses)
         ]
         inputs = self.tokenizer(
-            convs, return_tensors="pt", padding=True, truncation=True, max_length=4096
+            convs, return_tensors="pt", padding=True,
+            truncation=True, max_length=4096
         ).to(self.device)
 
-        logits = self.model(**inputs).logits  # [B, 1]，模型内部已自动取了最后有效token
-        scores = logits.squeeze(-1).float().tolist()  # [B, 1] -> [B]
-        return [self._squash(s) for s in scores]
+        logits = self.model(**inputs).logits.squeeze(-1)  # [N]
+        del inputs
+        return [self._squash(s.item()) for s in logits]
 
 
 class ScalingLawLogger:

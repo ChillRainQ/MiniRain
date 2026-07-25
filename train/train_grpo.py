@@ -18,8 +18,7 @@ from architectures.config import RainConfig
 from dataset.datasets import RLAIFDataset
 from train.rollout_engine import create_rollout_engine
 from train.train_util import init_distributed_mode, setup_seed, get_checkpoint, init_model, LMForRewardModel, Logger, \
-    is_main_process, SkipBatchSampler, save
-
+    is_main_process, SkipBatchSampler, save, LMForRewardModel1
 
 
 def rep_penalty(text, n=3, cap=0.5):
@@ -84,7 +83,7 @@ def calculate_rewards(prompts, responses, reward_model):
     """
     rewards = torch.zeros(len(responses), device=args.device)
     with torch.no_grad():
-        messages_list, answers = [], []          # 收集待评委打分的数据
+        rewards_scores = []      # 收集待评委打分的数据
         batch_size = len(prompts)
 
         for i in range(batch_size):
@@ -114,12 +113,9 @@ def calculate_rewards(prompts, responses, reward_model):
                 # rule3 重复惩罚（只罚最终答案部分）
                 rewards[response_idx] -= rep_penalty(answer)
 
-                # 收集，不立刻打分
-                messages_list.append(messages)
-                answers.append(answer)
-
-        # 评委批量打分：B*num_gen 条一次前向，类内已软压缩到 ±3
-        rewards_scores = reward_model.get_scores_batch(messages_list, answers)
+                # 打分
+                score = reward_model.get_score(messages, answer)
+                rewards_scores.append(score)
         reward_model_scores = torch.tensor(rewards_scores, device=args.device)
         rewards += reward_model_scores
 
@@ -263,7 +259,10 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
         del prompt_inputs, outputs, completion_ids, per_token_logprobs, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completions_mask, completion_pad_mask, prompt_lens, logp_pos
-
+        if is_main_process() and args.debug_mode:
+            Logger(f"[MEM] step={step}, allocated={torch.cuda.memory_allocated() / 1024 ** 3:.2f}GiB, "
+                   f"reserved={torch.cuda.memory_reserved() / 1024 ** 3:.2f}GiB, "
+                   f"max_allocated={torch.cuda.max_memory_allocated() / 1024 ** 3:.2f}GiB")
     if step > start_step and step % args.accumulation_steps != 0:
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -294,7 +293,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=768, type=int, help="Prompt最大长度")
     parser.add_argument("--max_gen_len", type=int, default=1024, help="生成的最大长度")
     parser.add_argument("--data_path", type=str, default="../data/rlaif.jsonl", help="RLAIF数据路径")
-    parser.add_argument("--num_generations", type=int, default=6, help="每个prompt生成的样本数")
+    parser.add_argument("--num_generations", type=int, default=3, help="每个prompt生成的样本数")
     parser.add_argument("--beta", type=float, default=0.1, help="KL惩罚系数")
     parser.add_argument("--loss_type", type=str, default="cispo", choices=["grpo", "cispo"], help="loss类型")
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon")
