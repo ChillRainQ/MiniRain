@@ -10,9 +10,11 @@ import numpy as np
 import torch
 import random
 import torch.distributed as dist
+import swanlab
 
 
-
+def swanlab_login():
+    swanlab.login(api_key="sghsimiyP151FAEhi4kzS", save=True)
 
 def save(state_dict, weight_path):
     # 修复：保存前确保目录存在（否则 ../ready/ 等未创建目录会直接崩）

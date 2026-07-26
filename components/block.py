@@ -41,14 +41,14 @@ class BlockAttnRes(nn.Module):
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
 
     def forward(self, inter_block_history: list[torch.Tensor],
-                intra_block_history: list[torch.Tensor], layer_id: int):
+                partial_block: torch.Tensor):
         """
-        :param inter_block_history: 块间历史（每一个块的最后一个output）
-        :param intra_block_history: 块内历史
-        :param layer_id:
+        :param inter_block_history: 块间历史表示（每一个块的最后一个output）
+        :param partial_block: 块内历史表示
         :return:
         """
-        V = torch.stack(inter_block_history + intra_block_history, dim=0)
+        # (N, B, T, D)
+        V = torch.stack(inter_block_history + [partial_block], dim=0)
         K = self.attn_res_norm(V)
         # KQ -> logits (N, B, T, D) * (1, 1, 1, D) -> (N, B, T)
         logits = (K * self.attn_res_query).sum(dim=-1)
@@ -64,6 +64,7 @@ class MiniRainBlock(nn.Module):
         self.full_attn_res = config.full_attn_res
         self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
+        self.layer_number = config.n_hidden_layers
         self.attn = GroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
@@ -79,18 +80,17 @@ class MiniRainBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None, intra_block_history=None):
+                past_hidden_states=None):
+        partial_block = None
         if self.full_attn_res and self.attn_res:
             past_hidden_states.append(hidden_states)
             attn_input = self.attn_res(past_hidden_states)
         elif self.block_attn_res and self.attn_res:
-            if self.layer_id % self.block_size == 0:
-                intra_block_history = [hidden_states]
-            else:
-                intra_block_history.append(hidden_states)
-            attn_input = self.attn_res(inter_block_history=past_hidden_states,
-                                       intra_block_history=intra_block_history,
-                                       layer_id=self.layer_id)
+            partial_block = hidden_states
+            attn_input = self.attn_res(past_hidden_states, partial_block)
+            if self.layer_number % (self.block_size // 2) == 0:
+                past_hidden_states.append(partial_block)
+                partial_block = None
         else:
             attn_input = hidden_states
         attn_out, past_key_value = self.attn(
@@ -104,22 +104,18 @@ class MiniRainBlock(nn.Module):
             past_hidden_states.append(attn_out)
             mlp_input = self.mlp_res(past_hidden_states)
         elif self.block_attn_res and self.mlp_res:
-            intra_block_history.append(attn_out)
-            mlp_input = self.mlp_res(inter_block_history=past_hidden_states,
-                                     intra_block_history=intra_block_history,
-                                     layer_id=self.layer_id)
+            partial_block = partial_block + attn_out if partial_block is not None else attn_out
+            mlp_input = self.mlp_res(past_hidden_states, partial_block)
         else:
             mlp_input = attn_input + attn_out
-        mlp_output = self.mlp(
+        mlp_out = self.mlp(
             self.post_attn_layernorm(mlp_input)
         )
         if self.full_attn_res:
-            output = mlp_output
+            output = mlp_out
         elif self.block_attn_res:
-            if (self.layer_id + 1) % self.block_size == 0:
-                past_hidden_states.append(mlp_output)
-            output = mlp_output
+           output = partial_block + mlp_out
         else:
-            output = mlp_output + mlp_input
-        return output, past_key_value, past_hidden_states, intra_block_history
+            output = mlp_out + mlp_input
+        return output, past_key_value, past_hidden_states
     

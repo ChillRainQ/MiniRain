@@ -7,13 +7,14 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 from dataset.datasets import SFTDataset
-from train.train_util import init_model, Logger
+from train.train_util import init_model, Logger, swanlab_login
 from train.train_util import is_main_process
 from contextlib import nullcontext
 import argparse
 import time
 import torch
 import torch.distributed as dist
+import swanlab
 from torch import optim, nn
 from architectures.config import RainConfig
 from train.train_util import get_lr, init_distributed_mode, setup_seed, get_checkpoint, get_adam_params, get_muon_params, SkipBatchSampler, save
@@ -77,6 +78,9 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, '
                 f'lr_muon: {muon_lr:.8f}, lr_adam: {adam_lr:.8f}, eta: {eta_min:.1f}min'
             )
+            if wandb:
+                swanlab.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,
+                                 "lr_muon": muon_lr, "lr_adam": adam_lr, "epoch_time": eta_min})
 
         # ========== 断点保存：统一走 get_checkpoint ==========
         if step % args.save_interval == 0 or step == iters:
@@ -140,6 +144,8 @@ if __name__ == '__main__':
     parser.add_argument('--loop_end', type=int, default=0, help="Loop结束层")
     parser.add_argument('--max_loop_iter', type=int, default=1, help="Loop最大迭代次数")
     parser.add_argument("--data_path", type=str, default="../data/sft_t2t.jsonl", help="训练数据路径")
+    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
+    parser.add_argument("--wandb_project", type=str, default="MiniRain-SFT", help="wandb项目名")
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
@@ -157,6 +163,15 @@ if __name__ == '__main__':
                         use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
                         loop_end=args.loop_end, max_loop_iter=args.max_loop_iter)
     print(config)
+    if args.use_wandb:
+        swanlab_login()
+        swanlab.init(
+            # 设置将记录此次实验的项目信息
+            project=args.wandb_project,
+            workspace="Chill_Rain",
+            # 跟踪超参数和实验元数据
+            config=dict(config)
+        )
     # 尝试获取断点
     ckp_data = get_checkpoint(config, weight=args.save_weight,
                               save_dir='../checkpoints') if args.from_resume == 1 else None
@@ -217,10 +232,10 @@ if __name__ == '__main__':
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
-                        args.learning_rate, args.device, loader, len(loader) + skip, start_step)
+                        args.learning_rate, args.device, loader, len(loader) + skip, start_step, wandb=args.use_wandb)
         else:
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
-                        args.learning_rate, args.device, loader, len(loader), 0)
+                        args.learning_rate, args.device, loader, len(loader), 0, wandb=args.use_wandb)
     if is_main_process():
         print("MiniRain SFT done!")
         # 保存最终结果（ready 命名规则，save() 内部已确保目录存在）

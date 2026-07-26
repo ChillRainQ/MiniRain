@@ -8,13 +8,14 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 from dataset.datasets import PretrainDataset
-from train.train_util import init_model, Logger, ScalingLawLogger
+from train.train_util import init_model, Logger, ScalingLawLogger, swanlab_login
 from train.train_util import is_main_process
 from contextlib import nullcontext
 import argparse
 import time
 import torch
 import torch.distributed as dist
+import swanlab
 from torch import optim, nn
 from architectures.config import RainConfig
 from train.train_util import get_lr, init_distributed_mode, setup_seed, get_checkpoint, get_adam_params, get_muon_params, SkipBatchSampler, save
@@ -82,6 +83,9 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, '
                 f'lr_muon: {muon_lr:.8f}, lr_adam: {adam_lr:.8f}, eta: {eta_min:.1f}min'
             )
+            if wandb:
+                swanlab.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,
+                                 "lr_muon": muon_lr, "lr_adam": adam_lr, "epoch_time": eta_min})
 
             # ========== 记录 Scaling Law 数据（仅主进程） ==========
             if logger is not None and is_main_process():
@@ -169,7 +173,15 @@ if __name__ == "__main__":
                         use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
                         max_loop_iter=int(args.max_loop_iter))
     print(config)
-
+    if args.use_wandb:
+        swanlab_login()
+        swanlab.init(
+            # 设置将记录此次实验的项目信息
+            project=args.wandb_project,
+            workspace="Chill_Rain",
+            # 跟踪超参数和实验元数据
+            config=dict(config)
+        )
     ckp_data = get_checkpoint(config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
 
     # 混合精度
@@ -243,7 +255,7 @@ if __name__ == "__main__":
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader) + skip, start_step,
-                        logger=scaling_logger)
+                        logger=scaling_logger, wandb=args.use_wandb)
         else:
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader), 0,

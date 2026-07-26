@@ -58,7 +58,6 @@ class MiniRainModel(nn.Module):
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
         past_hidden_states = []
-        intra_block_history = []
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present, past_hidden_states, intra_block_history = layer(
                 hidden_states,
@@ -67,7 +66,6 @@ class MiniRainModel(nn.Module):
                 use_cache=use_cache,
                 attention_mask=attention_mask,
                 past_hidden_states=past_hidden_states,
-                intra_block_history=intra_block_history
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
