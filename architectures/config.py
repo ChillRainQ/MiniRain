@@ -75,7 +75,7 @@ class RainConfig(PretrainedConfig):
         # attn_res
         self.full_attn_res = bool(kwargs.get("full_attn_res", False))
         self.block_attn_res = bool(kwargs.get("block_attn_res", False))
-        self.block_number = int(kwargs.get("block_number", 0))
+        self.block_size = int(kwargs.get("block_size", 0))
 
 
 class RainOmniConfig(RainConfig):
