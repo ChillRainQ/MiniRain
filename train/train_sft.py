@@ -149,6 +149,10 @@ if __name__ == '__main__':
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
+    parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
+    parser.add_argument("--block_size", default=0, type=int, help="块大小")
+
     args = parser.parse_args()
 
     # 训练环境初始化
@@ -161,7 +165,9 @@ if __name__ == '__main__':
     config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
                         use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
                         use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
-                        loop_end=args.loop_end, max_loop_iter=args.max_loop_iter)
+                        loop_end=args.loop_end, max_loop_iter=args.max_loop_iter,
+                        block_size=args.block_size,
+                        block_attn_res=bool(args.use_block_attn_res), full_attn_res=bool(args.use_full_attn_res))
     print(config)
     if args.use_wandb:
         swanlab_login()

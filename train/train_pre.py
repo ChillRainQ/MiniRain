@@ -158,7 +158,9 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniRain-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--scaling_log_dir", type=str, default="../train_logs", help="Scaling Law 分析日志保存目录")
-
+    parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
+    parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
+    parser.add_argument("--block_size", default=0, type=int, help="块大小")
     args = parser.parse_args()
 
     # 训练环境初始化
@@ -171,7 +173,8 @@ if __name__ == "__main__":
     config = RainConfig(hidden_size=int(args.hidden_size), n_hidden_layers=int(args.num_hidden_layers),
                         use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
                         use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
-                        max_loop_iter=int(args.max_loop_iter))
+                        max_loop_iter=int(args.max_loop_iter), block_attn_res=bool(args.use_block_attn_res),
+                        full_attn_res=bool(args.use_full_attn_res), block_size=int(args.block_size))
     print(config)
     if args.use_wandb:
         swanlab_login()

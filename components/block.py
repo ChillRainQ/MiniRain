@@ -88,7 +88,7 @@ class MiniRainBlock(nn.Module):
         elif self.block_attn_res and self.attn_res:
             partial_block = hidden_states
             attn_input = self.attn_res(past_hidden_states, partial_block)
-            if self.layer_number % (self.block_size // 2) == 0:
+            if self.layer_id % (self.block_size // 2) == 0:
                 past_hidden_states.append(partial_block)
                 partial_block = None
         else:
