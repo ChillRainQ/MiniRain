@@ -83,7 +83,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, '
                 f'lr_muon: {muon_lr:.8f}, lr_adam: {adam_lr:.8f}, eta: {eta_min:.1f}min'
             )
-            if wandb:
+            if wandb and is_main_process():
                 swanlab.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,
                                  "lr_muon": muon_lr, "lr_adam": adam_lr, "epoch_time": eta_min})
 
@@ -110,7 +110,7 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
             # 等其他 rank 同步后再继续，避免写盘期间有 rank 提前进入下一步
             if dist.is_initialized():
                 dist.barrier()
-            model.eval()
+            model.train()
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
@@ -161,6 +161,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
     parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
     parser.add_argument("--block_size", default=0, type=int, help="块大小")
+    parser.add_argument("--dropout", default=0, type=float, help="dropout概率")
     args = parser.parse_args()
 
     # 训练环境初始化
@@ -174,16 +175,17 @@ if __name__ == "__main__":
                         use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
                         use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
                         max_loop_iter=int(args.max_loop_iter), block_attn_res=bool(args.use_block_attn_res),
-                        full_attn_res=bool(args.use_full_attn_res), block_size=int(args.block_size))
-    print(config)
-    if args.use_wandb:
+                        full_attn_res=bool(args.use_full_attn_res), block_size=int(args.block_size),
+                        dropout=float(args.dropout))
+    Logger(config)
+    if args.use_wandb and is_main_process():
         swanlab_login()
         swanlab.init(
             # 设置将记录此次实验的项目信息
             project=args.wandb_project,
             workspace="Chill_Rain",
             # 跟踪超参数和实验元数据
-            config=dict(config)
+            config=config.to_dict()
         )
     ckp_data = get_checkpoint(config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
 
@@ -262,7 +264,7 @@ if __name__ == "__main__":
         else:
             train_epoch(model, scaler, muon, adam, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader), 0,
-                        logger=scaling_logger)
+                        logger=scaling_logger, wandb=args.use_wandb)
     if is_main_process():
         scaling_logger.save()
         print("MiniRain pretrain done!")
@@ -273,6 +275,7 @@ if __name__ == "__main__":
         moe_suffix = '_moe' if config.use_moe else ''
         weight_path = f'../ready/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
         save(state_dict, weight_path)
+        swanlab.finish()
     # clear
     if dist.is_initialized():
         dist.barrier()

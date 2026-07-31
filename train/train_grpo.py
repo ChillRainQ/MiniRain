@@ -323,7 +323,7 @@ if __name__ == "__main__":
     config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
                         max_seq_len=args.max_seq_len + args.max_gen_len,
                         use_moe=bool(args.use_moe))
-    print(config)
+    Logger(config)
     # 尝试获取断点
     ckp_data = get_checkpoint(config, weight=args.save_weight,
                               save_dir='../checkpoints') if args.from_resume == 1 else None

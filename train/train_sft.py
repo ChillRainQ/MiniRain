@@ -152,6 +152,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
     parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
     parser.add_argument("--block_size", default=0, type=int, help="块大小")
+    parser.add_argument("--dropout", default=0, type=float, help="dropout概率")
 
     args = parser.parse_args()
 
@@ -162,21 +163,21 @@ if __name__ == '__main__':
 
     # 训练环境检查
     os.makedirs(args.save_dir, exist_ok=True)
-    config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
+    config = RainConfig(hidden_size=int(args.hidden_size), n_hidden_layers=int(args.num_hidden_layers),
                         use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
-                        use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
-                        loop_end=args.loop_end, max_loop_iter=args.max_loop_iter,
-                        block_size=args.block_size,
-                        block_attn_res=bool(args.use_block_attn_res), full_attn_res=bool(args.use_full_attn_res))
-    print(config)
-    if args.use_wandb:
+                        use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
+                        max_loop_iter=int(args.max_loop_iter), block_attn_res=bool(args.use_block_attn_res),
+                        full_attn_res=bool(args.use_full_attn_res), block_size=int(args.block_size),
+                        dropout=float(args.dropout))
+    Logger(config)
+    if args.use_wandb and is_main_process():
         swanlab_login()
         swanlab.init(
             # 设置将记录此次实验的项目信息
             project=args.wandb_project,
             workspace="Chill_Rain",
             # 跟踪超参数和实验元数据
-            config=dict(config)
+            config=config.to_dict()
         )
     # 尝试获取断点
     ckp_data = get_checkpoint(config, weight=args.save_weight,
@@ -251,6 +252,7 @@ if __name__ == '__main__':
         moe_suffix = '_moe' if config.use_moe else ''
         weight_path = f'../ready/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
         save(state_dict, weight_path)
+        swanlab.finish()
     # clear
     if dist.is_initialized():
         dist.barrier()

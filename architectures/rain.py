@@ -59,7 +59,7 @@ class MiniRainModel(nn.Module):
         presents = []
         past_hidden_states = []
         for layer, past_key_value in zip(self.layers, past_key_values):
-            hidden_states, present, past_hidden_states, intra_block_history = layer(
+            hidden_states, present, past_hidden_states = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,

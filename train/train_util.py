@@ -1,3 +1,5 @@
+from typing import Any
+
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
@@ -11,7 +13,85 @@ import torch
 import random
 import torch.distributed as dist
 import swanlab
+from torch import Tensor, nn, optim
 
+class MuonWithAdamW(optim.Optimizer):
+    def __init__(self, model: nn.Module, lr: float, weight_decay: float,
+                 momentum: float, nesterov: bool, ns_steps: int = 5, adjust_lr_fn: str = "match_rms_adamw"):
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_steps": ns_steps,
+            "adjust_lr_fn": adjust_lr_fn,
+        }
+        params = [param for param in model.parameters() if param.requires_grad]
+        super().__init__(params, defaults)
+        # 把参数分成两组，一组Muon（多维），一组AdamW（一维）
+        muon_params: list[Tensor] = get_muon_params(model)
+        adam_params: list[Tensor] = get_adamw_params(model)
+        self.muon = optim.Muon(
+            muon_params,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adjust_lr_fn=adjust_lr_fn,
+        )
+        self.adamw = optim.AdamW(
+            [{"params": adam_params, "weight_decay": 0.0}],
+            lr=lr,
+            betas=(0.9, 0.95),
+            fused=True,
+        )
+        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self.muon.step(closure)
+        self.adamw.step(closure)
+
+    def zero_grad(self, set_to_none: bool = True):
+        """
+        清空两个优化器管理的所有参数的梯度。
+        """
+        self.muon.zero_grad(set_to_none)
+        self.adamw.zero_grad(set_to_none)
+
+    def state_dict(self)  -> dict[str, Any]:
+        return {
+            "muon": self.muon.state_dict(),
+            "adamw": self.adamw.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        """
+        从状态字典恢复两个优化器的状态。
+        """
+        self.muon.load_state_dict(state_dict["muon"])
+        self.adamw.load_state_dict(state_dict["adamw"])
+        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
+
+
+def adamw_params_name() -> list[str]:
+    return ['embed', 'lm_head', 'norm', 'bias']
+
+def get_muon_params(model) -> list[Tensor]:
+    """获取适用于 Muon 优化器的参数：隐藏层 ndim >= 2 的权重矩阵。
+    修复：embedding 和 lm_head 虽然也是 2D，但必须交给 AdamW（Muon 的要求）。"""
+    return [p for n, p in model.named_parameters()
+            if p.requires_grad and p.dim() >= 2
+            and not any(k in n for k in adamw_params_name())]
+
+
+def get_adamw_params(model) -> list[Tensor]:
+    """获取适用于 AdamW 优化器的参数：bias、norm scale 等 ndim < 2 的参数，
+    以及 embedding / lm_head（修复：这两类从 Muon 划归 AdamW）。"""
+    return [p for n, p in model.named_parameters()
+            if p.requires_grad
+            and (p.dim() < 2 or any(k in n for k in adamw_params_name()))]
 
 def swanlab_login():
     swanlab.login(api_key="sghsimiyP151FAEhi4kzS", save=True)
@@ -118,7 +198,7 @@ def get_checkpoint(lm_config, weight='full_sft', model=None, muon=None, adam=Non
         torch.save(state_dict, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
-        if wandb:
+        if wandb and is_main_process():
             if hasattr(wandb, 'get_run'):
                 run = wandb.get_run()
                 wandb_id = getattr(run, 'id', None) if run else None
@@ -162,20 +242,7 @@ def get_checkpoint(lm_config, weight='full_sft', model=None, muon=None, adam=Non
         return None
 
 
-def get_muon_params(model):
-    """获取适用于 Muon 优化器的参数：隐藏层 ndim >= 2 的权重矩阵。
-    修复：embedding 和 lm_head 虽然也是 2D，但必须交给 AdamW（Muon 的要求）。"""
-    return [p for n, p in model.named_parameters()
-            if p.requires_grad and p.ndim >= 2
-            and not any(k in n for k in ('embed', 'lm_head', 'head'))]
 
-
-def get_adam_params(model):
-    """获取适用于 AdamW 优化器的参数：bias、norm scale 等 ndim < 2 的参数，
-    以及 embedding / lm_head（修复：这两类从 Muon 划归 AdamW）。"""
-    return [p for n, p in model.named_parameters()
-            if p.requires_grad
-            and (p.ndim < 2 or any(k in n for k in ('embed', 'lm_head', 'head')))]
 
 
 class SkipBatchSampler(Sampler):
