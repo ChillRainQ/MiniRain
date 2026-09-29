@@ -2,6 +2,8 @@
   <dictionary name="project">
     <words>
       <w>layernorm</w>
+      <w>tffn</w>
+      <w>topk</w>
     </words>
   </dictionary>
 </component>

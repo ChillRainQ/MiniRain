@@ -18,7 +18,7 @@ import torch.distributed as dist
 import swanlab
 from torch import optim, nn
 from architectures.config import RainConfig
-from train.train_util import get_lr, init_distributed_mode, setup_seed, get_checkpoint, get_adam_params, get_muon_params, SkipBatchSampler, save
+from train.train_util import get_lr, init_distributed_mode, setup_seed, get_checkpoint, get_adamw_params, get_muon_params, SkipBatchSampler, save
 
 
 
@@ -220,7 +220,7 @@ if __name__ == "__main__":
 
     # 修复：参数分组后断言无遗漏、无重叠（embedding/lm_head 归 AdamW）
     muon_params = get_muon_params(model)
-    adam_params = get_adam_params(model)
+    adam_params = get_adamw_params(model)
     assert sum(p.numel() for p in muon_params) + sum(p.numel() for p in adam_params) == model_params, \
         '参数分组有遗漏或重叠，请检查 get_muon_params/get_adam_params'
     Logger(f'[Optimizer] Muon params: {sum(p.numel() for p in muon_params)/1e6:.2f}M, '

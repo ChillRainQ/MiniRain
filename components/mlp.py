@@ -1,16 +1,20 @@
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Callable, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from components.norm import RMSNorm, NormArgs
+
 
 @dataclass
 class MLPArgs:
     hidden_size: int
     intermediate_size: int
     bias: bool
+    beta1: int = 4
+    beta2: int = 25
 
 class MyMLP(ABC, nn.Module):
     """MLP 抽象基类。"""
@@ -41,18 +45,8 @@ class MLP(MyMLP):
 
 
 class SwiGLU(MyMLP):
-    """SwiGLU 门控 MLP。
-
-    与标准 MLP 不同，SwiGLU 将输入投影到三个权重空间，其中两个经过
-    SiLU 激活后逐元素相乘。hidden_dim 通常取 8/3 * dim（约 2.67x），
-    而非标准 MLP 的 4x，以保证参数量相当。
-
-    SwiGLU(x) = (xW_gate ⊙ SiLU(xW_up)) W_down
-    """
-
     def __init__(self, args: MLPArgs):
         super().__init__()
-        # hidden_dim = args.hidden_size or int(8 * args.hidden_size / 3)
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
@@ -60,113 +54,195 @@ class SwiGLU(MyMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
+class LowRankMLP(MyMLP):
+    ...
+
+class SiTUGLU(MyMLP):
+    def __init__(self, args: MLPArgs):
+        super().__init__()
+        self.beta1 = args.beta1
+        self.beta2 = args.beta2
+        self.w1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.w2 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.w3 = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w3(self.situ(self.w1(x), self.beta1) * self.softcap(self.w2(x), self.beta2))
+
+    def situ(self, x: torch.Tensor, beta: int):
+        return self.softcap(x, beta=beta) * F.sigmoid(x)
+
+    def softcap(self, x: torch.Tensor, beta: int):
+        return beta * torch.tanh(x / beta)
+
+def build_norm_fn(norm_type, dim, norm_eps, norm_affine):
+    pass
+
+
+class MoTFFN(nn.Module):
+    def __init__(self, n_modalities: int, args: MLPArgs):
+        super().__init__()
+        self.n_modalities = n_modalities
+        self.local_experts = nn.ModuleList([
+            SwiGLU(args=args) for _ in range(self.n_modalities)
+        ])
+        self.local_experts_ffn_norm = nn.ModuleList([
+            RMSNorm(NormArgs(args.hidden_size, args.eps))
+            for _ in range(self.n_modalities)
+        ])
+
+    def forward(self, x, modality_masks):
+        expert_outputs = []
+
+        # Process tokens for each modality separately
+        for i in range(self.n_modalities):
+            expert_input = x[modality_masks[i]]  # Select tokens for this modality
+            expert_output = self.local_experts[i](expert_input)  # Feed-forward processing
+            expert_output = self.local_experts_ffn_norm[i](expert_output)  # Normalization
+            expert_outputs.append(expert_output)
+
+        # Merge modality-specific outputs into a unified tensor
+        merged_output = torch.empty_like(x)
+        for i in range(self.n_modalities):
+            merged_output[modality_masks[i]] = expert_outputs[i]
+
+        return merged_output
+
 
 class Router(nn.Module):
-    """MoE 路由器，将 token 路由到 top-k 个专家。"""
-
+    """
+    标准MoE路由器
+    """
     def __init__(self, dim: int, num_experts: int, top_k: int, noise_scale: float = 0.0):
         super().__init__()
-        self.num_experts = num_experts
         self.top_k = top_k
+        self.num_experts = num_experts
         self.noise_scale = noise_scale
-        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.gate = nn.Linear(dim, self.num_experts, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(self.num_experts))
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
-        """返回 (router_logits, expert_weights, expert_indices)。"""
-        logits = self.gate(x)  # (..., num_experts)
-
-        if self.training and self.noise_scale > 0:
+    def forward(self, x: torch.Tensor):
+        logits = self.gate(x)
+        if self.training and self.noise_scale > 0.0:
             noise = torch.randn_like(logits) * self.noise_scale
-            logits = logits + noise
-
+            logits += noise
+        logits += self.expert_bias
+        # weights (token, experts)
         weights = F.softmax(logits, dim=-1)
+        # topk_idx (num_token, top_k)
         topk_weights, topk_idx = torch.topk(weights, self.top_k, dim=-1)
+        # weight 缩放，让和为1
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_idx = cast(torch.LongTensor, topk_idx)
-
         return logits, topk_weights, topk_idx
 
-
-class MoE(nn.Module):
-    """Mixture of Experts。
-
-    将输入通过路由器分发到 top-k 个专家，输出为各专家输出的加权和。
-    可选地包含一个共享专家（shared expert），处理所有 token，再将结果与
-    路由专家的输出相加（DeepSeek-MoE 风格）。
-
-    支持负载均衡辅助损失（auxiliary loss）以鼓励 token 均匀分配到各专家。
-
-    注意：MoE 返回 (output, aux_loss)，接口不同于 MyMLP（后者只返回 Tensor），
-    因此 MoE 不能直接作为 LlamaDecoderBlock 的 mlp 参数。在 block 中包装即可。
-
-    用法：
-        moe = MoE(
-            dim=512,
-            expert_fn=lambda d: MLP(d, hidden_dim=1024),
-            num_experts=8,
-            top_k=2,
-        )
-        out, aux_loss = moe(x)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        expert_fn: Callable[[int], nn.Module],
-        num_experts: int,
-        top_k: int = 2,
-        shared_expert: Callable[[int], nn.Module] | None = None,
-        noise_scale: float = 0.0,
-    ):
+class AuxMoE(nn.Module):
+    def __init__(self, dim: int, intermediate_size: int, num_experts: int, top_k: int = 2,
+                 num_shared_experts: int = 1, noise_scale: float = 0.0, aux_scale: float = 0.0):
+        assert top_k <= num_experts
         super().__init__()
-        assert top_k <= num_experts, "top_k 不能超过专家数"
         self.dim = dim
-        self.num_experts = num_experts
         self.top_k = top_k
+        self.aux_scale = aux_scale
+        mlp_args = MLPArgs(hidden_size=dim, intermediate_size=intermediate_size, bias=False)
+        self.experts = nn.ModuleList([SwiGLU(mlp_args) for _ in range(num_experts)])
+        self.num_experts = len(self.experts)
+        self.shared_experts = nn.ModuleList([SwiGLU(mlp_args) for _ in range(num_shared_experts)]) if num_shared_experts > 0 else None
+        self.router = Router(dim=self.dim, top_k=self.top_k, noise_scale=noise_scale, num_experts= num_experts)
 
-        self.router = Router(dim, num_experts, top_k, noise_scale)
-        self.experts = nn.ModuleList([expert_fn(dim) for _ in range(num_experts)])
-
-        self.shared = None
-        if shared_expert is not None:
-            self.shared = shared_expert(dim)
-
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_shape = x.shape
-        x_flat: torch.Tensor = x.view(-1, self.dim)  # (B*L, D)
-
-        router_logits: torch.Tensor
-        expert_weights: torch.Tensor
-        expert_idx: torch.LongTensor
-        router_logits, expert_weights, expert_idx = self.router(x_flat)
-
-        out: torch.Tensor = torch.zeros_like(x_flat)
+    def forward(self, x: torch.Tensor):
+        batch_shape = x.shape
+        # 按token变形， token位置由 batch_idx与seq_idx两个坐标确定
+        # (b, s, d) -> (b * s, d)
+        x = x.view(-1, self.dim)
+        num_tokens = x.shape[0]
+        routed_out = torch.zeros_like(x)
+        share_output = torch.zeros_like(x)
+        router_logits, expert_weights, expert_idx = self.router(x)
+        # 共享专家
+        if self.shared_experts is not None:
+            for expert in self.shared_experts:
+                share_output += expert(x)
+        # 按照 expert 遍历
         for expert_id in range(self.num_experts):
-            mask = expert_idx == expert_id  # (B*L, top_k)
-            if not torch.any(mask).item():
+            # 获取当前 expert 的 mask
+            mask = (expert_idx == expert_id)
+            if not mask.any():
                 continue
-            rows, cols = mask.nonzero(as_tuple=True)
-            selected_input: torch.Tensor = x_flat[rows]
-            selected_weights: torch.Tensor = expert_weights[rows, cols]
-            expert_out: torch.Tensor = self.experts[expert_id](selected_input)
-            out.index_add_(0, rows, expert_out * selected_weights.unsqueeze(-1))
+            # 当前 expert 要处理的 token nonzero就是找到True的位置
+            token_indices = mask.nonzero(as_tuple=False)
+            selected_tokens = token_indices[:, 0]
+            # 获取top_k的位置 这个很重要，要拿gate权值的
+            k_positions = token_indices[:, 1]
+            expert_input = x[selected_tokens]
 
-        # 负载均衡损失
-        router_probs: torch.Tensor = F.softmax(router_logits, dim=-1)
+            gate = expert_weights[selected_tokens, k_positions].unsqueeze(-1)
+            expert_output = self.experts[expert_id](expert_input) * gate
+            # 填入已处理的token routed_out (tokens, dim) 得把 token 放到 0的位置
+            routed_out.index_add_(0, selected_tokens, expert_output)
+        output = routed_out + share_output
+        output = output.view(batch_shape)
+        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        # 辅助损失
+        if self.training:
+            # p = 1/T * (sum(s_i))
+            p = F.softmax(router_logits, dim=-1).mean(dim=0)
+            # expert_mask = F.one_hot(expert_idx, self.num_experts).sum(dim=1).float()
+            with torch.no_grad():
+                expert_mask = torch.zeros_like(p)  # (T, N')
+                expert_mask.scatter_(1, expert_idx, 1.0)  # (T, N')
+            per_expert_count = expert_mask.sum(dim=0)
+            f = per_expert_count * (self.num_experts / (self.top_k * num_tokens))
+            aux_loss = self.aux_loss_alpha * (f * p).sum()
+        return output, router_logits, aux_loss
 
-        expert_mask: torch.Tensor = torch.zeros_like(router_probs)
-        expert_mask.scatter_(1, expert_idx, 1.0)  # (B*L, num_experts)
 
-        frac_selected: torch.Tensor = expert_mask.float().mean(dim=0)
-        avg_prob: torch.Tensor = router_probs.mean(dim=0)
-        aux_loss: torch.Tensor = (frac_selected * avg_prob).sum() * self.num_experts
+class LosslessMoE(nn.Module):
+    def __init__(self, dim: int, intermediate_size: int, num_experts: int, top_k: int = 2,
+                 num_shared_experts: int = 1, noise_scale: float = 0.0, aux_scale: float = 0.0):
+        assert top_k <= num_experts
+        super().__init__()
+        self.dim = dim
+        self.top_k = top_k
+        self.aux_scale = aux_scale
+        mlp_args = MLPArgs(hidden_size=dim, intermediate_size=intermediate_size, bias=False)
+        self.experts = nn.ModuleList([SwiGLU(mlp_args) for _ in range(num_experts)])
+        self.num_experts = len(self.experts)
+        self.shared_experts = nn.ModuleList(
+            [SwiGLU(mlp_args) for _ in range(num_shared_experts)]) if num_shared_experts > 0 else None
+        self.router = Router(dim=self.dim, top_k=self.top_k, noise_scale=noise_scale, num_experts=num_experts)
 
-        if self.shared is not None:
-            out = out + cast(torch.Tensor, self.shared(x_flat))
+    def forward(self, x: torch.Tensor):
+        batch_shape = x.shape
+        x = x.view(-1, self.dim)
+        num_tokens = x.shape[0]
+        shared_output = torch.zeros_like(x)
+        routed_output = torch.zeros_like(x)
+        router_logits, expert_weights, expert_idx = self.router(x)
+        if self.shared_experts is not None:
+            for expert in self.shared_experts:
+                shared_output += expert(x)
+        for expert_id in range(self.num_experts):
+            mask = (expert_idx == expert_id)
+            if not mask.any():
+                continue
+            token_indices = mask.nonzero(as_tuple=False)
+            selected_tokens = token_indices[:, 0]
+            k_position = token_indices[:, 1]
+            expert_input = x[selected_tokens]
+            gate = expert_weights[selected_tokens, k_position].unsqueeze(-1)
+            expert_output = self.experts[expert_id](expert_input) * gate
+            routed_output.index_add_(0, selected_tokens, expert_output)
+        output = routed_output + shared_output
+        output = output.view(batch_shape)
+        if self.training:
+            with torch.no_grad():
+                # c_i: 每个专家实际被分配了多少 token（含 top_k 重复）
+                expert_mask = torch.zeros(num_tokens, self.num_experts, device=x.device)
+                expert_mask.scatter_(1, expert_idx, 1.0)
+                c_i = expert_mask.sum(dim=0)
+            c = c_i.new_tensor((self.top_k * num_tokens) / self.num_experts)
+            e_i = c - c_i
+            self.router.expert_bias = self.router.expert_bias + self.aux_scale * torch.sign(e_i)
+        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        return output, router_logits, aux_loss
 
-        out = out.view(orig_shape)
-        return out, aux_loss

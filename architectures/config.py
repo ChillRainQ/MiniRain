@@ -25,6 +25,7 @@ class RainConfig(PretrainedConfig):
                 self.type_id = 3
             elif use_bounce:
                 self.type_id = 6
+        self.model_type_: str = str(kwargs.get("model_type", ""))
         self.vocab_size: int = int(kwargs.get("vocab_size", 6400))
         self.hidden_size: int = hidden_size
         self.n_hidden_layers: int = n_hidden_layers
@@ -60,22 +61,14 @@ class RainConfig(PretrainedConfig):
         self.per_active_experts: int = 0 if not use_moe else kwargs.get("per_active_experts", 1)
         self.router_aux_loss_coef: float = float(kwargs.get("router_aux_loss_coef", 5e-4))
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
-        # Loop flag
-        self.use_loop = use_loop
-        # Bounce flag
-        self.use_bounce = use_bounce
-        # loop config
-        self.loop_start: int = int(kwargs.get("loop_start", 0))
-        self.loop_end: int = int(kwargs.get("loop_end", self.n_hidden_layers))
-        self.max_loop_iter: int = int(kwargs.get("max_loop_iter", 3))
-        # bounce config：区间 [bounce_start, bounce_end] 含端点，首层与末两层不进区间
-        self.bounce_start: int = int(kwargs.get("bounce_start", min(2, self.n_hidden_layers)))
-        self.bounce_end: int = int(kwargs.get("bounce_end", self.n_hidden_layers - 1 - 2))
-        self.phase_init_std: float = float(kwargs.get("phase_init_std", 0.02))
         # attn_res
         self.full_attn_res = bool(kwargs.get("full_attn_res", False))
         self.block_attn_res = bool(kwargs.get("block_attn_res", False))
         self.block_size = int(kwargs.get("block_size", 0))
+        self.patch_size = int(kwargs.get("patch_size", 16))
+        # vision
+        self.img_patch_token = int(kwargs.get("img_patch_token", 12))
+
 
 
 class RainOmniConfig(RainConfig):

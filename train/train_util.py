@@ -3,7 +3,7 @@ from typing import Any
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
-from architectures.rain import MiniRainForCausalLM
+from architectures.rain import MiniRainForCausalLM, MiniRainVForCausalLM
 import math
 import csv
 import glob
@@ -154,7 +154,7 @@ def init_model(config, from_weight='pretrain', tokenizer_path='../tokenizers', s
     初始化模型
     """
     device = device if torch.cuda.is_available() else 'cpu'
-    model = MiniRainForCausalLM(config)
+    model = MiniRainVForCausalLM(config) if config.model_type_ in ['v', 'V'] else MiniRainForCausalLM(config)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     if from_weight != "none":

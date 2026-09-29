@@ -10,7 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    def rotate_half(x):
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    if cos.dim() == 3:
+        unsqueeze_dim = 2
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
@@ -89,6 +92,134 @@ class GroupQueryAttention(nn.Module):
         return output, past_kv
         
         
-        
-        
+class MoTAttention(nn.Module):
+    def __init__(self, dim: int,
+                 head_dim: int,
+                 n_heads: int,
+                 dropout: float,
+                 norm_eps: float = 1e-5,
+                 qk_normalization: bool = False,
+                 n_modalities: int = 2):
+        super().__init__()
+
+        self.n_modalities = n_modalities
+
+        self.local_experts_wq = self._create_experts(dim, head_dim * n_heads)
+        self.local_experts_wk = self._create_experts(dim, head_dim * n_heads)
+        self.local_experts_wv = self._create_experts(dim, head_dim * n_heads)
+        self.local_experts_wo = self._create_experts(head_dim * n_heads, dim)
+
+        self.head_dim = head_dim
+
+        if qk_normalization:
+            # 对每种模态的 Q 和 K 分别做 LayerNorm
+            self.local_experts_q_normalization = self._create_norms(
+                head_dim, self.n_modalities, eps=norm_eps
+            )
+            self.local_experts_k_normalization = self._create_norms(
+                head_dim, self.n_modalities, eps=norm_eps
+            )
+
+        self.local_experts_attention_norm = self._create_norms(
+            dim, self.n_modalities
+        )
+        # 全局的自注意力，这里后面可以用自己实现的Attention来替换。
+        self.attentions = torch.nn.MultiheadAttention(
+            embed_dim=n_heads * head_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, modality_masks: torch.Tensor):
+        # 提取所有的QKV
+        expert_outputs_xq, expert_outputs_xk, expert_outputs_xv = self._process_qkv(
+            x, modality_masks
+        )
+        # qkv合并
+        xq = self._merge_qkv(expert_outputs_xq, modality_masks)
+        xk = self._merge_qkv(expert_outputs_xk, modality_masks)
+        xv = self._merge_qkv(expert_outputs_xv, modality_masks)
+
+        # 全局自注意力计算
+        attn_output, attn_output_weights = self.attention_comp(
+            xq, xk, xv, attn_mask=attn_mask
+        )
+
+        attn_output = self._process_final_output(attn_output, modality_masks)
+
+        return attn_output, attn_output_weights
+
+    def _merge_qkv(self, expert_outputs: list, modality_masks:torch.Tensor):
+        # 确保形状一致
+        merged = torch.empty_like(expert_outputs[0])
+        for i, expert_output in enumerate(expert_outputs):
+            merged[modality_masks[i]] = expert_output
+        return merged
+
+    def _process_qkv(self, x: torch.Tensor, modality_mask: torch.Tensor):
+        expert_outputs_xq, expert_outputs_xk, expert_outputs_xv = [], [], []
+        """
+        modality_mask: (1, n_modalities)
+        """
+        for i in range(self.n_modalities):
+            # 获取对应模态的输入x
+            expert_input = x[modality_mask[i]]
+            # 对模态获取其qkv
+            xq = self.local_experts_wq[i](expert_input)
+            xk = self.local_experts_wk[i](expert_input)
+            xv = self.local_experts_wv[i](expert_input)
+            if hasattr(self, "local_experts_q_normalization"):
+                xq = self.local_experts_q_normalization[i](xq)
+                xk = self.local_experts_k_normalization[i](xk)
+            # 合并所有的qkv
+            expert_outputs_xq.append(xq)
+            expert_outputs_xk.append(xk)
+            expert_outputs_xv.append(xv)
+
+        return expert_outputs_xq, expert_outputs_xk, expert_outputs_xv
+
+    def _create_experts(self, input_dim: int, output_dim: int):
+        """
+        为各个模态创建 qkvo
+        :param input_dim:
+        :param output_dim:
+        :return:
+        """
+        return torch.nn.ModuleList(
+            [
+                torch.nn.Linear(
+                    input_dim,
+                    output_dim,
+                    bias=False,  # 论文及常见 LLM 实现中通常不使用 bias
+                )
+                for _ in range(self.n_modalities)
+            ]
+        )
+
+    def _create_norms(self, dim: int, n_modalities: int, eps: float=1e-5):
+        """
+        为各个模态创建norm
+        """
+        return torch.nn.ModuleList(
+            [torch.nn.LayerNorm(dim, eps=eps) for _ in range(n_modalities)]
+        )
+
+    def _process_final_output(self, output, modality_masks):
+        """
+        处理注意力的最终输出
+        """
+        expert_outputs = []
+        for i in range(self.n_modalities):
+            # 取出属于第 i 种模态的注意力输出
+            expert_input = output[modality_masks[i]]
+            # 模态专属的输出投影 Wo
+            expert_output = self.local_experts_wo[i](expert_input)
+
+            # 模态专属的 LayerNorm
+            expert_output = self.local_experts_attention_norm[i](expert_output)
+            expert_outputs.append(expert_output)
+
+        # 重新拼回完整序列顺序
+        return self._merge_modalities(expert_outputs, modality_masks)
         
