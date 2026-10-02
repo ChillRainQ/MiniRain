@@ -83,6 +83,7 @@ class MiniRainVLM(nn.Module):
         mask = input_ids == self.img_patch
         assert mask.sum().item() == patches.shape[0], \
             f"占位token数({mask.sum().item()})与patch数({patches.shape[0]})不一致"
+        # 覆盖图像位置的embeds
         inputs_embeds[mask] = patches.to(inputs_embeds.dtype)
         return inputs_embeds
 
@@ -175,6 +176,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                  repetition_penalty=1.0, **kwargs):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
+        if positions is not None: positions = positions.repeat(num_return_sequences, 1, 1)
         if pixel_values is not None: pixel_values = pixel_values * num_return_sequences
         past_key_values = kwargs.pop("past_key_values", None)
         # 记录 prompt 末尾的位置编号：图像段占用了额外的行号，

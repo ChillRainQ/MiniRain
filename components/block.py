@@ -133,11 +133,11 @@ class FullAttnResBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None):
+                past_hidden_states=None, image_bidirectional_mask=None):
         attn_input = self.attn_res(past_hidden_states + [hidden_states])
         attn_out, past_key_value = self.attn(
             self.input_layernorm(attn_input), position_embeddings,
-            past_key_value, use_cache, attention_mask)
+            past_key_value, use_cache, attention_mask, image_bidirectional_mask)
         attn_out = hidden_states + attn_out
         past_hidden_states.append(attn_out)
         mlp_input = self.mlp_res(past_hidden_states)
