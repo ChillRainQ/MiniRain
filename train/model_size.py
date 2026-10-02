@@ -40,5 +40,5 @@ if __name__ == "__main__":
     print(f"Model Type: {model.name}")
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     vision_params = sum(p.numel() for p in model.model.patch_embed.parameters() if p.requires_grad)
-    print(f'[ScalingLaw] Vision Params: {vision_params/1e6:.2f}M')
+    print(f'[ScalingLaw] Vision Embed Params: {vision_params/1e6:.2f}M')
     print(f'[ScalingLaw] Model Params: {model_params/1e6:.2f}M')

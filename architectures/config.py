@@ -68,6 +68,9 @@ class RainConfig(PretrainedConfig):
         self.patch_size = int(kwargs.get("patch_size", 16))
         # vision
         self.img_patch_token = int(kwargs.get("img_patch_token", 12))
+        self.img_start_token = int(kwargs.get("img_start_token", 9))
+        self.img_end_token = int(kwargs.get("img_end_token", 10))
+        self.img_row_token = int(kwargs.get("img_row_token", 27))
 
 
 

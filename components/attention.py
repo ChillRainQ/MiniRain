@@ -58,7 +58,7 @@ class GroupQueryAttention(nn.Module):
         self.dropout = config.n_dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask = None):
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask = None, image_bidirectional_mask = None):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -79,7 +79,16 @@ class GroupQueryAttention(nn.Module):
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        use_flash = self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None)
+        if image_bidirectional_mask is not None:
+            # 显式 mask：因果 + 图像段内双向（已含 padding 屏蔽）
+            if use_flash:
+                output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, attn_mask=image_bidirectional_mask)
+            else:
+                scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                scores = scores + image_bidirectional_mask
+                output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        elif use_flash and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)

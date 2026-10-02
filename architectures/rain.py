@@ -2,7 +2,7 @@
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
-from components.block import MiniRainBlock, BlockAttnResBlock
+from components.block import MiniRainBlock, FullAttnResBlock
 from components.norm import NormArgs
 from components.norm import RMSNorm
 from architectures.config import RainConfig
@@ -53,13 +53,16 @@ class MiniRainVLM(nn.Module):
         # 文本
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
-        self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
+        self.layers = nn.ModuleList([FullAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
         self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
         self.patch_embed = nn.Conv2d(3, config.hidden_size,
                                      kernel_size=self.patch_size, stride=self.patch_size)
         self.img_patch = config.img_patch_token
+        self.img_start = config.img_start_token
+        self.img_end = config.img_end_token
+        self.img_row = config.img_row_token
         cos_tab, sin_tab = precompute_freqs_cis_2d(
             self.config.head_dim,
             end=self.config.max_position_embeddings,
@@ -83,6 +86,24 @@ class MiniRainVLM(nn.Module):
         inputs_embeds[mask] = patches.to(inputs_embeds.dtype)
         return inputs_embeds
 
+    def _build_image_bidirectional_mask(self, input_ids, attention_mask, dtype):
+        device = input_ids.device
+        bsz, seq_len = input_ids.shape
+        img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
+                               dtype=torch.long, device=device)
+        is_img = torch.isin(input_ids, img_ids)  # [B, S]
+        # 段号：每遇到一个 <|vision_start|> 递增，同一张图的 token 段号相同
+        seg = torch.cumsum((input_ids == self.img_start).long(), dim=1)  # [B, S]
+        same_img = is_img.unsqueeze(2) & is_img.unsqueeze(1) & \
+                   (seg.unsqueeze(2) == seg.unsqueeze(1))  # 同段才双向
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        allow = causal.unsqueeze(0) | same_img
+        if attention_mask is not None:
+            allow = allow & attention_mask[:, None, :].bool()  # 只屏蔽 key 维（见下）
+        mask = torch.where(allow, torch.zeros((), dtype=dtype, device=device),
+                           torch.full((), float("-inf"), dtype=dtype, device=device))
+        return mask.unsqueeze(1)
+
     def forward(self, input_ids, pixel_values=None, positions=None,
                 attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
         batch_size, seq_length = input_ids.shape
@@ -91,6 +112,10 @@ class MiniRainVLM(nn.Module):
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.dropout(self.prepare_inputs_embeds(input_ids, pixel_values))
+
+        image_bidirectional_mask = None
+        if pixel_values is not None:
+            image_bidirectional_mask = self._build_image_bidirectional_mask(input_ids, attention_mask, hidden_states.dtype)
 
         if positions is None:  # 纯文本路径：行=列=下标，退化为1D
             pos = torch.arange(start_pos, start_pos + seq_length, device=input_ids.device)
@@ -107,6 +132,7 @@ class MiniRainVLM(nn.Module):
                 use_cache=use_cache,
                 attention_mask=attention_mask,
                 past_hidden_states=past_hidden_states,
+                image_bidirectional_mask=image_bidirectional_mask,
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)

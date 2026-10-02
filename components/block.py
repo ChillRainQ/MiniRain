@@ -164,7 +164,7 @@ class BlockAttnResBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None):
+                past_hidden_states=None, image_bidirectional_mask=None):
         partial_block = hidden_states
         attn_input = self.attn_res(past_hidden_states, partial_block)
         if self.layer_id % (self.block_size // 2) == 0:
@@ -172,7 +172,7 @@ class BlockAttnResBlock(nn.Module):
             partial_block = None
         else:
             attn_input = hidden_states
-        attn_out, past_key_value = self.attn(self.input_layernorm(attn_input), position_embeddings, past_key_value, use_cache, attention_mask)
+        attn_out, past_key_value = self.attn(self.input_layernorm(attn_input), position_embeddings, past_key_value, use_cache, attention_mask, image_bidirectional_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
