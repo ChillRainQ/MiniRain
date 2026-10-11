@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Georgia, 'Times New Roman', 'Microsoft YaHei', serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#333"/>
+    </marker>
+    <style>
+      .ttl { font-style: italic; font-weight: bold; font-size: 17px; fill: #111; }
+      .bx  { font-size: 14px; fill: #111; font-style: italic; }
+      .bxc { font-size: 13px; fill: #111; font-style: italic; }
+      .sm  { font-size: 11px; fill: #333; }
+      .wt  { font-size: 13px; fill: #fff; font-weight: bold; }
+      .ctr { text-anchor: middle; dominant-baseline: middle; }
+      .ln  { stroke: #333; stroke-width: 1.7; fill: none; marker-end: url(#ar); }
+      .ld  { stroke: #333; stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; marker-end: url(#ar); }
+    </style>
+  </defs>
+  <rect width="1280" height="720" fill="#ffffff"/>
+
+  <!-- ============ 面板1: 整体流程 ============ -->
+  <text x="150" y="192" class="ttl ctr">MiniRainVLM</text>
+
+  <rect x="95" y="610" width="60" height="30" rx="4" fill="#F2A33C"/>
+  <text x="125" y="626" class="wt ctr">text</text>
+  <rect x="165" y="610" width="60" height="30" rx="4" fill="#C0392B"/>
+  <text x="195" y="626" class="wt ctr">image</text>
+  <line x1="125" y1="610" x2="140" y2="590" class="ln"/>
+  <line x1="195" y1="610" x2="160" y2="590" class="ln"/>
+
+  <rect x="65" y="545" width="170" height="45" rx="6" fill="#FBE9A7" stroke="#D8B84E"/>
+  <text x="150" y="562" class="bx ctr">Embedding &amp;</text>
+  <text x="150" y="579" class="bx ctr">Patch Merge</text>
+  <line x1="150" y1="545" x2="150" y2="520" class="ln"/>
+
+  <rect x="60" y="380" width="180" height="140" rx="8" fill="#E3CCEF" stroke="#A86CC0" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="150" y="435" class="bx ctr" font-size="15">BlockAttnRes</text>
+  <text x="150" y="457" class="bx ctr" font-size="15">Block (Layer k)</text>
+  <circle cx="212" cy="492" r="13" fill="none" stroke="#C0392B" stroke-width="2.2"/>
+  <text x="212" y="493" class="ctr" font-size="13" fill="#C0392B" font-weight="bold">↻</text>
+  <text x="235" y="505" class="ctr" font-size="14" fill="#C0392B" font-weight="bold">×K</text>
+  <line x1="150" y1="380" x2="150" y2="362" class="ln"/>
+
+  <rect x="75" y="330" width="150" height="32" rx="5" fill="#C9CED6" stroke="#9AA2AD"/>
+  <text x="150" y="347" class="bx ctr">RMSNorm</text>
+  <line x1="150" y1="330" x2="150" y2="305" class="ln"/>
+
+  <rect x="75" y="270" width="150" height="32" rx="5" fill="#A9C7E8" stroke="#7FA3CC"/>
+  <text x="150" y="287" class="bx ctr">lm_head (tied)</text>
+  <line x1="150" y1="270" x2="150" y2="255" class="ln"/>
+
+  <rect x="100" y="222" width="100" height="30" rx="4" fill="#F2A33C"/>
+  <text x="150" y="238" class="wt ctr">logits</text>
+
+  <!-- 面板1→2 连接三角 -->
+  <polygon points="258,425 300,409 300,441" fill="#C9A6DE" opacity="0.9"/>
+  <polygon points="258,462 300,446 300,478" fill="#C9A6DE" opacity="0.9"/>
+
+  <!-- ============ 面板2: Layer k ============ -->
+  <text x="435" y="192" class="ttl ctr">Layer k</text>
+  <rect x="330" y="200" width="210" height="455" rx="10" fill="#F2E4F8" stroke="#C9A6DE" stroke-width="1.2"/>
+
+  <line x1="400" y1="655" x2="400" y2="620" class="ln"/>
+
+  <rect x="340" y="585" width="120" height="35" rx="6" fill="#FBE9A7" stroke="#D8B84E"/>
+  <text x="400" y="603" class="bxc ctr">BlockAttnRes</text>
+  <line x1="400" y1="585" x2="400" y2="560" class="ln"/>
+
+  <rect x="340" y="500" width="120" height="60" rx="6" fill="#DDEDD8" stroke="#A9C9A0"/>
+  <text x="400" y="524" class="bx ctr">MoT-GQA</text>
+  <text x="400" y="543" class="sm ctr" font-size="10">RMSNorm + Attn</text>
+  <line x1="400" y1="500" x2="400" y2="455" class="ln"/>
+
+  <rect x="340" y="420" width="120" height="35" rx="6" fill="#FBE9A7" stroke="#D8B84E"/>
+  <text x="400" y="438" class="bxc ctr">BlockAttnRes</text>
+  <line x1="400" y1="420" x2="400" y2="390" class="ln"/>
+
+  <rect x="340" y="330" width="120" height="60" rx="6" fill="#DDEDD8" stroke="#A9C9A0"/>
+  <text x="400" y="352" class="bx ctr">FFN</text>
+  <text x="400" y="371" class="sm ctr" font-size="10">SwiGLU / MoE</text>
+  <line x1="400" y1="330" x2="400" y2="300" class="ln"/>
+
+  <!-- 块间历史侧注 -->
+  <rect x="468" y="440" width="62" height="80" rx="6" fill="#FFF3D6" stroke="#D8B84E" stroke-dasharray="4 3"/>
+  <text x="499" y="470" class="sm ctr" font-size="10">块间历史</text>
+  <text x="499" y="488" class="sm ctr" font-size="9">嵌入+块尾</text>
+  <line x1="468" y1="455" x2="460" y2="440" class="ld"/>
+  <line x1="468" y1="505" x2="460" y2="600" class="ld"/>
+  <text x="499" y="535" class="sm ctr" font-size="9.5" fill="#7A5C00">偶数层 append</text>
+
+  <text x="435" y="672" class="sm ctr" font-size="10.5">块内经典残差 ｜ 块间可学习聚合</text>
+
+  <!-- ============ 面板3: (a) MoT-GQA ============ -->
+  <text x="745" y="192" class="ttl ctr">(a) MoT-GQA</text>
+  <rect x="590" y="200" width="310" height="455" rx="10" fill="#EEF7E6" stroke="#BBD8A8" stroke-width="1.2"/>
+
+  <line x1="710" y1="655" x2="710" y2="620" class="ln"/>
+
+  <rect x="640" y="590" width="140" height="30" rx="5" fill="#C9CED6" stroke="#9AA2AD"/>
+  <text x="710" y="606" class="bx ctr">RMSNorm</text>
+  <line x1="710" y1="590" x2="710" y2="576" class="ln"/>
+
+  <rect x="620" y="548" width="180" height="28" rx="5" fill="#FBE9A7" stroke="#D8B84E"/>
+  <text x="710" y="563" class="bxc ctr" font-size="12">modality 分拣 (0文/1图)</text>
+
+  <line x1="635" y1="548" x2="635" y2="510" class="ln"/>
+  <line x1="700" y1="548" x2="700" y2="510" class="ln"/>
+  <line x1="765" y1="548" x2="765" y2="510" class="ln"/>
+
+  <rect x="610" y="480" width="50" height="30" rx="4" fill="#222222"/>
+  <text x="635" y="496" class="wt ctr">Q</text>
+  <rect x="675" y="480" width="50" height="30" rx="4" fill="#555555"/>
+  <text x="700" y="496" class="wt ctr">K'</text>
+  <rect x="740" y="480" width="50" height="30" rx="4" fill="#777777"/>
+  <text x="765" y="496" class="wt ctr">V'</text>
+  <text x="812" y="495" class="sm" font-size="10">wq/wk/wv ×2 expert</text>
+
+  <circle cx="635" cy="452" r="10" fill="#fff" stroke="#333" stroke-width="1.4"/>
+  <text x="635" y="453" class="ctr" font-size="10.5">R</text>
+  <circle cx="700" cy="452" r="10" fill="#fff" stroke="#333" stroke-width="1.4"/>
+  <text x="700" y="453" class="ctr" font-size="10.5">R</text>
+  <text x="668" y="438" class="sm ctr" font-size="9.5">RoPE 2D</text>
+  <line x1="635" y1="480" x2="635" y2="462" class="ln"/>
+  <line x1="700" y1="480" x2="700" y2="462" class="ln"/>
+
+  <!-- Q·K -->
+  <circle cx="700" cy="410" r="11" fill="#fff" stroke="#333" stroke-width="1.5"/>
+  <text x="700" y="411" class="ctr" font-size="13">⊗</text>
+  <line x1="635" y1="442" x2="692" y2="415" class="ln"/>
+  <line x1="700" y1="442" x2="700" y2="421" class="ln"/>
+
+  <!-- mask 三角 -->
+  <polygon points="605,395 645,395 645,425 605,425" fill="#fff" stroke="#333"/>
+  <polygon points="605,395 645,395 645,425" fill="#111"/>
+  <text x="609" y="410" class="sm" font-size="9" fill="#fff">-∞</text>
+  <text x="633" y="421" class="sm" font-size="9">0</text>
+  <text x="602" y="388" class="sm" font-size="9.5">mask: 因果|图内双向</text>
+
+  <!-- 加 mask -->
+  <circle cx="672" cy="410" r="8" fill="#fff" stroke="#333" stroke-width="1.3"/>
+  <text x="672" y="411" class="ctr" font-size="11">+</text>
+  <line x1="645" y1="410" x2="664" y2="410" class="ln"/>
+  <line x1="689" y1="410" x2="680" y2="410" class="ln"/>
+
+  <!-- SoftMax -->
+  <rect x="730" y="396" width="80" height="28" rx="5" fill="#F5A962" stroke="#D98A3E"/>
+  <text x="770" y="411" class="bxc ctr" font-size="12">SoftMax</text>
+  <line x1="700" y1="399" x2="730" y2="404" class="ln"/>
+
+  <!-- ⊗V -->
+  <circle cx="790" cy="452" r="11" fill="#fff" stroke="#333" stroke-width="1.5"/>
+  <text x="790" y="453" class="ctr" font-size="13">⊗</text>
+  <line x1="765" y1="480" x2="785" y2="462" class="ln"/>
+  <line x1="770" y1="424" x2="787" y2="442" class="ln"/>
+
+  <!-- wo -->
+  <rect x="700" y="330" width="160" height="32" rx="5" fill="#A9C7E8" stroke="#7FA3CC"/>
+  <text x="780" y="347" class="bxc ctr" font-size="12.5">Linear ×2 (wo 分模态)</text>
+  <line x1="790" y1="441" x2="782" y2="362" class="ln"/>
+  <line x1="780" y1="330" x2="780" y2="300" class="ln"/>
+
+  <!-- KV cache 虚线 -->
+  <path d="M790,480 L872,480 L872,346 L860,346" class="ld"/>
+  <text x="700" y="290" class="sm" font-size="10">KV cache (decode 增量)</text>
+
+  <!-- ============ 面板4: (b) BlockAttnRes ============ -->
+  <text x="1085" y="192" class="ttl ctr">(b) BlockAttnRes</text>
+  <rect x="950" y="200" width="270" height="455" rx="10" fill="#F4F4F4" stroke="#CCCCCC" stroke-width="1.2"/>
+
+  <line x1="1082" y1="655" x2="1082" y2="600" class="ln"/>
+
+  <!-- 历史栈 -->
+  <rect x="996" y="551" width="160" height="34" rx="5" fill="#FBE9A7" stroke="#D8B84E"/>
+  <rect x="1002" y="557" width="160" height="34" rx="5" fill="#FBE9A7" stroke="#D8B84E"/>
+  <rect x="1008" y="563" width="160" height="34" rx="5" fill="#FFF8E6" stroke="#D8B84E"/>
+  <text x="1088" y="581" class="bxc ctr" font-size="11.5">history + 当前输入</text>
+  <text x="1088" y="607" class="sm ctr" font-size="9.5">[嵌入, 块0尾, 块1尾, …]</text>
+
+  <line x1="1082" y1="563" x2="1082" y2="530" class="ln"/>
+
+  <rect x="1010" y="500" width="140" height="30" rx="5" fill="#C9CED6" stroke="#9AA2AD"/>
+  <text x="1080" y="516" class="bx ctr" font-size="13">RMSNorm</text>
+
+  <!-- query 点积 -->
+  <rect x="958" y="445" width="90" height="26" rx="5" fill="#F2A33C"/>
+  <text x="1003" y="459" class="wt ctr" font-size="11">query 可学</text>
+  <circle cx="1085" cy="458" r="9" fill="#fff" stroke="#333" stroke-width="1.4"/>
+  <text x="1085" y="459" class="ctr" font-size="12">·</text>
+  <line x1="1080" y1="500" x2="1084" y2="467" class="ln"/>
+  <line x1="1048" y1="458" x2="1076" y2="458" class="ln"/>
+
+  <!-- SoftMax α -->
+  <rect x="1020" y="395" width="110" height="28" rx="5" fill="#F5A962" stroke="#D98A3E"/>
+  <text x="1075" y="410" class="bxc ctr" font-size="12">SoftMax → α</text>
+  <line x1="1084" y1="449" x2="1077" y2="423" class="ln"/>
+
+  <!-- Σ 加权 -->
+  <circle cx="1070" cy="352" r="12" fill="#fff" stroke="#333" stroke-width="1.5"/>
+  <text x="1070" y="353" class="ctr" font-size="13">Σ</text>
+  <line x1="1074" y1="395" x2="1071" y2="364" class="ln"/>
+  <text x="1100" y="345" class="sm" font-size="10">加权求和</text>
+
+  <!-- V 旁路(未归一化历史) -->
+  <path d="M1168,574 L1192,574 L1192,352 L1082,352" class="ln"/>
+
+  <line x1="1070" y1="340" x2="1070" y2="300" class="ln"/>
+
+  <text x="1085" y="630" class="sm ctr" font-size="10">零初始化 → α 均匀 = 均值聚合</text>
+  <text x="1085" y="647" class="sm ctr" font-size="10">偶数层: 当前输入 append 进 history</text>
+
+  <!-- ============ 底部标题 ============ -->
+  <text x="640" y="702" class="ctr" font-style="italic" font-weight="bold" font-size="21" fill="#111">The Structure of MiniRainVLM</text>
+</svg>
