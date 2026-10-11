@@ -10,6 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    应用位置编码
+    """
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
     if cos.dim() == 3:

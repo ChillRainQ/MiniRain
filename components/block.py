@@ -163,6 +163,7 @@ class FullAttnResBlock(nn.Module):
         past_hidden_states.append(hidden_states)
         mlp_input = self.mlp_res(past_hidden_states + [attn_out])
         mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
+        if isinstance(mlp_out, tuple): mlp_out = mlp_out[0]  # MoE 返回 (out, logits, aux)
         # output = attn_out + mlp_out
         past_hidden_states.append(attn_out)
         return mlp_out, past_key_value, past_hidden_states
@@ -217,5 +218,6 @@ class BlockAttnResBlock(nn.Module):
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
+        if isinstance(mlp_out, tuple): mlp_out = mlp_out[0]  # MoE 返回 (out, logits, aux)
         output = partial_block + mlp_out
         return output, past_key_value, past_hidden_states

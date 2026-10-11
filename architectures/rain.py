@@ -28,13 +28,23 @@ def precompute_freqs_cis(dim: int, end: int = 32 * 1024, rope_base: float = 1e6,
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
-def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6):
+def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
     half = head_dim // 2
-    freqs = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half))
+    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half)), 1.0
+    if rope_scaling is not None:  # YaRN，按轴内维度 half 计算，与 1D 版同式
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+        )
+        if end / orig_max > 1.0:
+            inv_dim = lambda b: (half * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
+            ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1 - ramp + ramp / factor)
     t = torch.arange(end)
     ang = torch.outer(t, freqs)          # [P, half/2]
-    return ang.cos(), ang.sin()          # 两张表：按行/列索引查
+    return ang.cos() * attn_factor, ang.sin() * attn_factor   # 两张表：按行/列索引查
 
 def build_2d_position_embeddings(positions, cos_tab, sin_tab):
     rows, cols = positions[..., 0], positions[..., 1]
@@ -66,7 +76,8 @@ class MiniRainVLM(nn.Module):
         cos_tab, sin_tab = precompute_freqs_cis_2d(
             self.config.head_dim,
             end=self.config.max_position_embeddings,
-            rope_base=self.config.rope_theta)
+            rope_base=self.config.rope_theta,
+            rope_scaling=getattr(self.config, "rope_scaling", None))
         self.register_buffer("rope2d_cos", cos_tab, persistent=False)
         self.register_buffer("rope2d_sin", sin_tab, persistent=False)
 
