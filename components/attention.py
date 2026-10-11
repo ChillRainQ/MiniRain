@@ -135,15 +135,23 @@ class MoTGroupQueryAttention(nn.Module):
         self.flash = hasattr(F, 'scaled_dot_product_attention') and config.flash_attn
 
     def _modal_indices(self, modality_mask):
+        """
+        获取不同模态索引
+        """
         flat = modality_mask.reshape(-1)
         return [(flat == i).nonzero(as_tuple=True)[0] for i in range(self.n_modalities)]
 
     def _project_modal(self, layers, x, idxs):
+        """
+        token分拣
+        """
+        # 为空时默认全为文本
         if idxs is None:
             return layers[0](x)
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         out = None
+        # token分拣
         for layer, idx in zip(layers, idxs):
             if idx.numel() == 0:
                 continue
@@ -156,9 +164,10 @@ class MoTGroupQueryAttention(nn.Module):
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False,
                 attention_mask=None, image_bidirectional_mask=None, modality_mask=None):
         bsz, seq_len, _ = x.shape
-        xq = self._project_modal(self.wq, x, modality_mask)
-        xk = self._project_modal(self.wk, x, modality_mask)
-        xv = self._project_modal(self.wv, x, modality_mask)
+        idxs = self._modal_indices(modality_mask) if modality_mask is not None else None
+        xq = self._project_modal(self.wq, x, idxs)
+        xk = self._project_modal(self.wk, x, idxs)
+        xv = self._project_modal(self.wv, x, idxs)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_key_value_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_key_value_heads, self.head_dim)
@@ -202,7 +211,7 @@ class MoTGroupQueryAttention(nn.Module):
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self._project_modal(self.wo, output, modality_mask)   # wo 也按模态
+        output = self._project_modal(self.wo, output, idxs)   # wo 也按模态
         output = self.resid_dropout(output)
         return output, past_kv
 

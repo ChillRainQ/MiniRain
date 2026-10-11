@@ -84,7 +84,8 @@ class VLMCollator:
                 f"图像段({head_len})+EOS 已超出 max_len={self.max_len}，图太大或 max_len 太小"
             keep_text = self.max_len - head_len - 1         # 留给文本的额度
             ids    = ids[:head_len] + ids[head_len:head_len + keep_text] + [EOS]
-            pos    = pos[:head_len] + pos[head_len:head_len + keep_text] + [pos[-1]]
+            end_r, end_c = pos[head_len + keep_text - 1]    # 保留文本末尾位置
+            pos    = pos[:head_len] + pos[head_len:head_len + keep_text] + [(end_r + 1, end_c + 1)]
             labels = labels[:head_len] + labels[head_len:head_len + keep_text] + [EOS]
         return ids, pos, labels, pixel_values
 

@@ -206,8 +206,9 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             # pyrefly: ignore [unsupported-operation]
             logits = outputs.logits[:, -1, :] / temperature
-            # 禁止生成视觉占位/边界 token，防止输出污染
-            logits[:, [9, 10, 11, 12, 13]] = -float('inf')
+            # 禁止生成视觉占位/边界 token（含换行 img_row），防止输出污染
+            logits[:, [self.config.img_start_token, self.config.img_end_token, 11,
+                       self.config.img_patch_token, 13, self.config.img_row_token]] = -float('inf')
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
