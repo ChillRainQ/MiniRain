@@ -2,7 +2,22 @@
 
 MiniRain 是一个从零实现的轻量级视觉语言模型（VLM）。其核心 **MiniRainVLM** 采用**单流统一架构**：不使用独立的视觉编码器 + 跨注意力，而是将图像 patch 作为普通 token 直接注入语言模型的同一序列，由一个 Transformer 主干统一处理文本与图像。
 
-## 架构特性
+## 模型架构
+
+<div align="center">
+  <img src="docs/arch.svg" alt="MiniRain 架构图" width="900"/>
+</div>
+
+### 核心组件说明
+
+| 组件 | 作用 | 关键设计 |
+|------|------|----------|
+| **输入融合** | 文本/图像统一序列 | patch 嵌入 in-place 覆盖 `image_pad` 占位，无独立视觉塔 |
+| **2D RoPE** | 位置编码 | 图像 (行,列) 双轴，文本 (t,t) 退化 1D，支持 YaRN 插值 |
+| **MoT-GQA** | 注意力 | QKVO 按模态分 expert，注意力全局共享，纯文本零开销 |
+| **BlockAttnRes** | 跨块信息聚合 | 可学习加权历史块尾 + 当前输入，替代恒等残差 |
+| **Mask** | 注意力约束 | 文本因果 | 图像段内双向 | 跨段隔离 |
+| **MLP** | 非线性变换 | SwiGLU（dense）或 LosslessMoE（无辅助损失 MoE） |
 
 ### 单流多模态序列
 
