@@ -58,7 +58,8 @@ class GroupQueryAttention(nn.Module):
         self.dropout = config.n_dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask = None, image_bidirectional_mask = None):
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False,
+                attention_mask=None, image_bidirectional_mask=None, modality_mask=None):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -99,8 +100,114 @@ class GroupQueryAttention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.wo(output))
         return output, past_kv
-        
-        
+
+
+
+class MoTGroupQueryAttention(nn.Module):
+    """MoT 版 GQA：QKVO 按模态解耦，注意力计算全局共享。
+    modality_mask: (B, T) int，0=文本 1=图像；为 None 时全部走模态 0（纯文本退化为普通 GQA）。
+    """
+    def __init__(self, args: AttentionArgs):
+        super().__init__()
+        config = args.config
+        self.n_key_value_heads = config.n_key_value_heads
+        self.n_local_heads = config.n_attn_heads
+        self.n_rep = self.n_local_heads // self.n_key_value_heads
+        self.head_dim = config.head_dim
+        self.is_causal = True
+        self.n_modalities = getattr(config, "n_modalities", 2)
+
+        def experts(in_dim, out_dim) -> nn.ModuleList:
+            return nn.ModuleList(
+                [nn.Linear(in_dim, out_dim, bias=False) for _ in range(self.n_modalities)]
+            )
+
+        self.wq = experts(config.hidden_size, self.n_local_heads * self.head_dim)
+        self.wk = experts(config.hidden_size, self.n_key_value_heads * self.head_dim)
+        self.wv = experts(config.hidden_size, self.n_key_value_heads * self.head_dim)
+        self.wo = experts(self.n_local_heads * self.head_dim, config.hidden_size)
+
+        self.q_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.k_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.attn_dropout = nn.Dropout(config.n_dropout)
+        self.resid_dropout = nn.Dropout(config.n_dropout)
+        self.dropout = config.n_dropout
+        self.flash = hasattr(F, 'scaled_dot_product_attention') and config.flash_attn
+
+    def _modal_indices(self, modality_mask):
+        flat = modality_mask.reshape(-1)
+        return [(flat == i).nonzero(as_tuple=True)[0] for i in range(self.n_modalities)]
+
+    def _project_modal(self, layers, x, idxs):
+        if idxs is None:
+            return layers[0](x)
+        B, T, D = x.shape
+        flat = x.reshape(-1, D)
+        out = None
+        for layer, idx in zip(layers, idxs):
+            if idx.numel() == 0:
+                continue
+            y = layer(flat.index_select(0, idx))
+            if out is None:
+                out = y.new_zeros(B * T, y.shape[-1])  # 顺带解决第3条：zeros 兜底
+            out.index_copy_(0, idx, y)
+        return out.view(B, T, -1)
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False,
+                attention_mask=None, image_bidirectional_mask=None, modality_mask=None):
+        bsz, seq_len, _ = x.shape
+        xq = self._project_modal(self.wq, x, modality_mask)
+        xk = self._project_modal(self.wk, x, modality_mask)
+        xv = self._project_modal(self.wv, x, modality_mask)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_key_value_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_key_value_heads, self.head_dim)
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
+        # 带 cache 解码时，mask 切出当前 query 对应的行
+        if image_bidirectional_mask is not None and image_bidirectional_mask.shape[-2] != seq_len:
+            image_bidirectional_mask = image_bidirectional_mask[:, :, -seq_len:, :]
+        use_flash = self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None)
+        if image_bidirectional_mask is not None:
+            if use_flash:
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, dropout_p=self.dropout if self.training else 0.0,
+                    attn_mask=image_bidirectional_mask)
+            else:
+                scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                scores = scores + image_bidirectional_mask
+                output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        elif use_flash and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.is_causal)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal:
+                scores[:, :, :, -seq_len:] += torch.full(
+                    (seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None:
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self._project_modal(self.wo, output, modality_mask)   # wo 也按模态
+        output = self.resid_dropout(output)
+        return output, past_kv
+
+
+
 class MoTAttention(nn.Module):
     def __init__(self, dim: int,
                  head_dim: int,
@@ -158,7 +265,8 @@ class MoTAttention(nn.Module):
         attn_output = self._process_final_output(attn_output, modality_masks)
 
         return attn_output, attn_output_weights
-
+    def attention_comp(self, q, k, v, attn_mask=None):
+        pass
     def _merge_qkv(self, expert_outputs: list, modality_masks:torch.Tensor):
         # 确保形状一致
         merged = torch.empty_like(expert_outputs[0])

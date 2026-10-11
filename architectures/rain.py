@@ -2,7 +2,7 @@
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
-from components.block import MiniRainBlock, FullAttnResBlock
+from components.block import MiniRainBlock, FullAttnResBlock, BlockAttnResBlock
 from components.norm import NormArgs
 from components.norm import RMSNorm
 from architectures.config import RainConfig
@@ -53,11 +53,11 @@ class MiniRainVLM(nn.Module):
         # 文本
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
-        self.layers = nn.ModuleList([FullAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
+        self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
         self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
-        self.patch_embed = nn.Conv2d(3, config.hidden_size,
+        self.patch_embd = nn.Conv2d(3, config.hidden_size,
                                      kernel_size=self.patch_size, stride=self.patch_size)
         self.img_patch = config.img_patch_token
         self.img_start = config.img_start_token
@@ -77,7 +77,7 @@ class MiniRainVLM(nn.Module):
             return inputs_embeds
         patches = []
         for img in pixel_values:
-            p = self.patch_embed(img.unsqueeze(0).to(self.patch_embed.weight.dtype))
+            p = self.patch_embd(img.unsqueeze(0).to(self.patch_embd.weight.dtype))
             patches.append(p.flatten(2).transpose(1, 2).squeeze(0))  # [R*C, hidden]
         patches = torch.cat(patches, dim=0)
         mask = input_ids == self.img_patch
@@ -115,8 +115,12 @@ class MiniRainVLM(nn.Module):
         hidden_states = self.dropout(self.prepare_inputs_embeds(input_ids, pixel_values))
 
         image_bidirectional_mask = None
+        modality_mask = None
         if pixel_values is not None:
             image_bidirectional_mask = self._build_image_bidirectional_mask(input_ids, attention_mask, hidden_states.dtype)
+            img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
+                                   dtype=torch.long, device=input_ids.device)
+            modality_mask = torch.isin(input_ids, img_ids).long()
 
         if positions is None:  # 纯文本路径：行=列=下标，退化为1D
             pos = torch.arange(start_pos, start_pos + seq_length, device=input_ids.device)
@@ -134,6 +138,7 @@ class MiniRainVLM(nn.Module):
                 attention_mask=attention_mask,
                 past_hidden_states=past_hidden_states,
                 image_bidirectional_mask=image_bidirectional_mask,
+                modality_mask=modality_mask
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)

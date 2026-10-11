@@ -13,6 +13,7 @@ class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
                  use_moe=False, use_loop=False, use_bounce=False,  **kwargs):
         super().__init__(**kwargs)
+        self.type_id = 0
         if use_moe:
             self.type_id = 2
             if use_loop:
@@ -41,6 +42,17 @@ class RainConfig(PretrainedConfig):
         self.norm_type: str = kwargs.get("norm_type", "rms")
         self.max_position_embeddings: int = int(kwargs.get("max_position_embeddings", 32768))
         self.intermediate_size: int = int(kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64))
+        # MOE config
+        self.use_moe = use_moe
+        self.m: int = int(kwargs.get("m", 8))
+        self.norm_topk_prob: bool = bool(kwargs.get("norm_topk_prob", True))
+        self.n_experts: int = 0 if not use_moe else kwargs.get("n_experts", 4) * self.m
+        self.n_share_experts: int = 0 if not use_moe else kwargs.get("n_share_experts", 0)
+        self.per_active_experts: int = 0 if not use_moe else kwargs.get("per_active_experts", 1) * self.m / 2
+        self.router_aux_loss_coef: float = float(kwargs.get("router_aux_loss_coef", 5e-4))
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        if self.type_id == 2:
+            self.intermediate_size = int(self.intermediate_size / self.m)
         self.rms_norm_eps: float = float(kwargs.get("rms_norm_eps", 1e-6))
         self.rope_theta: float = float(kwargs.get("rope_theta", 1e6))
         self.tie_word_embeddings: bool = bool(kwargs.get("tie_word_embeddings", True))
@@ -53,14 +65,6 @@ class RainConfig(PretrainedConfig):
             "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None
-        # MOE config
-        self.use_moe = use_moe
-        self.norm_topk_prob: bool = bool(kwargs.get("norm_topk_prob", True))
-        self.n_experts: int = 0 if not use_moe else kwargs.get("n_experts", 4)
-        self.n_share_experts: int = 0 if not use_moe else kwargs.get("n_share_experts", 0)
-        self.per_active_experts: int = 0 if not use_moe else kwargs.get("per_active_experts", 1)
-        self.router_aux_loss_coef: float = float(kwargs.get("router_aux_loss_coef", 5e-4))
-        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         # attn_res
         self.full_attn_res = bool(kwargs.get("full_attn_res", False))
         self.block_attn_res = bool(kwargs.get("block_attn_res", False))

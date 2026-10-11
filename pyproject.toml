@@ -12,6 +12,7 @@ dependencies = [
     "wandb>=0.28.0",
     "torch==2.6.0",
     "torchvision==0.21.0",
+    "deprecated>=3.0.0",
 ]
 
 [[tool.uv.index]]

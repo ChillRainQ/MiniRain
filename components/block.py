@@ -1,10 +1,10 @@
 import torch
 from transformers import PreTrainedConfig
 
-from components.mlp import SwiGLU
+from components.mlp import SwiGLU, LosslessMoE
 from components.mlp import MLPArgs
 from components.norm import NormArgs
-from components.attention import AttentionArgs
+from components.attention import AttentionArgs, MoTGroupQueryAttention
 from components.attention import GroupQueryAttention
 import torch.nn as nn
 
@@ -36,11 +36,28 @@ class BlockAttnRes(nn.Module):
     """
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
-        self.block_size = config.block_size
         self.attn_res_norm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
 
     def forward(self, inter_block_history: list[torch.Tensor],
+                partial_block: torch.Tensor):
+        """
+        :param inter_block_history: 块间历史表示（每一个块的最后一个output）
+        :param partial_block: 块内历史表示
+        :return:
+        """
+        hs = inter_block_history + [partial_block]
+        logits = torch.stack([
+            torch.matmul(self.attn_res_norm(h), self.attn_res_query)
+            for h in hs
+        ])
+        alpha = torch.softmax(logits.float(), dim=0).to(partial_block.dtype)
+        output = torch.zeros_like(hs[0])
+        for a, h in zip(alpha, hs):
+            output = output + a.unsqueeze(-1) * h
+        return output
+
+    def forward_old(self, inter_block_history: list[torch.Tensor],
                 partial_block: torch.Tensor):
         """
         :param inter_block_history: 块间历史表示（每一个块的最后一个output）
@@ -126,25 +143,44 @@ class FullAttnResBlock(nn.Module):
         self.attn = GroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
+        if config.type_id == 1:
+            self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
                                   intermediate_size=config.intermediate_size, bias=False))
-        self.attn_res = FullAttnRes(config)
+        elif config.type_id == 2:
+            self.mlp = LosslessMoE(dim=config.hidden_size,
+                                  intermediate_size=config.intermediate_size, num_experts=config.n_experts)
         self.mlp_res = FullAttnRes(config)
+        self.attn_res = FullAttnRes(config)
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None, image_bidirectional_mask=None):
+                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None):
         attn_input = self.attn_res(past_hidden_states + [hidden_states])
         attn_out, past_key_value = self.attn(
             self.input_layernorm(attn_input), position_embeddings,
             past_key_value, use_cache, attention_mask, image_bidirectional_mask)
-        attn_out = hidden_states + attn_out
-        past_hidden_states.append(attn_out)
-        mlp_input = self.mlp_res(past_hidden_states)
+        # attn_out = hidden_states + attn_out
+        past_hidden_states.append(hidden_states)
+        mlp_input = self.mlp_res(past_hidden_states + [attn_out])
         mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
-        output = attn_out + mlp_out
-        past_hidden_states.append(output)
-        return output, past_key_value, past_hidden_states
+        # output = attn_out + mlp_out
+        past_hidden_states.append(attn_out)
+        return mlp_out, past_key_value, past_hidden_states
+
+    def forward_old(self, hidden_states, position_embeddings,
+                past_key_value=None, use_cache=False, attention_mask=None,
+                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None):
+        attn_input = self.attn_res(past_hidden_states + [hidden_states])
+        attn_out, past_key_value = self.attn(
+            self.input_layernorm(attn_input), position_embeddings,
+            past_key_value, use_cache, attention_mask, image_bidirectional_mask, modality_mask=modality_mask)
+        # attn_out = hidden_states + attn_out
+        past_hidden_states.append(hidden_states)
+        mlp_input = self.mlp_res(past_hidden_states + [attn_out])
+        mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
+        # output = attn_out + mlp_out
+        past_hidden_states.append(attn_out)
+        return mlp_out, past_key_value, past_hidden_states
 
 class BlockAttnResBlock(nn.Module):
     def __init__(self, layer_id: int, config: PreTrainedConfig):
@@ -154,25 +190,30 @@ class BlockAttnResBlock(nn.Module):
         self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
-        self.attn = GroupQueryAttention(AttentionArgs(config))
+        self.attn = MoTGroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size, bias=False))
+        if config.type_id == 1:
+            self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
+                                      intermediate_size=config.intermediate_size, bias=False))
+        elif config.type_id == 2:
+            self.mlp = LosslessMoE(dim=config.hidden_size,
+                                   intermediate_size=config.intermediate_size, num_experts=config.n_experts)
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)
 
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None, image_bidirectional_mask=None):
+                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None):
         partial_block = hidden_states
         attn_input = self.attn_res(past_hidden_states, partial_block)
-        if self.layer_id % (self.block_size // 2) == 0:
+        if self.block_size >= 2 and self.layer_id % (self.block_size // 2) == 0:
             past_hidden_states.append(partial_block)
             partial_block = None
-        else:
-            attn_input = hidden_states
-        attn_out, past_key_value = self.attn(self.input_layernorm(attn_input), position_embeddings, past_key_value, use_cache, attention_mask, image_bidirectional_mask)
+        attn_out, past_key_value = self.attn(self.input_layernorm(attn_input),
+                                             position_embeddings, past_key_value,
+                                             use_cache, attention_mask, image_bidirectional_mask, modality_mask=modality_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
