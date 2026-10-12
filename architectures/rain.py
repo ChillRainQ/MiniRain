@@ -3,6 +3,7 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
 from components.block import MiniRainBlock, FullAttnResBlock, BlockAttnResBlock
+from components.cv import ConvStem
 from components.norm import NormArgs
 from components.norm import RMSNorm
 from architectures.config import RainConfig
@@ -64,15 +65,18 @@ class MiniRainVLM(nn.Module):
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
         self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
-        self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
+        self.text_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
-        self.patch_embd = nn.Conv2d(3, config.hidden_size,
-                                     kernel_size=self.patch_size, stride=self.patch_size)
-        self.img_patch = config.img_patch_token
-        self.img_start = config.img_start_token
-        self.img_end = config.img_end_token
-        self.img_row = config.img_row_token
+        # 对于如此尺寸的小模型，可能需要更强的视觉先验，一层卷积可能不行，本身参数就不足。
+        # self.patch_embd = nn.Conv2d(3, config.hidden_size,
+        #                              kernel_size=self.patch_size, stride=self.patch_size)
+        self.patch_embd = ConvStem(hidden=config.hidden_size)
+        self.img_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
+        self.img_patch = self.config.img_patch_token
+        self.img_start = self.config.img_start_token
+        self.img_end = self.config.img_end_token
+        self.img_row = self.config.img_row_token
         cos_tab, sin_tab = precompute_freqs_cis_2d(
             self.config.head_dim,
             end=self.config.max_position_embeddings,
@@ -82,20 +86,27 @@ class MiniRainVLM(nn.Module):
         self.register_buffer("rope2d_sin", sin_tab, persistent=False)
 
     def prepare_inputs_embeds(self, input_ids, pixel_values=None):
-        # pixel_values: List[Tensor[3, H, W]]，batch内按样本顺序、样本内按图顺序平铺
         inputs_embeds = self.embed(input_ids)
         if pixel_values is None:
             return inputs_embeds
         patches = []
         for img in pixel_values:
-            p = self.patch_embd(img.unsqueeze(0).to(self.patch_embd.weight.dtype))
-            patches.append(p.flatten(2).transpose(1, 2).squeeze(0))  # [R*C, hidden]
+            p = self.patch_embd(img.unsqueeze(0).to(next(self.patch_embd.parameters()).dtype))
+            patches.append(self.img_norm(p.flatten(2).transpose(1, 2).squeeze(0)))
         patches = torch.cat(patches, dim=0)
+
+        # patch 位置：conv 输出覆盖
         mask = input_ids == self.img_patch
         assert mask.sum().item() == patches.shape[0], \
             f"占位token数({mask.sum().item()})与patch数({patches.shape[0]})不一致"
-        # 覆盖图像位置的embeds
         inputs_embeds[mask] = patches.to(inputs_embeds.dtype)
+
+        # 边界 token 位置（start/end/row）：embedding 也过 img_norm，对齐分布  ← 新增
+        boundary_ids = torch.tensor([self.img_start, self.img_end, self.img_row],
+                                    dtype=torch.long, device=input_ids.device)
+        boundary_mask = torch.isin(input_ids, boundary_ids)
+        inputs_embeds[boundary_mask] = self.img_norm(inputs_embeds[boundary_mask])
+
         return inputs_embeds
 
     def _build_image_bidirectional_mask(self, input_ids, attention_mask, dtype):
@@ -152,7 +163,7 @@ class MiniRainVLM(nn.Module):
                 modality_mask=modality_mask
             )
             presents.append(present)
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.text_norm(hidden_states)
         aux_loss = hidden_states.new_zeros(1).squeeze()
         return hidden_states, presents, aux_loss
 

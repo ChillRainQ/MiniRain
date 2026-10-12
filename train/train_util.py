@@ -76,7 +76,7 @@ class MuonWithAdamW(optim.Optimizer):
 
 
 def adamw_params_name() -> list[str]:
-    return ['embed', 'lm_head', 'norm', 'bias']
+    return ['embed', 'lm_head', 'text_norm', 'bias']
 
 def get_muon_params(model) -> list[Tensor]:
     """获取适用于 Muon 优化器的参数：隐藏层 ndim >= 2 的权重矩阵。
@@ -87,7 +87,7 @@ def get_muon_params(model) -> list[Tensor]:
 
 
 def get_adamw_params(model) -> list[Tensor]:
-    """获取适用于 AdamW 优化器的参数：bias、norm scale 等 ndim < 2 的参数，
+    """获取适用于 AdamW 优化器的参数：bias、text_norm scale 等 ndim < 2 的参数，
     以及 embedding / lm_head（修复：这两类从 Muon 划归 AdamW）。"""
     return [p for n, p in model.named_parameters()
             if p.requires_grad
