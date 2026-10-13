@@ -73,7 +73,7 @@ tests/           测试套件(见下)
 ```python
 import torch
 from architectures.config import RainConfig
-from architectures.rain import MiniRainVForCausalLM
+from architectures.rain_v import MiniRainVForCausalLM
 
 cfg = RainConfig(hidden_size=1024, n_hidden_layers=12, block_size=4,
                  n_attn_heads=8, n_key_value_heads=4)
@@ -85,7 +85,7 @@ out = model(input_ids=ids, labels=ids)
 
 # 图文: 用 VLMCollator 拼序列(自动处理位置编号/截断保护)
 from dataset.collator import VLMCollator
-collator = VLMCollator(tokenizer, patch_size=cfg.patch_size)
+collator = VLMCollator(tokenizer, cfg)
 batch = collator([{"image": img_tensor, "text": "描述这张图"}])
 
 # 生成

@@ -3,7 +3,8 @@ from typing import Any
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
-from architectures.rain import MiniRainForCausalLM, MiniRainVForCausalLM
+from architectures.rain import MiniRainForCausalLM
+from architectures.rain_v import MiniRainVForCausalLM
 import math
 import csv
 import glob

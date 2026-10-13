@@ -1,9 +1,9 @@
-import os
+﻿import os
 
 import torch
 import argparse
 from architectures.config import RainConfig
-from architectures.rain import MiniRainVForCausalLM
+from architectures.rain_v import MiniRainVForCausalLM
 
 # ---- 特殊 token id（按你的 tokenizer_config）----
 IMG_START = 9    # <|vision_start|>
@@ -25,9 +25,11 @@ class VLMCollator:
       - 换行:      行=base+i, 列=base+C（该行末尾，列出界一格）
       - 图后文本:  从 base+max(R,C)+1 继续（max 防止宽图列坐标与文本碰撞）
     """
-    def __init__(self, tokenizer, patch_size=16, max_len=2048, img_row_id=IMG_ROW):
+    def __init__(self, tokenizer, config: RainConfig = None, max_len=2048, img_row_id=IMG_ROW):
         self.tokenizer = tokenizer
-        self.patch_size = patch_size
+        # config 是唯一事实源：patch_size 必须与模型 ConvStem 的 16× 降采样一致
+        self.config = config or RainConfig()
+        self.patch_size = self.config.patch_size
         self.max_len = max_len
         self.img_row_id = img_row_id   # 设为 None 则不用换行符
 
@@ -117,7 +119,7 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(TOK_PATH)
-    col = VLMCollator(tok, patch_size=16)
+    col = VLMCollator(tok)
 
     # 方图 + 宽图 + 纯文本，三种形态一次测完
     out = col([

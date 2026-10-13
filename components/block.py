@@ -86,30 +86,12 @@ class MiniRainBlock(nn.Module):
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size, bias=False))
-        assert not (self.block_attn_res and self.full_attn_res)
-        if self.full_attn_res:
-            self.attn_res = FullAttnRes(config)
-            self.mlp_res = FullAttnRes(config)
-        elif self.block_attn_res:
-            self.attn_res = BlockAttnRes(config)
-            self.mlp_res = BlockAttnRes(config)
 
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
                 past_hidden_states=None):
-        partial_block = None
-        if self.full_attn_res and self.attn_res:
-            past_hidden_states.append(hidden_states)
-            attn_input = self.attn_res(past_hidden_states)
-        elif self.block_attn_res and self.attn_res:
-            partial_block = hidden_states
-            attn_input = self.attn_res(past_hidden_states, partial_block)
-            if self.layer_id % (self.block_size // 2) == 0:
-                past_hidden_states.append(partial_block)
-                partial_block = None
-        else:
-            attn_input = hidden_states
+        attn_input = hidden_states
         attn_out, past_key_value = self.attn(
             self.input_layernorm(attn_input),
             position_embeddings,
@@ -117,23 +99,11 @@ class MiniRainBlock(nn.Module):
             use_cache,
             attention_mask,
         )
-        if self.full_attn_res and self.mlp_res:
-            past_hidden_states.append(attn_out)
-            mlp_input = self.mlp_res(past_hidden_states)
-        elif self.block_attn_res and self.mlp_res:
-            partial_block = partial_block + attn_out if partial_block is not None else attn_out
-            mlp_input = self.mlp_res(past_hidden_states, partial_block)
-        else:
-            mlp_input = attn_input + attn_out
+        mlp_input = attn_input + attn_out
         mlp_out = self.mlp(
             self.post_attn_layernorm(mlp_input)
         )
-        if self.full_attn_res:
-            output = mlp_out
-        elif self.block_attn_res:
-           output = partial_block + mlp_out
-        else:
-            output = mlp_out + mlp_input
+        output = mlp_out + mlp_input
         return output, past_key_value, past_hidden_states
 
 class FullAttnResBlock(nn.Module):
