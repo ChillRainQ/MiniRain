@@ -50,7 +50,6 @@ class MiniRainVLM(nn.Module):
         self.text_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
-        # ConvStem 固定 16× 降采样，patch_size 是唯一事实源；改它需同步改 ConvStem 结构
         assert self.patch_size == 16, f"ConvStem 固定 16× 降采样，config.patch_size={self.patch_size} 暂不支持"
         # 对于如此尺寸的小模型，可能需要更强的视觉先验，一层卷积可能不行，本身参数就不足。
         # self.patch_embd = nn.Conv2d(3, config.hidden_size,
