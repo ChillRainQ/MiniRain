@@ -80,33 +80,39 @@ def build_norm_fn(norm_type, dim, norm_eps, norm_affine):
 
 
 class MoTFFN(nn.Module):
-    def __init__(self, n_modalities: int, args: MLPArgs):
+    """
+    MOT FFN
+    """
+    def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs):
         super().__init__()
         self.n_modalities = n_modalities
-        self.local_experts = nn.ModuleList([
-            SwiGLU(args=args) for _ in range(self.n_modalities)
-        ])
-        self.local_experts_ffn_norm = nn.ModuleList([
-            RMSNorm(NormArgs(args.hidden_size, args.eps))
-            for _ in range(self.n_modalities)
-        ])
+        self.mlp_t = SwiGLU(args)
+        self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
+                                    intermediate_size=(args.intermediate_size // 2),
+                                    bias=args.bias))
+        self.norm_t = RMSNorm(norm_args)
+        self.norm_v = RMSNorm(norm_args)
 
-    def forward(self, x, modality_masks):
-        expert_outputs = []
+    def forward(self, x, img_idx=None):
+        if img_idx is None:
+            return self.mlp_t(self.norm_t(x))
 
-        # Process tokens for each modality separately
-        for i in range(self.n_modalities):
-            expert_input = x[modality_masks[i]]  # Select tokens for this modality
-            expert_output = self.local_experts[i](expert_input)  # Feed-forward processing
-            expert_output = self.local_experts_ffn_norm[i](expert_output)  # Normalization
-            expert_outputs.append(expert_output)
+        B, T, D = x.shape
+        flat = x.reshape(-1, D)
+        txt_mask = torch.ones(B * T, dtype=torch.bool, device=x.device)
+        txt_mask[img_idx] = False
+        txt_idx = txt_mask.nonzero(as_tuple=True)[0]
 
-        # Merge modality-specific outputs into a unified tensor
-        merged_output = torch.empty_like(x)
-        for i in range(self.n_modalities):
-            merged_output[modality_masks[i]] = expert_outputs[i]
-
-        return merged_output
+        out = None  # 延迟创建：dtype 跟随 expert 输出，兼容 autocast
+        for idx, norm, mlp in ((txt_idx, self.norm_t, self.mlp_t),
+                               (img_idx, self.norm_v, self.mlp_v)):
+            if idx.numel() == 0:
+                continue
+            y = mlp(norm(flat.index_select(0, idx)))
+            if out is None:
+                out = y.new_empty(B * T, D)
+            out.index_copy_(0, idx, y)
+        return out.view(B, T, D)
 
 
 class Router(nn.Module):

@@ -225,7 +225,7 @@ if __name__ == '__main__':
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # run
     for epoch in range(start_epoch, args.epochs):

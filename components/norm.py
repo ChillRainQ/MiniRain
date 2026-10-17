@@ -14,11 +14,6 @@ class NormArgs:
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization。
-
-    RMSNorm 将输入按 RMS 归一化，相比 LayerNorm 省去了均值中心化
-    的计算，在 LLM（如 Llama、Mistral）中被广泛采用。
-    """
     name = "rms"
     def __init__(self, args: NormArgs):
         super().__init__()

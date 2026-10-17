@@ -174,12 +174,10 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         if labels is not None:
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        # pyrefly: ignore [bad-argument-type]
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
                                          past_key_values=past_key_values, hidden_states=hidden_states)
 
     @torch.inference_mode()
-    # pyrefly: ignore [bad-override]
     def generate(self, inputs=None, pixel_values=None, positions=None, attention_mask=None,
                  max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2,
                  streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,

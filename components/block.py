@@ -1,7 +1,7 @@
 import torch
 from transformers import PreTrainedConfig
 
-from components.mlp import SwiGLU, LosslessMoE
+from components.mlp import SwiGLU, LosslessMoE, MoTFFN
 from components.mlp import MLPArgs
 from components.norm import NormArgs
 from components.attention import AttentionArgs, MoTGroupQueryAttention
@@ -170,6 +170,12 @@ class BlockAttnResBlock(nn.Module):
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                    intermediate_size=config.intermediate_size, num_experts=config.n_experts)
+        elif config.type_id == 3:
+            self.mlp = MoTFFN(n_modalities=2,
+                              args=MLPArgs(hidden_size=config.hidden_size,
+                                           intermediate_size=config.intermediate_size, bias=False),
+                              norm_args=NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+            self.post_attn_layernorm = None
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)
 
@@ -187,7 +193,12 @@ class BlockAttnResBlock(nn.Module):
                                              use_cache, attention_mask, image_bidirectional_mask, modality_mask=modality_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
-        mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
+        # MoTFFN 期望 img_idx（索引），从 modality_mask 转换；其他 MLP 不接受此参数
+        if isinstance(self.mlp, MoTFFN):
+            img_idx = (modality_mask.reshape(-1) == 1).nonzero(as_tuple=True)[0] if modality_mask is not None else None
+            mlp_out = self.mlp(mlp_input, img_idx=img_idx)
+        else:
+            mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
         if isinstance(mlp_out, tuple): mlp_out = mlp_out[0]  # MoE 返回 (out, logits, aux)
         output = partial_block + mlp_out
         return output, past_key_value, past_hidden_states

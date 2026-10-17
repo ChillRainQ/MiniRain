@@ -3,29 +3,21 @@ import math
 model_type: dict[int, str] = {
     1 : "DENSE",
     2 : "MOE",
-    3 : "DENSE-LOOP",
-    4 : "MOE-LOOP",
-    5 : "MOE-BOUNCE",
-    6 : "DENSE-BOUNCE",
+    3 : "MOT",
 }
 
 class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
-                 use_moe=False, use_loop=False, use_bounce=False,  **kwargs):
+                 use_moe=False, use_mot=False, use_bounce=False,  **kwargs):
         super().__init__(**kwargs)
         self.type_id = 0
         if use_moe:
             self.type_id = 2
-            if use_loop:
-                self.type_id = 4
-            elif use_bounce:
-                self.type_id = 5
+
+        elif use_mot:
+            self.type_id = 3
         else:
             self.type_id = 1
-            if use_loop:
-                self.type_id = 3
-            elif use_bounce:
-                self.type_id = 6
         self.model_type_: str = str(kwargs.get("model_type", ""))
         self.vocab_size: int = int(kwargs.get("vocab_size", 6400))
         self.hidden_size: int = hidden_size

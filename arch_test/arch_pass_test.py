@@ -17,7 +17,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--use_loop', default=0, type=int, choices=[0, 1], help="是否使用LOOP架构（0=否，1=是）")
+    parser.add_argument('--use_mot', default=1, type=int, choices=[0, 1], help="是否使用MOT架构（0=否，1=是）")
     parser.add_argument('--use_bounce', default=0, type=int, choices=[0, 1], help="是否使用Bounce架构（0=否，1=是）")
     parser.add_argument('--loop_start', type=int, default=0, help="Loop起始层")
     parser.add_argument('--loop_end', type=int, default=0, help="Loop结束层")
@@ -38,7 +38,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
-                        use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
+                        use_moe=bool(args.use_moe), use_mot=bool(args.use_mot),
                         use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
                         loop_end=args.loop_end, max_loop_iter=args.max_loop_iter,
                         block_size=args.block_size,
