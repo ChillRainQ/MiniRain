@@ -54,7 +54,7 @@ class MiniRainVLM(nn.Module):
         # 对于如此尺寸的小模型，可能需要更强的视觉先验，一层卷积可能不行，本身参数就不足。
         # self.patch_embd = nn.Conv2d(3, config.hidden_size,
         #                              kernel_size=self.patch_size, stride=self.patch_size)
-        self.patch_embd = ConvStem(hidden=config.hidden_size)
+        self.patch_embed = ConvStem(hidden=config.hidden_size)
         self.img_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         self.img_patch = self.config.img_patch_token
         self.img_start = self.config.img_start_token
@@ -74,7 +74,7 @@ class MiniRainVLM(nn.Module):
             return inputs_embeds
         patches = []
         for img in pixel_values:
-            p = self.patch_embd(img.unsqueeze(0).to(next(self.patch_embd.parameters()).dtype))
+            p = self.patch_embed(img.unsqueeze(0).to(next(self.patch_embed.parameters()).dtype))
             patches.append(self.img_norm(p.flatten(2).transpose(1, 2).squeeze(0)))
         patches = torch.cat(patches, dim=0)
 

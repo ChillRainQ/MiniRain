@@ -1,11 +1,15 @@
 import os
 import sys
+
+import project
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from train.train_util import init_model
 
 
 from architectures.config import RainConfig
+from components.mlp import MoTFFN
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniRain Pretraining")
@@ -36,9 +40,24 @@ if __name__ == "__main__":
                         full_attn_res=bool(args.use_full_attn_res))
 
     print(config)
-    model, tokenizer = init_model(config, from_weight=args.from_weight)
+    model, tokenizer = init_model(config, from_weight=args.from_weight, tokenizer_path=project.TOKENIZER_PATH)
     print(f"Model Type: {model.name}")
-    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    vision_params = sum(p.numel() for p in model.model.patch_embd.parameters() if p.requires_grad)
+
+    def count_params(module):
+        if module is None:
+            return 0
+        return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+    backbone = model.model
+    # 视觉 stem：兼容新旧命名 patch_embed / patch_embd
+    patch_embed = getattr(backbone, "patch_embed", None) or getattr(backbone, "patch_embd", None)
+    vision_params = count_params(patch_embed)
+    # MoT 架构下视觉 FFN 为每层 MoTFFN.mlp_v；非 MoT/非视觉模型没有独立视觉 FFN
+    vision_ffn_params = sum(count_params(layer.mlp.mlp_v) for layer in getattr(backbone, "layers", [])
+                            if isinstance(layer.mlp, MoTFFN))
+
+    model_params = count_params(model)
     print(f'[ScalingLaw] Vision Embed Params: {vision_params/1e6:.2f}M')
+    print(f'[ScalingLaw] Vision FFN Params: {vision_ffn_params/1e6:.2f}M')
+    print(f'[ScalingLaw] Vision Total Params: {(vision_params + vision_ffn_params)/1e6:.2f}M')
     print(f'[ScalingLaw] Model Params: {model_params/1e6:.2f}M')

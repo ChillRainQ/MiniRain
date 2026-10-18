@@ -15,6 +15,7 @@ dependencies = [
     "deprecated>=3.0.0",
     "opencc-python-reimplemented>=0.1.7",
     "muon-optimizer",
+    "fastparquet>=2026.9.0",
 ]
 
 [[tool.uv.index]]
