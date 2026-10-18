@@ -16,15 +16,15 @@ import time
 import torch
 import torch.distributed as dist
 import swanlab
-from torch import optim, nn
+from torch import nn
 from architectures.config import RainConfig
-from train.train_util import get_lr, init_distributed_mode, setup_seed, get_checkpoint, get_adamw_params, get_muon_params, SkipBatchSampler, save
+from train.train_util import get_lr, init_distributed_mode, setup_seed, get_adamw_params, get_muon_params, SkipBatchSampler, save, MuonWithAdamW
+from train.ckpt import save_exp, save_ckpt, save_state_dict, load_ckpt
 
 
-
-
-def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, muon, adam, epoch:int, epochs:int,
-                learning_rate:float, device: str, loader, iters, start_step: int = 0, wandb=None, logger=None):
+def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, optimizer: MuonWithAdamW,
+                epoch: int, epochs: int, learning_rate: float, device: str, loader, iters, start_step: int = 0,
+                wandb=None, logger=None):
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -32,11 +32,10 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
         labels = labels.to(device)
         last_step = step
         lr = get_lr(epoch * iters + step, epochs * iters, learning_rate)
-        if muon is not None:
-            for param_group in muon.param_groups:
-                param_group['lr'] = lr * 30
-
-        for param_group in adam.param_groups:
+        # Muon 组用 30 倍学习率, AdamW 组用基础学习率
+        for param_group in optimizer.muon.param_groups:
+            param_group['lr'] = lr * 30
+        for param_group in optimizer.adamw.param_groups:
             param_group['lr'] = lr
 
         with autocast_ctx:
@@ -48,35 +47,20 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
-            if muon is not None:
-                # 修复：裁剪前两个优化器都要 unscale，
-                # 否则 adam 管的参数在 scaled 状态下被裁剪，阈值失真
-                scaler.unscale_(muon)
-                scaler.unscale_(adam)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                # 分别 step 两个优化器
-                scaler.step(muon)
-                scaler.step(adam)
-                scaler.update()
-                # 清空梯度
-                muon.zero_grad(set_to_none=True)
-                adam.zero_grad(set_to_none=True)
-            else:
-                scaler.unscale_(adam)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(adam)
-                scaler.update()
-                adam.zero_grad(set_to_none=True)
+            # 统一优化器: 先 unscale 再裁剪, 最后 step + 清梯度
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
-            muon_lr = 0
-            if muon is not None:
-                muon_lr = muon.param_groups[-1]['lr']
-            adam_lr = adam.param_groups[-1]['lr']
+            muon_lr = optimizer.muon.param_groups[-1]['lr']
+            adam_lr = optimizer.adamw.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(
                 f'Epoch:[{epoch + 1}/{epochs}]({step}/{iters}), '
@@ -92,21 +76,16 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
                 # 修复：传全局步数，否则第二个 epoch 的 step 从头开始，token 曲线回退
                 logger.log(epoch * iters + step, current_loss)
 
-        # ========== 断点保存：统一走 get_checkpoint ==========
+        # ========== 断点保存：统一走 train/ckpt.py ==========
         if step % args.save_interval == 0 or step == iters:
             model.eval()
             if is_main_process():
                 if step == iters:
-                    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-                    raw_model = getattr(raw_model, '_orig_mod', raw_model)
-                    moe_suffix = '_moe' if config.use_moe else ''
-                    weight_path = f'{args.save_dir}/{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_{epoch + 1}done.pth'
-                    save(raw_model.state_dict(), weight_path)
-
-                # 保存完整断点（模型 + 双优化器 + scaler，scaler 走 kwargs 通道）
-                get_checkpoint(config, weight=args.save_weight, model=model,
-                               save_dir='../checkpoints', epoch=epoch, step=step,
-                               muon=muon, adam=adam, scaler=scaler)
+                    # 每个 epoch 结束另存一份纯权重, 便于直接部署
+                    save_state_dict(model, exp_name, f'{prefix}_{epoch + 1}done.pth')
+                # 保存完整断点（模型 + 优化器 + scaler）
+                save_ckpt(exp_name, f'{prefix}_resume.pth', model=model, epoch=epoch, step=step,
+                          optimizer=optimizer, scaler=scaler)
             # 等其他 rank 同步后再继续，避免写盘期间有 rank 提前进入下一步
             if dist.is_initialized():
                 dist.barrier()
@@ -114,26 +93,24 @@ def train_epoch(model: nn.Module | DistributedDataParallel, scaler: GradScaler, 
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
-        # 修复：与主循环一致，裁剪前两个优化器都 unscale
-        if muon is not None:
-            scaler.unscale_(muon)
-        scaler.unscale_(adam)
+        # 与主循环一致: 收尾处理不足一个累积周期的残差梯度
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        if muon is not None:
-            scaler.step(muon)
-        scaler.step(adam)
+        scaler.step(optimizer)
         scaler.update()
-        if muon is not None:
-            muon.zero_grad(set_to_none=True)
-        adam.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniRain Pretraining")
     parser.add_argument("--save_dir", type=str, default="../outputs", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
+    parser.add_argument('--exp_name', type=str, default='', help="实验名, 对应输出目录 outputs/<exp_name>, 为空则自动生成")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Muon 权重衰减")
+    parser.add_argument("--momentum", type=float, default=0.95, help="Muon 动量")
+    parser.add_argument("--nesterov", type=int, default=1, choices=[0, 1], help="Muon 是否使用 Nesterov")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
@@ -171,6 +148,11 @@ if __name__ == "__main__":
 
     # 训练环境检查
     os.makedirs(args.save_dir, exist_ok=True)
+    # 实验目录名(外界维护), 实验产物统一输出到 outputs/<exp_name>
+    exp_name = args.exp_name or f"{args.save_weight}_{args.hidden_size}_{args.num_hidden_layers}" + ('_moe' if args.use_moe else '')
+    if is_main_process():
+        save_exp(exp_name)
+        Logger(f'[Experiment] 实验目录: {exp_name}')
     config = RainConfig(hidden_size=int(args.hidden_size), n_hidden_layers=int(args.num_hidden_layers),
                         use_moe=bool(args.use_moe), use_loop=bool(args.use_loop),
                         use_bounce=bool(args.use_bounce), loop_start=int(args.loop_start), loop_end=int(args.loop_end),
@@ -187,7 +169,9 @@ if __name__ == "__main__":
             # 跟踪超参数和实验元数据
             config=config.to_dict()
         )
-    ckp_data = get_checkpoint(config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    moe_suffix = '_moe' if config.use_moe else ''
+    prefix = f'{args.save_weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}'
+    ckp_data = load_ckpt(exp_name, f'{prefix}_resume.pth') if args.from_resume == 1 else None
 
     # 混合精度
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -225,17 +209,22 @@ if __name__ == "__main__":
         '参数分组有遗漏或重叠，请检查 get_muon_params/get_adam_params'
     Logger(f'[Optimizer] Muon params: {sum(p.numel() for p in muon_params)/1e6:.2f}M, '
            f'AdamW params: {sum(p.numel() for p in adam_params)/1e6:.2f}M')
-    muon = optim.Muon(muon_params, lr=args.learning_rate * 30)
-    adam = optim.AdamW(adam_params, lr=args.learning_rate)
+    # 统一优化器: Muon(隐藏层矩阵) + AdamW(embed/lm_head/bias/norm)
+    optimizer = MuonWithAdamW(model, lr=args.learning_rate, weight_decay=args.weight_decay,
+                              momentum=args.momentum, nesterov=bool(args.nesterov))
 
     # 断点恢复
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
-        if 'muon' in ckp_data:
-            muon.load_state_dict(ckp_data['muon'])
-        if 'adam' in ckp_data:
-            adam.load_state_dict(ckp_data['adam'])
+        if 'optimizer' in ckp_data:
+            optimizer.load_state_dict(ckp_data['optimizer'])
+        else:
+            # 兼容旧格式检查点: muon / adam 分开保存
+            if 'muon' in ckp_data:
+                optimizer.muon.load_state_dict(ckp_data['muon'])
+            if 'adam' in ckp_data:
+                optimizer.adamw.load_state_dict(ckp_data['adam'])
         if 'scaler' in ckp_data:
             scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
@@ -258,11 +247,11 @@ if __name__ == "__main__":
         loader = DataLoader(pretrain_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(model, scaler, muon, adam, epoch, args.epochs,
+            train_epoch(model, scaler, optimizer, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader) + skip, start_step,
                         logger=scaling_logger, wandb=args.use_wandb)
         else:
-            train_epoch(model, scaler, muon, adam, epoch, args.epochs,
+            train_epoch(model, scaler, optimizer, epoch, args.epochs,
                         args.learning_rate, args.device, loader, len(loader), 0,
                         logger=scaling_logger, wandb=args.use_wandb)
     if is_main_process():

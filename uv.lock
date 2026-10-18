@@ -691,6 +691,7 @@ dependencies = [
     { name = "deprecated" },
     { name = "matplotlib" },
     { name = "modelscope" },
+    { name = "muon-optimizer" },
     { name = "opencc-python-reimplemented" },
     { name = "scipy" },
     { name = "swanlab" },
@@ -706,6 +707,7 @@ requires-dist = [
     { name = "deprecated", specifier = ">=3.0.0" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "modelscope", specifier = ">=1.38.1" },
+    { name = "muon-optimizer", git = "https://github.com/KellerJordan/Muon" },
     { name = "opencc-python-reimplemented", specifier = ">=0.1.7" },
     { name = "scipy", specifier = ">=1.18.0" },
     { name = "swanlab", specifier = ">=0.8.4" },
@@ -835,6 +837,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/74/d2c27e03cb84251dfe7249b8e82923643c6d48fa4883b9476b025e7dc7eb/multiprocess-0.70.19-py313-none-any.whl", hash = "sha256:8d5eb4ec5017ba2fab4e34a747c6d2c2b6fecfe9e7236e77988db91580ada952", size = 156414, upload-time = "2026-01-19T06:47:35.915Z" },
     { url = "https://files.pythonhosted.org/packages/7e/82/69e539c4c2027f1e1697e09aaa2449243085a0edf81ae2c6341e84d769b6/multiprocess-0.70.19-py39-none-any.whl", hash = "sha256:0d4b4397ed669d371c81dcd1ef33fd384a44d6c3de1bd0ca7ac06d837720d3c5", size = 133477, upload-time = "2026-01-19T06:47:38.619Z" },
 ]
+
+[[package]]
+name = "muon-optimizer"
+version = "0.1.0"
+source = { git = "https://github.com/KellerJordan/Muon#f98f1cacc0263b04290753e32be8d498c1efc806" }
 
 [[package]]
 name = "networkx"
