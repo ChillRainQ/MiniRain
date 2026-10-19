@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import project
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import project
 import argparse
 from train.train_util import init_model
 
