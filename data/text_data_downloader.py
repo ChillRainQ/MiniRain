@@ -1,40 +1,40 @@
-#!/usr/bin/env python3
-import os
-import sys
-import json
+# collect_text.py
+"""
+纯文本语料收集：zh(世界知识) + en(世界知识) + code + math
+零 modelscope/pyarrow 依赖：jsonl 直读，parquet 用 polars
+文件列表走 API 自动发现，不用猜分片命名
+
+前置：uv pip install polars requests
+gated 仓库：set HF_TOKEN=hf_xxxxx
+"""
 import argparse
-import logging
-from pathlib import Path
+import io
+import json
+import os
+import random
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path
 
-try:
-    from datasets import load_dataset
-    HAS_HF = True
-except ImportError:
-    HAS_HF = False
+import requests
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("text_dl")
+MIRROR = "https://hf-mirror.com"
+HF_TOKEN = os.environ.get("HF_TOKEN")
+AUTH = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 
 @dataclass
 class Source:
     repo: str
-    subdir: str = ""
-    text_col: str = "text"
-    weight_gb: float = 0.0
-    is_config: bool = False
-    fallback_repo: Optional[str] = None
+    subset: str       # 仓库内目录，如 "zh_cc-high-loss0"、"4_5"、"sample/10BT"
+    text_key: str
+    n_files: int      # 取多少个分片
+    shuffle: bool     # True=随机抽分片，False=顺序取前N个
 
 
 SOURCES = {
     "zh": [
-        Source("BAAI/CCI4.0-M2-Base-v1", "", "text", 20, False),
+        Source("BAAI/CCI4.0-M2-Base-v1", "zh_cc-high-loss0", "text", 20, False),
         Source("opencsg/Fineweb-Edu-Chinese-V2.2", "4_5", "text", 3, True),
         Source("opencsg/Fineweb-Edu-Chinese-V2.2", "3_4", "text", 1, True),
         Source("wikimedia/wikipedia", "20231101.zh", "text", 2, True),
@@ -47,151 +47,137 @@ SOURCES = {
         Source("bigcode/the-stack", "data/python", "content", 5, False),
     ],
     "math": [
-        Source("AI-MO/NuminaMath-1.5", "", "solution", 2, False),
+        Source("AI-MO/NuminaMath-1.5", "data", "solution", 2, False),
     ],
 }
 
 
-class Downloader:
-    def __init__(self, output_dir: str, cache_dir: Optional[str] = None):
-        self.out = Path(output_dir)
-        self.out.mkdir(parents=True, exist_ok=True)
-        self.cache = Path(cache_dir) if cache_dir else self.out / ".hf_cache"
-        self.cache.mkdir(parents=True, exist_ok=True)
-        self.manifest: Dict = {}
+def list_files(src: Source) -> list[str]:
+    """API 列出 subset 目录下的数据文件（jsonl/parquet），按名排序。"""
+    u = f"{MIRROR}/api/datasets/{src.repo}/tree/main/{src.subset}"
+    r = requests.get(u, headers=AUTH, timeout=60)
+    r.raise_for_status()
+    files = [f["path"] for f in r.json()
+             if f["type"] == "file" and f["path"].endswith((".jsonl", ".parquet"))]
+    files.sort()
+    if src.shuffle:
+        random.Random(42).shuffle(files)
+    files = files[:src.n_files]
+    if len(files) < src.n_files:
+        print(f"  [警告] 只要 {src.n_files} 片，实际只有 {len(files)} 片")
+    return files
 
-    def _save_dir(self, src: Source, domain: str, idx: int) -> Path:
-        safe = src.repo.replace("/", "__")
-        tag = src.subdir.replace("/", "__") if src.subdir else "default"
-        return self.out / domain / f"{idx:02d}_{safe}__{tag}"
 
-    @staticmethod
-    def _parse_size(s: str) -> int:
-        s = s.upper().strip()
-        for unit, mul in [("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)]:
-            if s.endswith(unit):
-                return int(float(s[:-len(unit)]) * mul)
-        return int(s)
+def download(url: str, dest: Path, max_retry: int = 5):
+    if dest.exists():
+        print(f"  已存在: {dest.name}")
+        return
+    tmp = dest.with_suffix(".part")
+    for attempt in range(1, max_retry + 1):
+        try:
+            headers = dict(AUTH)
+            got = tmp.stat().st_size if tmp.exists() else 0
+            if got:
+                headers["Range"] = f"bytes={got}-"
+            with requests.get(url, headers=headers, stream=True,
+                              timeout=(30, 300)) as r:
+                r.raise_for_status()
+                with open(tmp, "ab" if got else "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 22):  # 4MB chunk
+                        f.write(chunk)
+                        got += len(chunk)
+                        print(f"\r    {dest.name}: {got/1e9:.2f} GB",
+                              end="", flush=True)
+            tmp.rename(dest)
+            print()
+            return
+        except Exception as e:
+            print(f"\n    第 {attempt} 次失败: {type(e).__name__}: {e}")
+            if attempt < max_retry:
+                time.sleep(10 * attempt)
+    raise RuntimeError(f"下载失败: {url}")
 
-    def download(self, src: Source, domain: str, idx: int,
-                 max_shard_size: str = "1GB", streaming: bool = True) -> dict:
-        save_dir = self._save_dir(src, domain, idx)
-        save_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"[{domain}] 开始: {src.repo} | subdir={src.subdir!r} | col={src.text_col}")
+def keep_text(t: str) -> bool:
+    return 50 <= len(t) <= 10000 and "\x00" not in t
 
-        ds = None
-        repos_to_try = [src.repo]
-        if src.fallback_repo:
-            repos_to_try.append(src.fallback_repo)
 
-        for repo in repos_to_try:
+def dump_jsonl(path: Path, src: Source, out) -> int:
+    n = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
             try:
-                kwargs = {
-                    "split": "train",
-                    "streaming": streaming,
-                    "cache_dir": str(self.cache),
-                    "trust_remote_code": True,
-                }
-                if src.is_config:
-                    ds = load_dataset(repo, src.subdir, **kwargs)
-                elif src.subdir:
-                    ds = load_dataset(repo, data_dir=src.subdir, **kwargs)
-                else:
-                    ds = load_dataset(repo, **kwargs)
-                logger.info(f"  成功加载: {repo}")
-                break
-            except Exception as e:
-                logger.warning(f"  加载失败 {repo}: {e}")
+                text = str(json.loads(line).get(src.text_key, "")).strip()
+            except json.JSONDecodeError:
+                continue
+            if keep_text(text):
+                out.write(json.dumps({"text": text, "source": src.repo},
+                                     ensure_ascii=False) + "\n")
+                n += 1
+    return n
+
+
+def dump_parquet(path: Path, src: Source, out) -> int:
+    import polars as pl
+    n = 0
+    try:
+        df = pl.read_parquet(path, columns=[src.text_key])
+    except pl.exceptions.ColumnNotFoundError:
+        df0 = pl.read_parquet(path).head(1)
+        raise RuntimeError(f"{path.name} 没有列 '{src.text_key}'，实际列: {df0.columns}")
+    for text in df[src.text_key].to_list():
+        text = str(text or "").strip()
+        if keep_text(text):
+            out.write(json.dumps({"text": text, "source": src.repo},
+                                 ensure_ascii=False) + "\n")
+            n += 1
+    return n
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--groups", type=str, default="zh,en,code,math",
+                        help="逗号分隔，可只跑部分")
+    parser.add_argument("--work_dir", type=str, default="text_raw")
+    parser.add_argument("--out_dir", type=str, default="texts")
+    parser.add_argument("--keep_files", action="store_true",
+                        help="处理后保留原始分片（默认删除省磁盘）")
+    args = parser.parse_args()
+
+    work = Path(args.work_dir); work.mkdir(exist_ok=True)
+    out_dir = Path(args.out_dir); out_dir.mkdir(exist_ok=True)
+
+    for group in args.groups.split(","):
+        for src in SOURCES[group.strip()]:
+            tag = f"{group}_{src.repo.split('/')[-1]}_{src.subset.replace('/', '-')}"
+            out_path = out_dir / f"{tag}.jsonl"
+            print(f"\n{'='*55}\n{src.repo} / {src.subset or '(root)'} → {out_path}\n{'='*55}")
+            if out_path.exists():
+                print("  已存在，跳过（重收请删除）")
                 continue
 
-        if ds is None:
-            logger.error(f"[{domain}] 所有 repo 均失败: {src.repo}")
-            return {"status": "failed", "repo": src.repo, "error": "all repos failed"}
+            files = list_files(src)
+            print(f"  分片: {len(files)} 个")
 
-        max_bytes = self._parse_size(max_shard_size)
-        shard_idx, current_bytes = 0, 0
-        shard_f = None
-        buffer = []
-        written = 0
+            total = 0
+            with open(out_path, "w", encoding="utf-8") as out:
+                for fpath in files:
+                    local = work / src.repo.split("/")[-1] / fpath.replace("/", "_")
+                    local.parent.mkdir(parents=True, exist_ok=True)
+                    url = f"{MIRROR}/datasets/{src.repo}/resolve/main/{fpath}"
+                    download(url, local)
+                    fn = dump_jsonl if fpath.endswith(".jsonl") else dump_parquet
+                    n = fn(local, src, out)
+                    total += n
+                    print(f"    +{n:,} 条（累计 {total:,}）")
+                    if not args.keep_files:
+                        local.unlink()   # 处理完即删，省磁盘
+            print(f"  完成: {total:,} 条，{out_path.stat().st_size/1e9:.2f} GB")
 
-        def flush(force_new: bool = False):
-            nonlocal shard_f, shard_idx, current_bytes
-            if not buffer:
-                return
-            if shard_f is None or current_bytes >= max_bytes or force_new:
-                if shard_f:
-                    shard_f.close()
-                shard_idx += 1
-                path = save_dir / f"shard_{shard_idx:05d}.jsonl"
-                shard_f = open(path, "w", encoding="utf-8")
-                current_bytes = 0
-            for r in buffer:
-                line = json.dumps(r, ensure_ascii=False) + "\n"
-                shard_f.write(line)
-                current_bytes += len(line.encode("utf-8"))
-            buffer.clear()
-
-        try:
-            for ex in ds:
-                text = ex.get(src.text_col)
-                if text is None or not isinstance(text, str) or not text.strip():
-                    continue
-                buffer.append({"text": text.strip()})
-                if len(buffer) >= 5000:
-                    flush()
-                written += 1
-                if written % 50000 == 0:
-                    logger.info(f"  ...已处理 {written:,} 条")
-            flush()
-            if shard_f:
-                shard_f.close()
-        except Exception as e:
-            logger.error(f"[{domain}] 写入中断: {e}")
-            return {"status": "error", "repo": src.repo, "error": str(e)}
-
-        logger.info(f"[{domain}] 完成: {written:,} 条 -> {save_dir}")
-        return {
-            "status": "success",
-            "repo": src.repo,
-            "subdir": src.subdir,
-            "domain": domain,
-            "samples": written,
-            "path": str(save_dir),
-            "text_col": src.text_col,
-        }
-
-    def run(self, domains: Optional[List[str]] = None,
-            streaming: bool = True, shard_size: str = "1GB"):
-        if not HAS_HF:
-            logger.error("缺少依赖: pip install datasets")
-            sys.exit(1)
-
-        todo = {k: v for k, v in SOURCES.items() if not domains or k in domains}
-
-        for domain, srcs in todo.items():
-            self.manifest[domain] = []
-            for idx, src in enumerate(srcs):
-                meta = self.download(src, domain, idx, streaming=streaming, max_shard_size=shard_size)
-                self.manifest[domain].append(meta)
-
-        mf = self.out / "manifest.json"
-        with open(mf, "w", encoding="utf-8") as f:
-            json.dump(self.manifest, f, ensure_ascii=False, indent=2)
-        logger.info(f"Manifest 已保存: {mf}")
+    print("\n全部产物:")
+    for p in sorted(out_dir.glob("*.jsonl")):
+        print(f"  {p.name:50s} {p.stat().st_size/1e9:.2f} GB")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="下载纯文本预训练数据")
-    parser.add_argument("-o", "--output", default="./pretrain_text", help="输出目录")
-    parser.add_argument("--cache", default=None, help="HF 缓存目录")
-    parser.add_argument("-d", "--domains", nargs="+", default=None,
-                        choices=["zh", "en", "code", "math"],
-                        help="只下载指定域，默认全部")
-    parser.add_argument("--no-streaming", action="store_true",
-                        help="关闭流式（先把完整数据集下载到本地缓存）")
-    parser.add_argument("--shard-size", default="1GB", help="单个 shard 大小")
-    args = parser.parse_args()
-
-    dl = Downloader(args.output, args.cache)
-    dl.run(domains=args.domains, streaming=not args.no_streaming, shard_size=args.shard_size)
+    main()

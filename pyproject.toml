@@ -16,6 +16,7 @@ dependencies = [
     "fastparquet>=2026.9.0",
     "torch==2.7.1",
     "torchvision==0.22.1",
+    "polars>=2.0.0",
 ]
 
 [[tool.uv.index]]
