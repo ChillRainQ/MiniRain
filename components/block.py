@@ -161,7 +161,7 @@ class BlockAttnResBlock(nn.Module):
         self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
-        self.attn = MoTGroupQueryAttention(AttentionArgs(config))
+        self.attn = GroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
@@ -174,7 +174,7 @@ class BlockAttnResBlock(nn.Module):
             self.mlp = MoTFFN(n_modalities=2,
                               args=MLPArgs(hidden_size=config.hidden_size,
                                            intermediate_size=config.intermediate_size, bias=False),
-                              norm_args=NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+                              norm_args=NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps), config=config)
             self.post_attn_layernorm = None
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)

@@ -1,330 +1,197 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-高质量纯文本预训练语料采集（多源加权版）
-  zh : BAAI/CCI4.0-M2-Base-v1 (主力, 通用网页, 世界知识)      [需 HF_TOKEN]
-       opencsg/Fineweb-Edu-Chinese-V2.2 4_5/3_4 (质量压舱)
-       wikimedia/wikipedia 20231101.zh (知识密度, 多epoch)
-  en : HuggingFaceFW/fineweb-edu sample/10BT (质量)
-       HuggingFaceFW/fineweb sample/10BT (通用网页, 实体覆盖)
-  code: codeparrot/codeparrot-clean (纯 Python)
-全程 hf-mirror 直连 HTTP，断点续传 + 质量过滤器。
+import os
+import sys
+import json
+import argparse
+import logging
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-用法:
-    $env:HF_TOKEN = "hf_xxx"          # 仅 zh 的 CCI4.0 需要
-    python collect_text_hq.py --only zh --target-gb 20
-    python collect_text_hq.py --only en --target-gb 10
-    python collect_text_hq.py --only code --target-gb 5
-输出默认为脚本所在目录下的 text_hq/{zh,en,code}.jsonl
-"""
-import os, re, gzip, json, time, argparse, unicodedata
-import requests
+try:
+    from datasets import load_dataset
+    HAS_HF = True
+except ImportError:
+    HAS_HF = False
 
-MIRROR = "https://hf-mirror.com"
-HEADERS = {"User-Agent": "Mozilla/5.0 (data-collector)"}
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("text_dl")
 
-def auth_headers():
-    h = dict(HEADERS)
-    if HF_TOKEN:
-        h["Authorization"] = f"Bearer {HF_TOKEN}"
-    return h
 
-# ---------------- 数据源（多源加权） ----------------
+@dataclass
+class Source:
+    repo: str
+    subdir: str = ""
+    text_col: str = "text"
+    weight_gb: float = 0.0
+    is_config: bool = False
+    fallback_repo: Optional[str] = None
+
+
 SOURCES = {
     "zh": [
-        {"repo": "BAAI/CCI4.0-M2-Base-v1", "subdir": "",
-         "format": "jsonl", "text_col": "text", "weight_gb": 14},
-        {"repo": "opencsg/Fineweb-Edu-Chinese-V2.2", "subdir": "4_5",
-         "format": "parquet", "text_col": "text", "weight_gb": 2},
-        {"repo": "opencsg/Fineweb-Edu-Chinese-V2.2", "subdir": "3_4",
-         "format": "parquet", "text_col": "text", "weight_gb": 2},
-        {"repo": "wikimedia/wikipedia", "subdir": "20231101.zh",
-         "format": "parquet", "text_col": "text", "weight_gb": 2},
+        Source("BAAI/CCI4.0-M2-Base-v1", "", "text", 20, False),
+        Source("opencsg/Fineweb-Edu-Chinese-V2.2", "4_5", "text", 3, True),
+        Source("opencsg/Fineweb-Edu-Chinese-V2.2", "3_4", "text", 1, True),
+        Source("wikimedia/wikipedia", "20231101.zh", "text", 2, True),
     ],
     "en": [
-        {"repo": "HuggingFaceFW/fineweb-edu", "subdir": "sample/10BT",
-         "format": "parquet", "text_col": "text", "weight_gb": 8},
-        {"repo": "HuggingFaceFW/fineweb", "subdir": "sample/10BT",
-         "format": "parquet", "text_col": "text", "weight_gb": 2},
+        Source("HuggingFaceFW/fineweb-edu", "sample/10BT", "text", 8, False),
+        Source("HuggingFaceFW/fineweb", "sample/10BT", "text", 2, False),
     ],
     "code": [
-        {"repo": "codeparrot/codeparrot-clean", "subdir": "",
-         "format": "jsongz", "text_col": "content", "weight_gb": 5},
+        Source("bigcode/the-stack", "data/python", "content", 5, False),
+    ],
+    "math": [
+        Source("AI-MO/NuminaMath-1.5", "", "solution", 2, False),
     ],
 }
 
-DEBUG_MAX_SHOW = 3
-SHARD_EXTS = (".parquet", ".json.gz", ".jsonl")
-_WS_CHARS = "\n\t\r\f"
 
-# ---------------- 质量过滤 ----------------
-def _rep_ratio(text: str) -> float:
-    units = text.split() if " " in text else list(text)
-    n = 8
-    if len(units) < n * 2:
-        return 0.0
-    grams = [tuple(units[i:i+n]) for i in range(len(units) - n + 1)]
-    return 1.0 - len(set(grams)) / len(grams)
+class Downloader:
+    def __init__(self, output_dir: str, cache_dir: Optional[str] = None):
+        self.out = Path(output_dir)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.cache = Path(cache_dir) if cache_dir else self.out / ".hf_cache"
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.manifest: Dict = {}
 
-def clean_text(t: str) -> str:
-    t = unicodedata.normalize("NFC", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+    def _save_dir(self, src: Source, domain: str, idx: int) -> Path:
+        safe = src.repo.replace("/", "__")
+        tag = src.subdir.replace("/", "__") if src.subdir else "default"
+        return self.out / domain / f"{idx:02d}_{safe}__{tag}"
 
-def check_text(text: str, kind: str, min_len: int, max_len: int):
-    if not text:
-        return False, "empty"
-    n = len(text)
-    if n < min_len:
-        return False, f"too_short({n})"
-    if n > max_len:
-        return False, f"too_long({n})"
-    if _rep_ratio(text) > 0.35:
-        return False, "high_repetition"
-    weird = sum(1 for c in text[:2000]
-                if unicodedata.category(c).startswith("C")
-                and c not in _WS_CHARS)
-    if weird > 20:
-        return False, "control_chars"
-    if kind == "zh":
-        zh = sum(1 for c in text[:2000] if "一" <= c <= "鿿")
-        if zh < 100:
-            return False, f"low_cjk({zh})"
-    elif kind == "en":
-        alpha = sum(1 for c in text[:2000] if c.isalpha())
-        if alpha / min(n, 2000) < 0.55:
-            return False, "low_alpha"
-        lines = [l for l in text.split("\n") if len(l) > 25][:50]
-        if lines:
-            end_p = sum(1 for l in lines if l.rstrip().endswith((".", "!", "?", '"', "'")))
-            if end_p / len(lines) < 0.5:
-                return False, "boilerplate_lines"
-    elif kind == "code":
-        if text.count("\n") < 3:
-            return False, "too_few_lines"
-        longline = max((len(l) for l in text.split("\n")), default=0)
-        if longline > 2000:
-            return False, "minified"
-    return True, "ok"
+    @staticmethod
+    def _parse_size(s: str) -> int:
+        s = s.upper().strip()
+        for unit, mul in [("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)]:
+            if s.endswith(unit):
+                return int(float(s[:-len(unit)]) * mul)
+        return int(s)
 
-KEEP_CFG = {
-    "zh":   (300, 8000),
-    "en":   (500, 20000),
-    "code": (200, 20000),
-}
+    def download(self, src: Source, domain: str, idx: int,
+                 max_shard_size: str = "1GB", streaming: bool = True) -> dict:
+        save_dir = self._save_dir(src, domain, idx)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-def code_row_ok(d: dict) -> bool:
-    if d.get("autogenerated"):
-        return False
-    try:
-        if float(d.get("copies", 1)) > 10:
-            return False
-        if float(d.get("alpha_frac", 1)) < 0.25:
-            return False
-        if float(d.get("line_max", 0)) > 1000:
-            return False
-    except (TypeError, ValueError):
-        return False
-    return True
+        logger.info(f"[{domain}] 开始: {src.repo} | subdir={src.subdir!r} | col={src.text_col}")
 
-# ---------------- HTTP ----------------
-def http_get(url, timeout=30, retries=4):
-    for i in range(retries):
-        try:
-            r = requests.get(url, headers=auth_headers(), timeout=timeout)
-            r.raise_for_status()
-            return r
-        except Exception:
-            if i == retries - 1:
-                raise
-            time.sleep(3 * (i + 1))
+        ds = None
+        repos_to_try = [src.repo]
+        if src.fallback_repo:
+            repos_to_try.append(src.fallback_repo)
 
-def download(url: str, dst: str) -> bool:
-    pos = os.path.getsize(dst) if os.path.exists(dst) else 0
-    for attempt in range(5):
-        try:
-            h = auth_headers()
-            if pos:
-                h["Range"] = f"bytes={pos}-"
-            with requests.get(url, headers=h, stream=True, timeout=60) as r:
-                if r.status_code in (200, 206):
-                    total = int(r.headers.get("content-length", 0)) + pos
-                    mode = "ab" if (pos and r.status_code == 206) else "wb"
-                    t0 = time.time()
-                    with open(dst, mode) as f:
-                        for chunk in r.iter_content(1 << 20):
-                            f.write(chunk)
-                            pos += len(chunk)
-                            el = max(time.time() - t0, 1e-6)
-                            print(f"\r    {pos/1e6:.0f}/{total/1e6:.0f}MB "
-                                  f"{pos/1e6/el:.1f}MB/s", end="", flush=True)
-                    print()
-                    return True
-                if r.status_code == 416:
-                    return True
-                raise RuntimeError(f"HTTP {r.status_code}")
-        except Exception as e:
-            print(f"\n    重试{attempt+1}: {e}")
-            time.sleep(4 * (attempt + 1))
-            pos = os.path.getsize(dst) if os.path.exists(dst) else 0
-    return False
-
-def list_shards(repo: str, subdir: str):
-    def _list(path):
-        r = http_get(f"{MIRROR}/api/datasets/{repo}/tree/main/{path}?recursive=true")
-        return [it["path"] for it in r.json()
-                if it.get("type") == "file" and it["path"].endswith(SHARD_EXTS)]
-    if subdir:
-        try:
-            files = _list(subdir)
-            if files:
-                return sorted(files)
-        except Exception as e:
-            print(f"    [debug] 子目录列表失败({subdir}): {e}")
-    return sorted(_list(""))
-
-# ---------------- 解析 ----------------
-def _get_text(d: dict, text_col: str):
-    """宽容取正文: 优先指定列, 回退 text/content"""
-    t = d.get(text_col)
-    if isinstance(t, str):
-        return t
-    for alt in ("text", "content"):
-        if alt != text_col:
-            t = d.get(alt)
-            if isinstance(t, str):
-                return t
-    return None
-
-def parse_shard(path: str, src: dict, kind: str):
-    fmt = src["format"]
-    text_col = src["text_col"]
-    if fmt == "parquet":
-        import fastparquet
-        pf = fastparquet.ParquetFile(path)
-        first = True
-        for df in pf.iter_row_groups():
-            if first:
-                print(f"    [debug] 列: {df.columns.tolist()}, 行数: {len(df)}")
-            if text_col not in df.columns and "text" not in df.columns and "content" not in df.columns:
-                raise ValueError(f"分片缺少正文列, 实际列: {df.columns.tolist()}")
-            col = text_col if text_col in df.columns else ("text" if "text" in df.columns else "content")
-            first = False
-            for t in df[col].tolist():
-                if isinstance(t, str):
-                    yield t
-    elif fmt in ("jsongz", "jsonl"):
-        first = True
-        if fmt == "jsongz":
-            f = gzip.open(path, "rt", encoding="utf-8", errors="ignore")
-        else:
-            f = open(path, "rt", encoding="utf-8", errors="ignore")
-        with f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if first:
-                    print(f"    [debug] 字段: {list(d.keys())}")
-                    first = False
-                if kind == "code" and not code_row_ok(d):
-                    continue
-                t = _get_text(d, text_col)
-                if isinstance(t, str):
-                    yield t
-    else:
-        raise ValueError(f"未知格式: {fmt}")
-
-# ---------------- 主流程 ----------------
-def collect_source(kind: str, src: dict, out_dir: str):
-    min_len, max_len = KEEP_CFG[kind]
-    tag = f"{kind}:{src['repo'].split('/')[-1]}:{src['subdir'] or 'root'}"
-    out_path = os.path.join(out_dir, f"{kind}.jsonl")
-    tmp_dir = os.path.join(out_dir, "_tmp_shards")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    state_name = f".state_{tag.replace('/', '_').replace(':', '_')}.json"
-    state_path = os.path.join(out_dir, state_name)
-    state = json.load(open(state_path)) if os.path.exists(state_path) else {"done": []}
-    done = set(state["done"])
-
-    target = int(src["weight_gb"] * (1 << 30))
-    bytes_have = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-    print(f"[{tag}] 目标 {src['weight_gb']}GB (jsonl 当前已含 {bytes_have/1e9:.2f}GB)")
-
-    shards = list_shards(src["repo"], src["subdir"])
-    print(f"[{tag}] {len(shards)} 个分片")
-
-    fout = open(out_path, "a", encoding="utf-8")
-    try:
-        for sp in shards:
-            if bytes_have >= target:
-                break
-            if sp in done:
-                continue
-            local = os.path.join(tmp_dir, sp.replace("/", "__"))
-            url = f"{MIRROR}/datasets/{src['repo']}/resolve/main/{sp}"
-            print(f"[{tag}] 下载 {sp}")
-            if not download(url, local):
-                print(f"[{tag}]   跳过(下载失败)")
-                continue
-            kept = rejected = shown = 0
-            reject_reasons = {}
-            ok_shard = True
+        for repo in repos_to_try:
             try:
-                for text in parse_shard(local, src, kind):
-                    t = clean_text(text)
-                    ok, reason = check_text(t, kind, min_len, max_len)
-                    if ok:
-                        fout.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
-                        bytes_have += len(t.encode("utf-8")) + 1
-                        kept += 1
-                        if kept % 2000 == 0:
-                            fout.flush()
-                        if bytes_have >= target:
-                            break
-                    else:
-                        rejected += 1
-                        key = reason.split("(")[0]
-                        reject_reasons[key] = reject_reasons.get(key, 0) + 1
-                        if shown < DEBUG_MAX_SHOW:
-                            print(f"    [debug] 被拒({reason}): {t[:100]!r}")
-                            shown += 1
+                kwargs = {
+                    "split": "train",
+                    "streaming": streaming,
+                    "cache_dir": str(self.cache),
+                    "trust_remote_code": True,
+                }
+                if src.is_config:
+                    ds = load_dataset(repo, src.subdir, **kwargs)
+                elif src.subdir:
+                    ds = load_dataset(repo, data_dir=src.subdir, **kwargs)
+                else:
+                    ds = load_dataset(repo, **kwargs)
+                logger.info(f"  成功加载: {repo}")
+                break
             except Exception as e:
-                print(f"\n[{tag}]   解析失败: {e}")
-                ok_shard = False
-            finally:
-                if ok_shard and os.path.exists(local):
-                    os.remove(local)
-            if ok_shard:
-                done.add(sp)
-                state["done"] = sorted(done)
-                json.dump(state, open(state_path, "w"))
-                print(f"[{tag}]   +{kept} 条 (拒 {rejected}: {reject_reasons}), "
-                      f"累计 {bytes_have/1e9:.2f}GB")
-    finally:
-        fout.close()
-    print(f"[{tag}] 完成, 累计 {bytes_have/1e9:.2f}GB")
+                logger.warning(f"  加载失败 {repo}: {e}")
+                continue
 
-def collect(kind: str, out_dir: str):
-    for src in SOURCES[kind]:
-        collect_source(kind, src, out_dir)
+        if ds is None:
+            logger.error(f"[{domain}] 所有 repo 均失败: {src.repo}")
+            return {"status": "failed", "repo": src.repo, "error": "all repos failed"}
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=os.path.join(SCRIPT_DIR, "text_hq"))
-    ap.add_argument("--only", choices=["zh", "en", "code"], default=None)
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
-    for kind in ([args.only] if args.only else ["zh", "en", "code"]):
-        collect(kind, args.out)
+        max_bytes = self._parse_size(max_shard_size)
+        shard_idx, current_bytes = 0, 0
+        shard_f = None
+        buffer = []
+        written = 0
+
+        def flush(force_new: bool = False):
+            nonlocal shard_f, shard_idx, current_bytes
+            if not buffer:
+                return
+            if shard_f is None or current_bytes >= max_bytes or force_new:
+                if shard_f:
+                    shard_f.close()
+                shard_idx += 1
+                path = save_dir / f"shard_{shard_idx:05d}.jsonl"
+                shard_f = open(path, "w", encoding="utf-8")
+                current_bytes = 0
+            for r in buffer:
+                line = json.dumps(r, ensure_ascii=False) + "\n"
+                shard_f.write(line)
+                current_bytes += len(line.encode("utf-8"))
+            buffer.clear()
+
+        try:
+            for ex in ds:
+                text = ex.get(src.text_col)
+                if text is None or not isinstance(text, str) or not text.strip():
+                    continue
+                buffer.append({"text": text.strip()})
+                if len(buffer) >= 5000:
+                    flush()
+                written += 1
+                if written % 50000 == 0:
+                    logger.info(f"  ...已处理 {written:,} 条")
+            flush()
+            if shard_f:
+                shard_f.close()
+        except Exception as e:
+            logger.error(f"[{domain}] 写入中断: {e}")
+            return {"status": "error", "repo": src.repo, "error": str(e)}
+
+        logger.info(f"[{domain}] 完成: {written:,} 条 -> {save_dir}")
+        return {
+            "status": "success",
+            "repo": src.repo,
+            "subdir": src.subdir,
+            "domain": domain,
+            "samples": written,
+            "path": str(save_dir),
+            "text_col": src.text_col,
+        }
+
+    def run(self, domains: Optional[List[str]] = None,
+            streaming: bool = True, shard_size: str = "1GB"):
+        if not HAS_HF:
+            logger.error("缺少依赖: pip install datasets")
+            sys.exit(1)
+
+        todo = {k: v for k, v in SOURCES.items() if not domains or k in domains}
+
+        for domain, srcs in todo.items():
+            self.manifest[domain] = []
+            for idx, src in enumerate(srcs):
+                meta = self.download(src, domain, idx, streaming=streaming, max_shard_size=shard_size)
+                self.manifest[domain].append(meta)
+
+        mf = self.out / "manifest.json"
+        with open(mf, "w", encoding="utf-8") as f:
+            json.dump(self.manifest, f, ensure_ascii=False, indent=2)
+        logger.info(f"Manifest 已保存: {mf}")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="下载纯文本预训练数据")
+    parser.add_argument("-o", "--output", default="./pretrain_text", help="输出目录")
+    parser.add_argument("--cache", default=None, help="HF 缓存目录")
+    parser.add_argument("-d", "--domains", nargs="+", default=None,
+                        choices=["zh", "en", "code", "math"],
+                        help="只下载指定域，默认全部")
+    parser.add_argument("--no-streaming", action="store_true",
+                        help="关闭流式（先把完整数据集下载到本地缓存）")
+    parser.add_argument("--shard-size", default="1GB", help="单个 shard 大小")
+    args = parser.parse_args()
+
+    dl = Downloader(args.output, args.cache)
+    dl.run(domains=args.domains, streaming=not args.no_streaming, shard_size=args.shard_size)

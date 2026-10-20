@@ -4,7 +4,9 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PreTrainedConfig
 
+from architectures.config import RainConfig
 from components.norm import RMSNorm, NormArgs
 
 
@@ -83,12 +85,12 @@ class MoTFFN(nn.Module):
     """
     MOT FFN
     """
-    def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs):
+    def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
         self.mlp_t = SwiGLU(args)
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
-                                    intermediate_size=(args.intermediate_size // 2),
+                                    intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
                                     bias=args.bias))
         self.norm_t = RMSNorm(norm_args)
         self.norm_v = RMSNorm(norm_args)
