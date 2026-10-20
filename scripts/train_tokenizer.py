@@ -63,13 +63,13 @@ assert SPECIALS[12] == "<|image_pad|>" and SPECIALS[27] == "<|buffer1|>"
 # ===================== 采样配比（tokenizer 训练用 ~3GB 即可） =====================
 SAMPLING = {
     # glob 模式: 目标采样 GB
-    "texts/zh_CCI4.0*.jsonl":               1.2,
-    "texts/zh_wikipedia*.jsonl":            0.3,
-    "texts/zh_*Fineweb-Edu-Chinese*.jsonl": 0.1,
-    "texts/en_fineweb-edu*.jsonl":          0.5,
-    "texts/en_fineweb_sample*.jsonl":       0.1,
-    "texts/code_python*.jsonl":             0.6,
-    "texts/math_NuminaMath*.jsonl":         0.2,
+    "data/texts/zh_CCI4.0*.jsonl":               1.2,
+    "data/texts/zh_wikipedia*.jsonl":            0.3,
+    "data/texts/zh_*Fineweb-Edu-Chinese*.jsonl": 0.1,
+    "data/texts/en_fineweb-edu*.jsonl":          0.5,
+    "data/texts/en_fineweb_sample*.jsonl":       0.1,
+    "data/texts/code_python*.jsonl":             0.6,
+    "data/texts/math_NuminaMath*.jsonl":         0.2,
     # 图文 caption 收集完后取消注释：
     # "muge.jsonl":    0.10,
     # "cococn.jsonl":  0.05,
