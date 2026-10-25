@@ -20,7 +20,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=1024, type=int, help="隐藏层维度")
     parser.add_argument('--vision_ffn_scale', default=4, type=int, help="视觉 FFN 缩放比例")
     parser.add_argument('--model_type', default='v', type=str, help="模型类别")
-    parser.add_argument('--num_hidden_layers', default=16, type=int, help="隐藏层数量")
+    parser.add_argument('--num_hidden_layers', default=20, type=int, help="隐藏层数量")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_mot', default=1, type=int, choices=[0, 1], help="是否使用LOOP架构（0=否，1=是）")

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedConfig
 
 from architectures.config import RainConfig
-from components.norm import RMSNorm, NormArgs
+from components.norm import RMSNorm, NormArgs, TorchRMSNorm
 
 
 @dataclass
@@ -92,8 +92,8 @@ class MoTFFN(nn.Module):
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
                                     bias=args.bias))
-        self.norm_t = RMSNorm(norm_args)
-        self.norm_v = RMSNorm(norm_args)
+        self.norm_t = TorchRMSNorm(norm_args)
+        self.norm_v = TorchRMSNorm(norm_args)
 
     def forward(self, x, img_idx=None):
         if img_idx is None:

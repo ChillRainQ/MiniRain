@@ -4,11 +4,11 @@ from transformers import PreTrainedConfig
 from components.mlp import SwiGLU, LosslessMoE, MoTFFN
 from components.mlp import MLPArgs
 from components.norm import NormArgs
-from components.attention import AttentionArgs, MoTGroupQueryAttention
+from components.attention import AttentionArgs
 from components.attention import GroupQueryAttention
 import torch.nn as nn
 
-from components.norm import RMSNorm
+from components.norm import RMSNorm, TorchRMSNorm
 
 class FullAttnRes(nn.Module):
     """
@@ -16,7 +16,7 @@ class FullAttnRes(nn.Module):
     """
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
-        self.attn_res_norm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.attn_res_norm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
 
     def forward(self, history_input: list[torch.Tensor]):
@@ -36,7 +36,7 @@ class BlockAttnRes(nn.Module):
     """
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
-        self.attn_res_norm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.attn_res_norm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
 
     def forward(self, inter_block_history: list[torch.Tensor],
@@ -83,8 +83,8 @@ class MiniRainBlock(nn.Module):
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
         self.attn = GroupQueryAttention(AttentionArgs(config))
-        self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size, bias=False))
 
 
@@ -111,8 +111,8 @@ class FullAttnResBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.attn = GroupQueryAttention(AttentionArgs(config))
-        self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
                                   intermediate_size=config.intermediate_size, bias=False))
@@ -162,8 +162,8 @@ class BlockAttnResBlock(nn.Module):
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
         self.attn = GroupQueryAttention(AttentionArgs(config))
-        self.input_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.post_attn_layernorm = RMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
+        self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
                                       intermediate_size=config.intermediate_size, bias=False))
@@ -188,6 +188,8 @@ class BlockAttnResBlock(nn.Module):
         if self.block_size >= 2 and self.layer_id % (self.block_size // 2) == 0:
             past_hidden_states.append(partial_block)
             partial_block = None
+        # 注意力固定 GQA，不做 MoT 化；modality_mask 只用于 MoTFFN 的模态分流。
+        # 注意 GQA 里同名参数是 image_bidirectional_mask 的别名（可见性 mask），语义不同，绝不能传入
         attn_out, past_key_value = self.attn(self.input_layernorm(attn_input),
                                              position_embeddings, past_key_value,
                                              use_cache, attention_mask, image_bidirectional_mask, modality_mask=modality_mask)

@@ -7,9 +7,9 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from architectures.config import RainConfig
 from components.block import BlockAttnResBlock
 from components.cv import ConvStem
-from components.norm import NormArgs, RMSNorm
+from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
-
+from losses.loss import get_loss_fn
 
 def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
@@ -47,7 +47,7 @@ class MiniRainVLM(nn.Module):
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
         self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
-        self.text_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
+        self.text_norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
         assert self.patch_size == 16, f"ConvStem 固定 16× 降采样，config.patch_size={self.patch_size} 暂不支持"
@@ -55,7 +55,7 @@ class MiniRainVLM(nn.Module):
         # self.patch_embd = nn.Conv2d(3, config.hidden_size,
         #                              kernel_size=self.patch_size, stride=self.patch_size)
         self.patch_embed = ConvStem(hidden=config.hidden_size)
-        self.img_norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
+        self.img_norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         self.img_patch = self.config.img_patch_token
         self.img_start = self.config.img_start_token
         self.img_end = self.config.img_end_token
@@ -160,6 +160,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         self.name = self.model.name
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed.weight = self.lm_head.weight
+        self.loss_fn = get_loss_fn()
         self.post_init()
 
     def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
@@ -168,14 +169,34 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             input_ids, pixel_values=pixel_values, positions=positions,
             attention_mask=attention_mask, past_key_values=past_key_values,
             use_cache=use_cache, **kwargs)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
         loss = None
-        if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+        if labels is None:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        else:
+            logits = None
+            # shift 作用在 hidden/labels 上（不是 logits），对齐原版 CE 的语义
+            h = hidden_states[:, :-1, :].contiguous()  # [B, T-1, H]
+            y = labels[..., 1:].contiguous()  # [B, T-1]，图像段/pad 已是 -100
+            loss = self.loss_fn(self.lm_head.weight, h, y)
+
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
                                          past_key_values=past_key_values, hidden_states=hidden_states)
+    # def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
+    #             past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+    #     hidden_states, past_key_values, aux_loss = self.model(
+    #         input_ids, pixel_values=pixel_values, positions=positions,
+    #         attention_mask=attention_mask, past_key_values=past_key_values,
+    #         use_cache=use_cache, **kwargs)
+    #     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    #     logits = self.lm_head(hidden_states[:, slice_indices, :])
+    #     loss = None
+    #     if labels is not None:
+    #         x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
+    #         loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+    #     return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
+    #                                      past_key_values=past_key_values, hidden_states=hidden_states)
 
     @torch.inference_mode()
     def generate(self, inputs=None, pixel_values=None, positions=None, attention_mask=None,
@@ -185,7 +206,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         if positions is not None: positions = positions.repeat(num_return_sequences, 1, 1)
-        if pixel_values is not None: pixel_values = pixel_values * num_return_sequences
+        if pixel_values is not None and num_return_sequences > 1:
+            pixel_values = list(pixel_values) * num_return_sequences
         past_key_values = kwargs.pop("past_key_values", None)
         # 记录 prompt 末尾的位置编号：图像段占用了额外的行号，
         # decode 新 token 的位置必须从这里+1继续，不能用 past_len
@@ -199,12 +221,20 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 # decode 阶段：行=列=连续编号，接在 prompt 末尾之后
                 pos = torch.full((input_ids.shape[0], 1), next_pos, dtype=torch.long, device=input_ids.device)
                 step_positions = torch.stack([pos, pos], dim=-1)
+            # outputs = self.forward(
+            #     input_ids[:, past_len:],
+            #     pixel_values=pixel_values if past_len == 0 else None,  # 图像只在 prefill 进
+            #     positions=step_positions if past_len > 0 else positions,
+            #     attention_mask=attention_mask,
+            #     past_key_values=past_key_values, use_cache=use_cache, **kwargs)
             outputs = self.forward(
                 input_ids[:, past_len:],
-                pixel_values=pixel_values if past_len == 0 else None,  # 图像只在 prefill 进
+                pixel_values=pixel_values if past_len == 0 else None,
                 positions=step_positions if past_len > 0 else positions,
                 attention_mask=attention_mask,
-                past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+                past_key_values=past_key_values, use_cache=use_cache,
+                logits_to_keep=1 if past_len == 0 else 0,  # prefill 只留最后一个
+                **kwargs)
             if next_pos is not None: next_pos += 1
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             # pyrefly: ignore [unsupported-operation]

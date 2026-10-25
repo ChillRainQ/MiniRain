@@ -18,14 +18,9 @@ from pathlib import Path
 
 import requests
 
-<<<<<<< HEAD
-MIRROR = "https://hf-mirror.com"
-HF_TOKEN = os.environ.get("HF_TOKEN")
-=======
 MIRROR = "https://huggingface.co"
 # HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_TOKEN = ""
->>>>>>> 9012359 (feat: tokenizer 训练)
 AUTH = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 

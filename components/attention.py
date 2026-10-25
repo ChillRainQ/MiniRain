@@ -1,3 +1,5 @@
+import inspect
+
 from transformers import PreTrainedConfig
 
 from components.norm import *
@@ -35,74 +37,295 @@ class AttentionArgs:
 
 
 class GroupQueryAttention(nn.Module):
-    """分组查询注意力机制。"""
+    """分组查询注意力机制。
+
+    依赖外部定义：AttentionArgs、NormArgs、TorchRMSNorm 和
+    apply_rotary_pos_emb。
+
+    attention_mask 使用 [B, KV_len] 格式，1/True 表示有效 token，
+    0/False 表示 padding；image_bidirectional_mask（别名 modality_mask）
+    应为可广播到 [B, H, Q_len, KV_len] 的 mask。布尔或整型 0/1 mask
+    按 1/True 可见、0/False 屏蔽处理；浮点 mask 按加性偏置处理。
+    """
+
+    @staticmethod
+    def _repeat_kv(x, n_rep):
+        """将 [B, Hkv, T, D] 展开为 [B, H, T, D]。"""
+        if n_rep == 1:
+            return x
+        bsz, n_kv_heads, seq_len, head_dim = x.shape
+        return (
+            x[:, :, None, :, :]
+            .expand(bsz, n_kv_heads, n_rep, seq_len, head_dim)
+            .reshape(bsz, n_kv_heads * n_rep, seq_len, head_dim)
+        )
+
+    @staticmethod
+    def _prepare_attn_mask(mask, query):
+        """将 mask 转为 SDPA 支持的类型，并统一可见性语义。"""
+        if mask.dtype == torch.bool:
+            return mask.to(device=query.device)
+
+        # 整型 0/1 mask 按可见性处理：1 可见，0 屏蔽。
+        if not mask.dtype.is_floating_point:
+            is_binary = bool(torch.all((mask == 0) | (mask == 1)).item())
+            if is_binary:
+                return mask.to(device=query.device, dtype=torch.bool)
+
+        # 浮点 mask 或其他整型 mask 按加性注意力偏置处理。
+        return mask.to(device=query.device, dtype=query.dtype)
+
     def __init__(self, args: AttentionArgs):
         super().__init__()
         config = args.config
-        
+
+        if config.n_attn_heads <= 0 or config.n_key_value_heads <= 0:
+            raise ValueError("注意力头数必须为正整数")
+        if config.n_attn_heads % config.n_key_value_heads != 0:
+            raise ValueError(
+                "n_attn_heads 必须能被 n_key_value_heads 整除，"
+                f"当前为 {config.n_attn_heads} 和 {config.n_key_value_heads}"
+            )
+
         self.n_key_value_heads = config.n_key_value_heads
         self.n_local_heads = config.n_attn_heads
         self.n_local_kv_heads = self.n_key_value_heads
-        # 重复次数
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.head_dim
-        # 是否为因果注意力
         self.is_causal = True
-        # 注意力矩阵
-        self.wq = nn.Linear(config.hidden_size, config.n_attn_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.hidden_size, self.n_key_value_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(config.hidden_size, self.n_key_value_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.n_attn_heads * self.head_dim, config.hidden_size, bias=False)
-        
-        self.q_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
-        self.k_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+
+        self.wq = nn.Linear(
+            config.hidden_size,
+            config.n_attn_heads * self.head_dim,
+            bias=False,
+        )
+        self.wk = nn.Linear(
+            config.hidden_size,
+            self.n_key_value_heads * self.head_dim,
+            bias=False,
+        )
+        self.wv = nn.Linear(
+            config.hidden_size,
+            self.n_key_value_heads * self.head_dim,
+            bias=False,
+        )
+        self.wo = nn.Linear(
+            config.n_attn_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+        )
+
+        self.q_norm = TorchRMSNorm(
+            NormArgs(dim=self.head_dim, eps=config.rms_norm_eps)
+        )
+        self.k_norm = TorchRMSNorm(
+            NormArgs(dim=self.head_dim, eps=config.rms_norm_eps)
+        )
         self.attn_dropout = nn.Dropout(config.n_dropout)
         self.resid_dropout = nn.Dropout(config.n_dropout)
         self.dropout = config.n_dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        self.flash = (
+            hasattr(F, "scaled_dot_product_attention") and config.flash_attn
+        )
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False,
-                attention_mask=None, image_bidirectional_mask=None, modality_mask=None):
+    def forward(
+        self,
+        x,
+        position_embeddings,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+        image_bidirectional_mask=None,
+        modality_mask=None,
+    ):
+        # 兼容多模态注意力中常用的 modality_mask 参数名。
+        if modality_mask is not None:
+            if image_bidirectional_mask is not None:
+                raise ValueError(
+                    "modality_mask 和 image_bidirectional_mask 只能传入一个"
+                )
+            image_bidirectional_mask = modality_mask
+
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
-        # 位置编码
+
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
-        # kv_cahce
+
+        # 缓存保存 RoPE 后的 [B, T, Hkv, D]，与历史缓存直接拼接。
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
-        
-        xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
-        )
-        use_flash = self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None)
+
+        xq = xq.transpose(1, 2)  # [B, H, Q_len, D]
+        xk = xk.transpose(1, 2)  # [B, Hkv, KV_len, D]
+        xv = xv.transpose(1, 2)
+        kv_len = xk.size(-2)
+        dropout_p = self.dropout if self.training else 0.0
+
+        # 始终显式展开 KV 头，不再依赖 SDPA 后端的原生 GQA 支持。
+        # 缓存已在上方保存，因此这里不会增大 KV Cache。
+        xk = self._repeat_kv(xk, self.n_rep)
+        xv = self._repeat_kv(xv, self.n_rep)
+
         if image_bidirectional_mask is not None:
-            # 显式 mask：因果 + 图像段内双向（已含 padding 屏蔽）
-            if use_flash:
-                output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, attn_mask=image_bidirectional_mask)
+            # 显式 mask 已包含因果、图像段内双向和 padding 屏蔽。
+            attn_mask = self._prepare_attn_mask(image_bidirectional_mask, xq)
+            if self.flash:
+                output = F.scaled_dot_product_attention(
+                    xq,
+                    xk,
+                    xv,
+                    dropout_p=dropout_p,
+                    attn_mask=attn_mask,
+                )
             else:
                 scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                scores = scores + image_bidirectional_mask
-                output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-        elif use_flash and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+                if attn_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(
+                        ~attn_mask,
+                        torch.finfo(scores.dtype).min,
+                    )
+                else:
+                    scores = scores + attn_mask
+                output = self.attn_dropout(
+                    F.softmax(scores.float(), dim=-1).type_as(xq)
+                ) @ xv
+
+        elif (
+            self.flash
+            and (
+                attention_mask is None
+                or bool(torch.all(attention_mask != 0).item())
+            )
+            # 多 token 带缓存时需要右下对齐的显式因果 mask，走手写分支。
+            and (past_key_value is None or seq_len == 1)
+        ):
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                dropout_p=dropout_p,
+                # 单 token 解码可见全部历史 KV，不能启用因果遮挡。
+                is_causal=self.is_causal and past_key_value is None,
+            )
+
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-            
+            min_score = torch.finfo(scores.dtype).min
+
+            if self.is_causal:
+                # 当前 Q 对应完整 KV 序列的最后 seq_len 个位置，掩码右下对齐。
+                q_positions = torch.arange(
+                    kv_len - seq_len, kv_len, device=scores.device
+                )
+                k_positions = torch.arange(kv_len, device=scores.device)
+                causal_mask = (
+                    k_positions.unsqueeze(0) > q_positions.unsqueeze(1)
+                )
+                scores = scores.masked_fill(causal_mask, min_score)
+
+            if attention_mask is not None:
+                if (
+                    attention_mask.ndim != 2
+                    or attention_mask.shape[0] != bsz
+                    or attention_mask.shape[1] != kv_len
+                ):
+                    raise ValueError(
+                        "attention_mask 应为 [B, KV_len]，当前形状为 "
+                        f"{tuple(attention_mask.shape)}，期望为 {(bsz, kv_len)}"
+                    )
+                if attention_mask.dtype == torch.bool:
+                    padding_mask = ~attention_mask
+                else:
+                    padding_mask = attention_mask == 0
+                scores = scores.masked_fill(
+                    padding_mask[:, None, None, :], min_score
+                )
+
+            output = self.attn_dropout(
+                F.softmax(scores.float(), dim=-1).type_as(xq)
+            ) @ xv
+
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.wo(output))
         return output, past_kv
+
+# class GroupQueryAttention(nn.Module):
+#     """分组查询注意力机制。"""
+#     def __init__(self, args: AttentionArgs):
+#         super().__init__()
+#         config = args.config
+#
+#         self.n_key_value_heads = config.n_key_value_heads
+#         self.n_local_heads = config.n_attn_heads
+#         self.n_local_kv_heads = self.n_key_value_heads
+#         # 重复次数
+#         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+#         self.head_dim = config.head_dim
+#         # 是否为因果注意力
+#         self.is_causal = True
+#         # 注意力矩阵
+#         self.wq = nn.Linear(config.hidden_size, config.n_attn_heads * self.head_dim, bias=False)
+#         self.wk = nn.Linear(config.hidden_size, self.n_key_value_heads * self.head_dim, bias=False)
+#         self.wv = nn.Linear(config.hidden_size, self.n_key_value_heads * self.head_dim, bias=False)
+#         self.wo = nn.Linear(config.n_attn_heads * self.head_dim, config.hidden_size, bias=False)
+#
+#         self.q_norm = TorchRMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+#         self.k_norm = TorchRMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+#         self.attn_dropout = nn.Dropout(config.n_dropout)
+#         self.resid_dropout = nn.Dropout(config.n_dropout)
+#         self.dropout = config.n_dropout
+#         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+#
+#     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False,
+#                 attention_mask=None, image_bidirectional_mask=None, modality_mask=None):
+#         bsz, seq_len, _ = x.shape
+#         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+#         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+#         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+#         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+#         xq, xk = self.q_norm(xq), self.k_norm(xk)
+#         # 位置编码
+#         cos, sin = position_embeddings
+#         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+#         # kv_cahce
+#         if past_key_value is not None:
+#             xk = torch.cat([past_key_value[0], xk], dim=1)
+#             xv = torch.cat([past_key_value[1], xv], dim=1)
+#         past_kv = (xk, xv) if use_cache else None
+#
+#         xq, xk, xv = (
+#             xq.transpose(1, 2),
+#             repeat_kv(xk, self.n_rep).transpose(1, 2),
+#             repeat_kv(xv, self.n_rep).transpose(1, 2)
+#         )
+#         use_flash = self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None)
+#         if image_bidirectional_mask is not None:
+#             # 显式 mask：因果 + 图像段内双向（已含 padding 屏蔽）
+#             if use_flash:
+#                 output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, attn_mask=image_bidirectional_mask)
+#             else:
+#                 scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+#                 scores = scores + image_bidirectional_mask
+#                 output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+#         elif use_flash and (attention_mask is None or torch.all(attention_mask == 1)):
+#             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+#         else:
+#             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+#             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+#             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+#             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+#
+#         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+#         output = self.resid_dropout(self.wo(output))
+#         return output, past_kv
 
 
 
@@ -130,8 +353,8 @@ class MoTGroupQueryAttention(nn.Module):
         self.wv = experts(config.hidden_size, self.n_key_value_heads * self.head_dim)
         self.wo = experts(self.n_local_heads * self.head_dim, config.hidden_size)
 
-        self.q_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
-        self.k_norm = RMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.q_norm = TorchRMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
+        self.k_norm = TorchRMSNorm(NormArgs(dim=self.head_dim, eps=config.rms_norm_eps))
         self.attn_dropout = nn.Dropout(config.n_dropout)
         self.resid_dropout = nn.Dropout(config.n_dropout)
         self.dropout = config.n_dropout
