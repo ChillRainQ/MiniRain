@@ -186,8 +186,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         else:
             logits = None
             # shift 作用在 hidden/labels 上（不是 logits），对齐原版 CE 的语义
-            h = hidden_states[:, :-1, :].contiguous()  # [B, T-1, H]
-            y = labels[..., 1:].contiguous()  # [B, T-1]，图像段/pad 已是 -100
+            h = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))  # [B*(T-1), H]
+            y = labels[..., 1:].reshape(-1)  # [B*(T-1)]，图像段/pad 已是 -100
             loss = self.loss_fn(self.lm_head.weight, h, y)
 
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
