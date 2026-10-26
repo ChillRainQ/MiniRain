@@ -314,7 +314,9 @@ def section_train(args, model, total_mb):
         base = torch.cuda.memory_allocated()
         run()  # fwd+bwd（梯度在）
         mem_opt = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
-        opt.step()  # 优化器状态 + step 临时缓冲
+        missing = [n for n, p in model.named_parameters() if p.grad is None]
+        print(f"[muon] 无梯度参数 {len(missing)} 个: {missing[:10]}")
+        opt.step()
         torch.cuda.synchronize()
         mem_total = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
         resident = torch.cuda.memory_allocated() / 2 ** 20
