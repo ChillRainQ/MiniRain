@@ -86,7 +86,7 @@ def free():
         torch.cuda.empty_cache()
 
 
-def build_model(args):
+def build_model(args, compile_model=None):
     kw = dict(BASE_CFG)
     kw.update(hidden_size=args.hidden, n_hidden_layers=args.layers,
               block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale)
@@ -100,6 +100,18 @@ def build_model(args):
         kw["intermediate_size"] = args.inter
     cfg = RainConfig(**kw)
     model = MiniRainVForCausalLM(cfg).to(args.device).to(DTYPES[args.dtype])
+    if getattr(args, "grad_ckpt", False):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+            print("  [ckpt] 梯度检查点已启用 (use_reentrant=False)")
+        except (AttributeError, ValueError) as e:
+            print(f"  [ckpt] 模型未实现 gradient_checkpointing，已跳过: {e}")
+    if compile_model is None:
+        compile_model = getattr(args, "compile", False)
+    if compile_model:
+        print("  [compile] torch.compile 中（首次调用会花几分钟编译）...")
+        model = torch.compile(model)
     return model, cfg
 
 
@@ -345,6 +357,8 @@ def main():
     p.add_argument("--gen-prompt", type=int, default=512)
     p.add_argument("--gen-new", type=int, default=64)
     p.add_argument("--no-gen", action="store_true", help="跳过生成测试")
+    p.add_argument("--compile", action="store_true", help="各测试段用 torch.compile 包模型")
+    p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
