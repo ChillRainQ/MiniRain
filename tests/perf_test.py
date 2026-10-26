@@ -306,13 +306,15 @@ def section_train(args, model, total_mb):
         labels[am == 0] = -100
         opt = _build_muon_optimizer(model, None)
         run = lambda: train_step(ids, am, labels)
-        bench(run, 2, 1, args.device)          # 热身：权重/编译就绪，梯度管道打通
-        gc.collect(); torch.cuda.empty_cache()
+        bench(run, 2, 1, args.device)  # 热身：权重/编译就绪，梯度管道打通
+        train_step(i_ids, i_am, i_lab, positions=i_pos, pixel_values=pix)  # 图像步：vision 参数拿梯度
+        gc.collect();
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
-        run()                                   # fwd+bwd（梯度在）
+        run()  # fwd+bwd（梯度在）
         mem_opt = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
-        opt.step()                              # 优化器状态 + step 临时缓冲
+        opt.step()  # 优化器状态 + step 临时缓冲
         torch.cuda.synchronize()
         mem_total = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
         resident = torch.cuda.memory_allocated() / 2 ** 20
