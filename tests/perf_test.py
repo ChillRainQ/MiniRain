@@ -306,17 +306,19 @@ def section_train(args, model, total_mb):
         labels[am == 0] = -100
         opt = _build_muon_optimizer(model, None)
         run = lambda: train_step(ids, am, labels)
-        bench(run, 2, 1, args.device)  # 热身：权重/编译就绪，梯度管道打通
-        train_step(i_ids, i_am, i_lab, positions=i_pos, pixel_values=pix)  # 图像步：vision 参数拿梯度
-        gc.collect();
-        torch.cuda.empty_cache()
+        bench(run, 2, 1, args.device)          # 热身：权重/编译就绪，梯度管道打通
+        gc.collect(); torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
-        run()  # fwd+bwd（梯度在）
+        run()                                   # fwd+bwd（文本梯度在）
         mem_opt = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
+        # 图像步：只前向+反向，不清零（train_step 会 zero_grad），让 vision 参数也有梯度
+        out = model(i_ids, attention_mask=i_am, labels=i_lab,
+                    positions=i_pos, pixel_values=pix)
+        out.loss.backward()
         missing = [n for n, p in model.named_parameters() if p.grad is None]
-        print(f"[muon] 无梯度参数 {len(missing)} 个: {missing[:10]}")
-        opt.step()
+        print(f"[muon] 无梯度参数 {len(missing)} 个: {missing[:5]}")
+        opt.step()                              # 优化器状态 + step 临时缓冲
         torch.cuda.synchronize()
         mem_total = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
         resident = torch.cuda.memory_allocated() / 2 ** 20
@@ -418,8 +420,11 @@ def main():
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
     torch._dynamo.config.recompile_limit = 10000
+
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
+    if args.dtype != "fp32" and not args.device.startswith("cpu"):
+        pass
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
         print("[warn] CPU 上 bf16/fp16 很慢，建议 --dtype fp32")
     if args.compile and args.warmup < 3:
