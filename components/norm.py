@@ -70,12 +70,14 @@ class TorchRMSNorm(nn.Module):
         self.dim = args.dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 推理态且环境有 triton 时走单 kernel 融合实现（训练需 autograd，仍用 composite）
         if (HAS_TRITON and x.is_cuda and not x.requires_grad
                 and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-                and x.shape[-1] == self.dim):
+                and x.shape[-1] == self.dim
+                and self.weight.is_cuda
+                and self.weight.device == x.device
+                and (x.device.index or 0) == torch.cuda.current_device()):
             return _triton_rms_norm(x, self.weight, self.eps)
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        return F.rms_norm(x, (self.dim,), self.weight.to(x.device), self.eps)
 
 
 
