@@ -188,11 +188,9 @@ class BlockAttnResBlock(nn.Module):
         if self.block_size >= 2 and self.layer_id % (self.block_size // 2) == 0:
             past_hidden_states.append(partial_block)
             partial_block = None
-        # 注意力固定 GQA，不做 MoT 化；modality_mask 只用于 MoTFFN 的模态分流。
-        # 注意 GQA 里同名参数是 image_bidirectional_mask 的别名（可见性 mask），语义不同，绝不能传入
         attn_out, past_key_value = self.attn(self.input_layernorm(attn_input),
                                              position_embeddings, past_key_value,
-                                             use_cache, attention_mask, image_bidirectional_mask, modality_mask=modality_mask)
+                                             use_cache, attention_mask, image_bidirectional_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         # MoTFFN 期望 img_idx（索引），从 modality_mask 转换；其他 MLP 不接受此参数

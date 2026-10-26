@@ -119,6 +119,15 @@ class MiniRainVLM(nn.Module):
 
         hidden_states = self.dropout(self.prepare_inputs_embeds(input_ids, pixel_values))
 
+        # padding 判断只做一次（避免注意力里每层 .item() 同步）；全有效时置 None 走因果快路径
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                has_pad = not bool(attention_mask.all())
+            else:
+                has_pad = bool((attention_mask == 0).any())
+            if not has_pad:
+                attention_mask = None
+
         image_bidirectional_mask = None
         modality_mask = None
         if pixel_values is not None:

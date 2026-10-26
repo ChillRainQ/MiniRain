@@ -17,6 +17,9 @@ dependencies = [
     "torch==2.7.1",
     "torchvision==0.22.1",
     "polars>=2.0.0",
+    # Linux 下才装 triton / liger（RMSNorm 融合 kernel 与 fused CE 依赖；Windows 无官方 triton）
+    "triton==3.3.1; sys_platform == 'linux'",
+    "liger-kernel>=0.5.0; sys_platform == 'linux'",
 ]
 
 [[tool.uv.index]]

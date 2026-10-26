@@ -36,6 +36,10 @@ class AttentionArgs:
     config: PreTrainedConfig
 
 
+# 因果 bool mask 的全局单条缓存：所有层与实例共用，按 (S, KV, device) 失效
+_CAUSAL_MASK_CACHE: dict = {}
+
+
 class GroupQueryAttention(nn.Module):
     """分组查询注意力机制。
 
@@ -43,9 +47,10 @@ class GroupQueryAttention(nn.Module):
     apply_rotary_pos_emb。
 
     attention_mask 使用 [B, KV_len] 格式，1/True 表示有效 token，
-    0/False 表示 padding；image_bidirectional_mask（别名 modality_mask）
-    应为可广播到 [B, H, Q_len, KV_len] 的 mask。布尔或整型 0/1 mask
+    0/False 表示 padding；image_bidirectional_mask 应为可广播到
+    [B, H, Q_len, KV_len] 的 mask。布尔或整型 0/1 mask
     按 1/True 可见、0/False 屏蔽处理；浮点 mask 按加性偏置处理。
+    模态指示（0/1）不属于本类，MoT 分流请用 MoTGroupQueryAttention。
     """
 
     @staticmethod
@@ -62,18 +67,30 @@ class GroupQueryAttention(nn.Module):
 
     @staticmethod
     def _prepare_attn_mask(mask, query):
-        """将 mask 转为 SDPA 支持的类型，并统一可见性语义。"""
-        if mask.dtype == torch.bool:
-            return mask.to(device=query.device)
+        """bool/整型 0/1 按可见性处理（转 bool），浮点按加性偏置处理。
 
-        # 整型 0/1 mask 按可见性处理：1 可见，0 屏蔽。
-        if not mask.dtype.is_floating_point:
-            is_binary = bool(torch.all((mask == 0) | (mask == 1)).item())
-            if is_binary:
-                return mask.to(device=query.device, dtype=torch.bool)
+        不做 ``.item()`` 数值检查，避免每层一次 GPU 同步。
+        """
+        if mask.dtype.is_floating_point:
+            return mask.to(device=query.device, dtype=query.dtype)
+        return mask.to(device=query.device, dtype=torch.bool)
 
-        # 浮点 mask 或其他整型 mask 按加性注意力偏置处理。
-        return mask.to(device=query.device, dtype=query.dtype)
+    def _causal_mask(self, seq_len: int, kv_len: int, device):
+        """右下对齐的因果 bool mask，按 (S, KV, device) 共享单条缓存。
+
+        所有层/实例共用同一份，既避免逐层重建 S×KV，也避免每层各存一份。
+        """
+        key = (seq_len, kv_len, device)
+        cached = _CAUSAL_MASK_CACHE.get("entry")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        q_positions = torch.arange(kv_len - seq_len, kv_len, device=device)
+        k_positions = torch.arange(kv_len, device=device)
+        mask = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+        # inference_mode 下创建的张量不能进入后续 autograd 图，故不写入缓存
+        if not torch.is_inference_mode_enabled():
+            _CAUSAL_MASK_CACHE["entry"] = (key, mask)
+        return mask
 
     def __init__(self, args: AttentionArgs):
         super().__init__()
@@ -136,16 +153,7 @@ class GroupQueryAttention(nn.Module):
         use_cache=False,
         attention_mask=None,
         image_bidirectional_mask=None,
-        modality_mask=None,
     ):
-        # 兼容多模态注意力中常用的 modality_mask 参数名。
-        if modality_mask is not None:
-            if image_bidirectional_mask is not None:
-                raise ValueError(
-                    "modality_mask 和 image_bidirectional_mask 只能传入一个"
-                )
-            image_bidirectional_mask = modality_mask
-
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -174,6 +182,23 @@ class GroupQueryAttention(nn.Module):
         xk = self._repeat_kv(xk, self.n_rep)
         xv = self._repeat_kv(xv, self.n_rep)
 
+        # padding 可见性统一转 bool：单 token 解码只需屏蔽 KV 侧（可广播到 [B,H,1,KV]），
+        # 多 token 需要「右下对齐因果 + padding」的显式 bool mask。
+        pad_mask = None
+        if attention_mask is not None:
+            if (
+                attention_mask.ndim != 2
+                or attention_mask.shape[0] != bsz
+                or attention_mask.shape[1] != kv_len
+            ):
+                raise ValueError(
+                    "attention_mask 应为 [B, KV_len]，当前形状为 "
+                    f"{tuple(attention_mask.shape)}，期望为 {(bsz, kv_len)}"
+                )
+            pad_mask = attention_mask.to(torch.bool)[:, None, None, :]
+            if seq_len > 1:
+                pad_mask = self._causal_mask(seq_len, kv_len, xq.device) & pad_mask
+
         if image_bidirectional_mask is not None:
             # 显式 mask 已包含因果、图像段内双向和 padding 屏蔽。
             attn_mask = self._prepare_attn_mask(image_bidirectional_mask, xq)
@@ -198,29 +223,35 @@ class GroupQueryAttention(nn.Module):
                     F.softmax(scores.float(), dim=-1).type_as(xq)
                 ) @ xv
 
-        elif (
-            self.flash
-            and (
-                attention_mask is None
-                or bool(torch.all(attention_mask != 0).item())
-            )
-            # 多 token 带缓存时需要右下对齐的显式因果 mask，走手写分支。
-            and (past_key_value is None or seq_len == 1)
-        ):
-            output = F.scaled_dot_product_attention(
-                xq,
-                xk,
-                xv,
-                dropout_p=dropout_p,
+        elif self.flash:
+            if pad_mask is not None:
+                # 因果与 padding 已并入 pad_mask，交给 SDPA 处理，避免整型 mask 与手写路径
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, dropout_p=dropout_p, attn_mask=pad_mask
+                )
+            elif past_key_value is None:
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, dropout_p=dropout_p, is_causal=self.is_causal
+                )
+            elif seq_len == 1:
                 # 单 token 解码可见全部历史 KV，不能启用因果遮挡。
-                is_causal=self.is_causal and past_key_value is None,
-            )
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, dropout_p=dropout_p
+                )
+            else:
+                # 多 token 续写：SDPA 的 is_causal 左对齐，需显式右下对齐因果 mask。
+                allow = self._causal_mask(seq_len, kv_len, xq.device)
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, dropout_p=dropout_p, attn_mask=allow
+                )
 
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             min_score = torch.finfo(scores.dtype).min
 
-            if self.is_causal:
+            if pad_mask is not None:
+                scores = scores.masked_fill(~pad_mask, min_score)
+            elif self.is_causal:
                 # 当前 Q 对应完整 KV 序列的最后 seq_len 个位置，掩码右下对齐。
                 q_positions = torch.arange(
                     kv_len - seq_len, kv_len, device=scores.device
@@ -230,24 +261,6 @@ class GroupQueryAttention(nn.Module):
                     k_positions.unsqueeze(0) > q_positions.unsqueeze(1)
                 )
                 scores = scores.masked_fill(causal_mask, min_score)
-
-            if attention_mask is not None:
-                if (
-                    attention_mask.ndim != 2
-                    or attention_mask.shape[0] != bsz
-                    or attention_mask.shape[1] != kv_len
-                ):
-                    raise ValueError(
-                        "attention_mask 应为 [B, KV_len]，当前形状为 "
-                        f"{tuple(attention_mask.shape)}，期望为 {(bsz, kv_len)}"
-                    )
-                if attention_mask.dtype == torch.bool:
-                    padding_mask = ~attention_mask
-                else:
-                    padding_mask = attention_mask == 0
-                scores = scores.masked_fill(
-                    padding_mask[:, None, None, :], min_score
-                )
 
             output = self.attn_dropout(
                 F.softmax(scores.float(), dim=-1).type_as(xq)
