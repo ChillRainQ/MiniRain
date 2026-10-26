@@ -6,10 +6,13 @@
     use_mot=True  use_moe=False  vision_ffn_scale=4  block_size=4
     block_attn_res=False  full_attn_res=False
 
+整个脚本只构建/编译一次模型，所有 section 共用（含参数、compile cache）。
+
 用法:
     python tests/perf_test.py
     python tests/perf_test.py --iters 20 --warmup 5
-    python tests/perf_test.py --train-batch 2 --train-seq 512
+    python tests/perf_test.py --train-batch 9 --train-seq 4096 --grad-ckpt --no-gen
+    python tests/perf_test.py --compile
     python tests/perf_test.py --dtype fp32 --device cpu --no-gen
 """
 import argparse
@@ -55,7 +58,7 @@ def sync(device):
 
 
 def bench(fn, iters, warmup, device):
-    """返回平均耗时（ms）。"""
+    """返回平均耗时（ms）。compile 模式下 warmup 会触发编译，耐心等待。"""
     for _ in range(warmup):
         fn()
     sync(device)
@@ -86,7 +89,7 @@ def free():
         torch.cuda.empty_cache()
 
 
-def build_model(args, compile_model=None):
+def build_model(args):
     kw = dict(BASE_CFG)
     kw.update(hidden_size=args.hidden, n_hidden_layers=args.layers,
               block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale)
@@ -107,10 +110,8 @@ def build_model(args, compile_model=None):
             print("  [ckpt] 梯度检查点已启用 (use_reentrant=False)")
         except (AttributeError, ValueError) as e:
             print(f"  [ckpt] 模型未实现 gradient_checkpointing，已跳过: {e}")
-    if compile_model is None:
-        compile_model = getattr(args, "compile", False)
-    if compile_model:
-        print("  [compile] torch.compile 中（首次调用会花几分钟编译）...")
+    if getattr(args, "compile", False):
+        print("  [compile] torch.compile 中（首次调用会花几分钟编译，之后形状复用缓存）...")
         model = torch.compile(model)
     return model, cfg
 
@@ -179,31 +180,28 @@ def image_batch(args, batch, text_len):
 
 
 # ---------------------------------------------------------------- 测试段
-def section_forward(args):
+def section_forward(args, model):
     print("\n" + "=" * 78)
     print(f"1. 前向吞吐（MoT）  B={args.batch}  S=1024  dtype={args.dtype}")
     print("=" * 78)
-    model, cfg = build_model(args)
-    param_report(model, cfg)
+    model.eval()
     with torch.no_grad():
         ids, _ = text_batch(args, args.batch, 1024)
         ms = bench(lambda: model(ids), args.iters, args.warmup, args.device)
         print(f"  {'S=1024':<10}{ms:>9.2f} ms{args.batch * 1024 / ms * 1000:>9.0f} tok/s")
 
-        print("  -- 序列长度扫描 --")
+        print("  -- 序列长度扫描（compile 下每个新形状会重新编译）--")
         for s in (512, 1024, 2048, 4096):
             ids, _ = text_batch(args, args.batch, s)
             ms = bench(lambda: model(ids), max(3, args.iters // 2), args.warmup, args.device)
             print(f"  {'S=' + str(s):<10}{ms:>9.2f} ms{args.batch * s / ms * 1000:>9.0f} tok/s")
-    del model
-    free()
 
 
-def section_mask(args):
+def section_mask(args, model):
     print("\n" + "=" * 78)
     print(f"2. padding / 图像路径（MoT）  B={args.batch}  S=1024  dtype={args.dtype}")
     print("=" * 78)
-    model, _ = build_model(args)
+    model.eval()
     ids, am_ones = text_batch(args, args.batch, 1024)
     _, am_pad = text_batch(args, args.batch, 1024, pad_frac=0.25)
     with torch.no_grad():
@@ -219,58 +217,49 @@ def section_mask(args):
                    max(3, args.iters // 2), args.warmup, args.device)
         print(f"  {f'图像 {args.img_size}px + 文本{args.text_len}':<24}{ms:>9.2f} ms"
               f"   (S={i_ids.shape[1]})")
-    del model
-    free()
 
 
-def section_train(args):
+def section_train(args, model, total_mb):
     print("\n" + "=" * 78)
     print(f"3. 训练一步（前向+反向，MoT）  B={args.train_batch}  S={args.train_seq}  "
           f"dtype={args.dtype}")
     print("=" * 78)
-    total_mb = (torch.cuda.get_device_properties(0).total_memory / 2 ** 20
-                if args.device.startswith("cuda") else 0.0)
 
-    def train_step(model, ids, am, labels, positions=None, pixel_values=None):
+    def train_step(ids, am, labels, positions=None, pixel_values=None):
         model.zero_grad(set_to_none=True)
         out = model(ids, attention_mask=am, labels=labels,
                     positions=positions, pixel_values=pixel_values)
         out.loss.backward()
         return out.loss
 
-    model, _ = build_model(args)
     model.train()
     ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.25)
     labels = ids.clone()
     labels[am == 0] = -100
-    run = lambda: train_step(model, ids, am, labels)
+    run = lambda: train_step(ids, am, labels)
     ms = bench(run, max(3, args.iters // 2), args.warmup, args.device)
     mem = peak_mb(run, args.device)
     print(f"  {'文本(25% pad)':<20}{ms:>9.2f} ms/step   峰值 +{mem:>7.1f} MB")
     if total_mb and mem > 0.85 * total_mb:
         print(f"      ! 峰值已超显存({total_mb:.0f}MB)的 85%，可能触发系统内存回退导致耗时失真；"
               f"请调小 --train-batch/--train-seq")
-    del model
-    free()
 
-    model, _ = build_model(args)
     model.train()
     i_ids, i_pos, i_am, i_lab, pix = image_batch(args, 1, args.text_len)
-    run = lambda: train_step(model, i_ids, i_am, i_lab, positions=i_pos, pixel_values=pix)
+    run = lambda: train_step(i_ids, i_am, i_lab, positions=i_pos, pixel_values=pix)
     ms = bench(run, max(3, args.iters // 2), args.warmup, args.device)
     mem = peak_mb(run, args.device)
     print(f"  {'图像+文本':<20}{ms:>9.2f} ms/step   峰值 +{mem:>7.1f} MB")
     if total_mb and mem > 0.85 * total_mb:
         print(f"      ! 峰值已超显存({total_mb:.0f}MB)的 85%，耗时可能失真")
-    del model
-    free()
 
 
-def section_generate(args):
+def section_generate(args, model):
     print("\n" + "=" * 78)
     print(f"4. 生成（MoT）  prompt={args.gen_prompt}  new={args.gen_new}  dtype={args.dtype}")
     print("=" * 78)
-    model, _ = build_model(args)
+    if getattr(args, "compile", False):
+        print("  [warn] compile 模式下 decode 每个新长度都可能重编译，本段数字仅供参考")
     model.eval()
     ids = torch.randint(100, 16000, (1, args.gen_prompt), device=args.device)
     am = torch.ones_like(ids)
@@ -280,15 +269,12 @@ def section_generate(args):
         ms = bench(run, 2, 1, args.device)
         print(f"  use_cache={str(use_cache):<5}{ms:>9.1f} ms  "
               f"{ms / args.gen_new:>7.2f} ms/token  {args.gen_new / ms * 1000:>8.1f} tok/s")
-    del model
-    free()
 
 
-def section_memory(args):
+def section_memory(args, model, cfg):
     print("\n" + "=" * 78)
     print("5. 显存与 CE（MoT）")
     print("=" * 78)
-    model, cfg = build_model(args)
     model.eval()
     with torch.no_grad():
         for s in (1024, 2048):
@@ -302,8 +288,6 @@ def section_memory(args):
                           args.device)
             resident = s * s * 2 / 2 ** 20  # 单份 [B,1,S,S] bf16
             print(f"  {'图像 mask S=' + str(s):<24}常驻 {resident:>7.1f} MB  构建峰值 +{mem:>7.1f} MB")
-    del model
-    free()
 
     if args.device.startswith("cuda"):
         dtype = DTYPES[args.dtype]
@@ -357,31 +341,47 @@ def main():
     p.add_argument("--gen-prompt", type=int, default=512)
     p.add_argument("--gen-new", type=int, default=64)
     p.add_argument("--no-gen", action="store_true", help="跳过生成测试")
-    p.add_argument("--compile", action="store_true", help="各测试段用 torch.compile 包模型")
+    p.add_argument("--compile", action="store_true", help="torch.compile 包模型（全脚本共享）")
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
+
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
         print("[warn] CPU 上 bf16/fp16 很慢，建议 --dtype fp32")
+    if args.compile and args.warmup < 3:
+        args.warmup = 3
     torch.manual_seed(0)
 
-    dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") else "CPU"
+    dev_idx = torch.device(args.device).index or 0
+    dev_name = torch.cuda.get_device_name(dev_idx) if args.device.startswith("cuda") else "CPU"
     print("=" * 78)
     print(f"MiniRainVLM 性能基准 | {dev_name} | torch {torch.__version__} | {args.dtype}")
     print(f"配置(model_size.py): type=v  hidden={args.hidden}  layers={args.layers}  "
           f"use_mot=1  use_moe=0  vision_ffn_scale={args.vision_ffn_scale}  "
           f"block_size={args.block_size}")
     print(f"负载: batch={args.batch}  训练={args.train_batch}x{args.train_seq}  "
-          f"图像={args.img_size}px  文本={args.text_len}  iters={args.iters}")
+          f"图像={args.img_size}px  文本={args.text_len}  iters={args.iters}  "
+          f"compile={args.compile}  ckpt={args.grad_ckpt}")
     print("=" * 78)
 
-    section_forward(args)
-    section_mask(args)
-    section_train(args)
+    # 整个脚本只构建（并至多编译）一次模型
+    model, cfg = build_model(args)
+    param_report(model, cfg)
+    total_mb = (torch.cuda.get_device_properties(dev_idx).total_memory / 2 ** 20
+                if args.device.startswith("cuda") else 0.0)
+
+    section_forward(args, model)
+    free()
+    section_mask(args, model)
+    free()
+    section_train(args, model, total_mb)
+    free()
     if not args.no_gen:
-        section_generate(args)
-    section_memory(args)
+        section_generate(args, model)
+        free()
+    section_memory(args, model, cfg)
+    free()
     print("\n完成。")
 
 
