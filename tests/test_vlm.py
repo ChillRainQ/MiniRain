@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """MiniRainVLM 全链路测试：collator 位置编码 / 双向 mask / 嵌入注入 / 前后向 / generate"""
-import os, sys, torch
+import argparse, os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from _device import add_device_args, list_gpus, resolve_device
 from transformers import AutoTokenizer
 from architectures.config import RainConfig
 from architectures.rain_v import MiniRainVForCausalLM, build_2d_position_embeddings
@@ -10,7 +12,13 @@ from components.attention import MoTGroupQueryAttention, GroupQueryAttention
 from dataset.collator import VLMCollator, IMG_START, IMG_END, IMG_PAD, IMG_ROW, PAD, BOS, EOS
 
 TOK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tokenizers')
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+_p = argparse.ArgumentParser(description="MiniRainVLM 全链路测试")
+add_device_args(_p)
+_args = _p.parse_args()
+if _args.list_gpus:
+    list_gpus()
+    raise SystemExit(0)
+DEVICE, GPU_INDEX = resolve_device(_args.device)
 torch.manual_seed(0)
 
 passed, failed = [], []

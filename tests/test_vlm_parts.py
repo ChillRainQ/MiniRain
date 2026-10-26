@@ -1,11 +1,13 @@
 """MiniRainVLM 部件级 + 整机结构测试
 与 test_vlm.py(链路/生成)、res_test.py(残差语义)互补: 这里逐部件验证契约。
 """
-import sys, os
+import argparse, sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 import torch.nn.functional as F
 
+from _device import add_device_args, list_gpus, resolve_device
 from architectures.config import RainConfig
 from architectures.rain_v import (MiniRainVForCausalLM, precompute_freqs_cis_2d,
                                 build_2d_position_embeddings)
@@ -15,7 +17,13 @@ from components.attention import (apply_rotary_pos_emb, repeat_kv,
 from components.block import BlockAttnRes, BlockAttnResBlock
 from components.mlp import SwiGLU, LosslessMoE, MLPArgs
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_p = argparse.ArgumentParser(description="MiniRainVLM 部件级测试")
+add_device_args(_p)
+_args = _p.parse_args()
+if _args.list_gpus:
+    list_gpus()
+    raise SystemExit(0)
+DEVICE, GPU_INDEX = resolve_device(_args.device)
 torch.manual_seed(0)
 passed, failed = [], []
 def check(name, cond, detail=""):
@@ -37,7 +45,7 @@ manual = (x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)).type_
 check("数值 == 手工公式", torch.allclose(y, manual, atol=1e-5))
 check("归一化后 RMS ≈ 1", ((y.pow(2).mean(-1).sqrt()) - 1).abs().max().item() < 1e-3,
       f"max dev {((y.pow(2).mean(-1).sqrt()) - 1).abs().max().item():.2e}")
-xb = x.bfloat16() if DEVICE == "cuda" else x.half()
+xb = x.bfloat16() if GPU_INDEX is not None else x.half()
 check("dtype 保持(权重同精度时)", RMSNorm(NormArgs(dim=D, eps=1e-6)).to(DEVICE).to(xb.dtype)(xb).dtype == xb.dtype)
 norm.weight.grad = None
 norm(x).sum().backward()

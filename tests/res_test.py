@@ -2,14 +2,22 @@
 """残差行为测试: BlockAttnRes 启用逻辑与聚合语义
 模型: 12 层 x 1024 维, block_size=2 → block_size//2=1 → 每层都 append 历史
 """
-import os, sys, torch
+import argparse, os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from _device import add_device_args, list_gpus, resolve_device
 from architectures.config import RainConfig
 from architectures.rain_v import MiniRainVForCausalLM
 from components.block import BlockAttnRes
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+_p = argparse.ArgumentParser(description="BlockAttnRes 残差语义测试")
+add_device_args(_p)
+_args = _p.parse_args()
+if _args.list_gpus:
+    list_gpus()
+    raise SystemExit(0)
+DEVICE, GPU_INDEX = resolve_device(_args.device)
 torch.manual_seed(0)
 
 passed, failed = [], []

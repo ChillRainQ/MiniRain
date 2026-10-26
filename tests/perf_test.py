@@ -320,7 +320,7 @@ def section_memory(args, model, cfg):
 # ---------------------------------------------------------------- 入口
 def main():
     p = argparse.ArgumentParser(description="MiniRainVLM 性能基准（model_size.py 的 MoT 配置）")
-    p.add_argument("--device", default="cuda:5" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
@@ -366,7 +366,7 @@ def main():
     print("=" * 78)
 
     # 整个脚本只构建（并至多编译）一次模型
-    model, cfg = build_model(args, compile_model=True)
+    model, cfg = build_model(args, compile_model=False)
     param_report(model, cfg)
     total_mb = (torch.cuda.get_device_properties(dev_idx).total_memory / 2 ** 20
                 if args.device.startswith("cuda") else 0.0)
