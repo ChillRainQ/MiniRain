@@ -30,6 +30,13 @@ from architectures.rain_v import MiniRainVForCausalLM
 from components.mlp import MoTFFN
 from losses.loss import ChunkedCrossEntropy
 
+try:
+    # 纯 PyPI 包 muon-optimizer（Keller Jordan Muon）。单卡用 SingleDevice 变体，
+    # 分布式 MuonWithAuxAdam 会调 dist.get_world_size()，未初始化 distributed 会崩。
+    from muon import SingleDeviceMuonWithAuxAdam as _MuonCls
+except ImportError:
+    _MuonCls = None
+
 IMG_START, IMG_END, IMG_PATCH, IMG_ROW, BOS = 9, 10, 12, 27, 1
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
@@ -89,7 +96,7 @@ def free():
         torch.cuda.empty_cache()
 
 
-def build_model(args, compile_model=False):
+def build_model(args):
     kw = dict(BASE_CFG)
     kw.update(hidden_size=args.hidden, n_hidden_layers=args.layers,
               block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale)
@@ -110,7 +117,7 @@ def build_model(args, compile_model=False):
             print("  [ckpt] 梯度检查点已启用 (use_reentrant=False)")
         except (AttributeError, ValueError) as e:
             print(f"  [ckpt] 模型未实现 gradient_checkpointing，已跳过: {e}")
-    if compile_model:
+    if getattr(args, "compile", False):
         print("  [compile] torch.compile 中（首次调用会花几分钟编译，之后形状复用缓存）...")
         model = torch.compile(model)
     return model, cfg
@@ -219,6 +226,23 @@ def section_mask(args, model):
               f"   (S={i_ids.shape[1]})")
 
 
+def _build_muon_optimizer(model, cfg):
+    """按 muon-optimizer 包的要求手动分 param_groups（use_muon 标志）。"""
+    hidden_matrix_params = [p for n, p in model.named_parameters()
+                            if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    adam_groups = [
+        dict(params=embed_params, lr=2e-3),
+        dict(params=scalar_params, lr=2e-3),
+    ]
+    adam_groups = [dict(**g, betas=(0.9, 0.95), eps=1e-10,
+                        weight_decay=0.0, use_muon=False) for g in adam_groups]
+    muon_group = dict(params=hidden_matrix_params, lr=0.02, momentum=0.95,
+                      weight_decay=0.01, use_muon=True)
+    return _MuonCls([*adam_groups, muon_group])
+
+
 def section_train(args, model, total_mb):
     print("\n" + "=" * 78)
     print(f"3. 训练一步（前向+反向，MoT）  B={args.train_batch}  S={args.train_seq}  "
@@ -252,6 +276,33 @@ def section_train(args, model, total_mb):
     print(f"  {'图像+文本':<20}{ms:>9.2f} ms/step   峰值 +{mem:>7.1f} MB")
     if total_mb and mem > 0.85 * total_mb:
         print(f"      ! 峰值已超显存({total_mb:.0f}MB)的 85%，耗时可能失真")
+
+    # 优化器显存：上面的峰值只含 权重+激活+梯度，训练真实占用还要加优化器状态
+    if _MuonCls is None:
+        print("  [muon] 未安装 muon-optimizer 包，跳过优化器显存测试"
+              "（pip install muon-optimizer）")
+    else:
+        model.train()
+        ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.25)
+        labels = ids.clone()
+        labels[am == 0] = -100
+        opt = _build_muon_optimizer(model, None)
+        run = lambda: train_step(ids, am, labels)
+        bench(run, 2, 1, args.device)          # 热身：权重/编译就绪，梯度管道打通
+        gc.collect(); torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        run()                                   # fwd+bwd（梯度在）
+        mem_opt = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
+        opt.step()                              # 优化器状态 + step 临时缓冲
+        torch.cuda.synchronize()
+        mem_total = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
+        resident = torch.cuda.memory_allocated() / 2 ** 20
+        print(f"  MuonWithAuxAdam  训练步峰值 +{mem_opt:>7.1f} MB"
+              f"   +optimizer.step 峰值 +{mem_total:>7.1f} MB"
+              f"   全进程常驻 {resident:>7.0f} MB")
+        if total_mb and resident > 0.80 * total_mb:
+            print(f"      ! 常驻已超显存({total_mb:.0f}MB)的 80%，长跑有 OOM 风险")
 
 
 def section_generate(args, model):
@@ -320,7 +371,7 @@ def section_memory(args, model, cfg):
 # ---------------------------------------------------------------- 入口
 def main():
     p = argparse.ArgumentParser(description="MiniRainVLM 性能基准（model_size.py 的 MoT 配置）")
-    p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda:5" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
@@ -344,7 +395,7 @@ def main():
     p.add_argument("--compile", action="store_true", help="torch.compile 包模型（全脚本共享）")
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
-    torch._dynamo.config.recompile_limit = 64
+
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
@@ -366,7 +417,7 @@ def main():
     print("=" * 78)
 
     # 整个脚本只构建（并至多编译）一次模型
-    model, cfg = build_model(args, compile_model=False)
+    model, cfg = build_model(args)
     param_report(model, cfg)
     total_mb = (torch.cuda.get_device_properties(dev_idx).total_memory / 2 ** 20
                 if args.device.startswith("cuda") else 0.0)
