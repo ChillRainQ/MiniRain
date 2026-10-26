@@ -395,7 +395,7 @@ def main():
     p.add_argument("--compile", action="store_true", help="torch.compile 包模型（全脚本共享）")
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
-
+    torch._dynamo.config.recompile_limit = 200
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
