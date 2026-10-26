@@ -80,8 +80,8 @@ class MiniRainVLM(nn.Module):
 
         # patch 位置：conv 输出覆盖
         mask = input_ids == self.img_patch
-        assert mask.sum().item() == patches.shape[0], \
-            f"占位token数({mask.sum().item()})与patch数({patches.shape[0]})不一致"
+        if not torch.compiler.is_compiling():
+            assert mask.sum().item() == patches.shape[0], "patch 数量与 <|image_pad|> 位置数不一致"
         inputs_embeds[mask] = patches.to(inputs_embeds.dtype)
 
         # 边界 token 位置（start/end/row）：embedding 也过 img_norm，对齐分布

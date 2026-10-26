@@ -89,7 +89,7 @@ def free():
         torch.cuda.empty_cache()
 
 
-def build_model(args):
+def build_model(args, compile_model=False):
     kw = dict(BASE_CFG)
     kw.update(hidden_size=args.hidden, n_hidden_layers=args.layers,
               block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale)
@@ -110,7 +110,7 @@ def build_model(args):
             print("  [ckpt] 梯度检查点已启用 (use_reentrant=False)")
         except (AttributeError, ValueError) as e:
             print(f"  [ckpt] 模型未实现 gradient_checkpointing，已跳过: {e}")
-    if getattr(args, "compile", False):
+    if compile_model:
         print("  [compile] torch.compile 中（首次调用会花几分钟编译，之后形状复用缓存）...")
         model = torch.compile(model)
     return model, cfg
@@ -344,7 +344,7 @@ def main():
     p.add_argument("--compile", action="store_true", help="torch.compile 包模型（全脚本共享）")
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
-
+    torch._dynamo.config.recompile_limit = 64
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
@@ -366,7 +366,7 @@ def main():
     print("=" * 78)
 
     # 整个脚本只构建（并至多编译）一次模型
-    model, cfg = build_model(args)
+    model, cfg = build_model(args, compile_model=True)
     param_report(model, cfg)
     total_mb = (torch.cuda.get_device_properties(dev_idx).total_memory / 2 ** 20
                 if args.device.startswith("cuda") else 0.0)
