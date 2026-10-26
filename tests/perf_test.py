@@ -324,7 +324,7 @@ def section_memory(args):
 # ---------------------------------------------------------------- 入口
 def main():
     p = argparse.ArgumentParser(description="MiniRainVLM 性能基准（model_size.py 的 MoT 配置）")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda:5" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
@@ -346,7 +346,8 @@ def main():
     p.add_argument("--gen-new", type=int, default=64)
     p.add_argument("--no-gen", action="store_true", help="跳过生成测试")
     args = p.parse_args()
-
+    if args.device.startswith("cuda"):
+        torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
         print("[warn] CPU 上 bf16/fp16 很慢，建议 --dtype fp32")
     torch.manual_seed(0)
