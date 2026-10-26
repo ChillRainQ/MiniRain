@@ -240,7 +240,24 @@ def _build_muon_optimizer(model, cfg):
                         weight_decay=0.0, use_muon=False) for g in adam_groups]
     muon_group = dict(params=hidden_matrix_params, lr=0.02, momentum=0.95,
                       weight_decay=0.01, use_muon=True)
-    return _MuonCls([*adam_groups, muon_group])
+    groups = [*adam_groups, muon_group]
+    print(f"[muon] muon组={len(hidden_matrix_params)} embed组={len(embed_params)} "
+          f"scalar组={len(scalar_params)} 总参数张量={len(list(model.parameters()))}")
+
+    # 校验：组间无重复、且覆盖全部参数
+    seen, all_ids = set(), {id(p) for p in model.parameters()}
+    for g in groups:
+        for p in g["params"]:
+            if id(p) in seen:
+                names = [n for n, q in model.named_parameters() if q is p]
+                raise ValueError(f"重复参数: {names}")
+            seen.add(id(p))
+    missing = all_ids - seen
+    if missing:
+        names = [n for n, p in model.named_parameters() if id(p) in missing]
+        print(f"[muon] 注意: {len(missing)} 个参数未分组: {names}")
+
+    return _MuonCls(groups)
 
 
 def section_train(args, model, total_mb):
@@ -395,7 +412,7 @@ def main():
     p.add_argument("--compile", action="store_true", help="torch.compile 包模型（全脚本共享）")
     p.add_argument("--grad-ckpt", action="store_true", help="启用梯度检查点（测大 batch 用）")
     args = p.parse_args()
-    torch._dynamo.config.recompile_limit = 200
+    torch._dynamo.config.recompile_limit = 10000
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
