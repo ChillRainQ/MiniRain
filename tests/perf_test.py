@@ -231,7 +231,8 @@ def _build_muon_optimizer(model, cfg):
     hidden_matrix_params = [p for n, p in model.named_parameters()
                             if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    scalar_params = [p for n, p in model.named_parameters()
+                     if p.ndim < 2 and "embed" not in n and "lm_head" not in n]
     adam_groups = [
         dict(params=embed_params, lr=2e-3),
         dict(params=scalar_params, lr=2e-3),
@@ -274,13 +275,13 @@ def section_train(args, model, total_mb):
         return out.loss
 
     model.train()
-    ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.25)
+    ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.0)
     labels = ids.clone()
     labels[am == 0] = -100
     run = lambda: train_step(ids, am, labels)
     ms = bench(run, max(3, args.iters // 2), args.warmup, args.device)
     mem = peak_mb(run, args.device)
-    print(f"  {'文本(25% pad)':<20}{ms:>9.2f} ms/step   峰值 +{mem:>7.1f} MB")
+    print(f"  {'文本(0% pad)':<20}{ms:>9.2f} ms/step   峰值 +{mem:>7.1f} MB")
     if total_mb and mem > 0.85 * total_mb:
         print(f"      ! 峰值已超显存({total_mb:.0f}MB)的 85%，可能触发系统内存回退导致耗时失真；"
               f"请调小 --train-batch/--train-seq")
@@ -300,7 +301,7 @@ def section_train(args, model, total_mb):
               "（pip install muon-optimizer）")
     else:
         model.train()
-        ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.25)
+        ids, am = text_batch(args, args.train_batch, args.train_seq, pad_frac=0.0)
         labels = ids.clone()
         labels[am == 0] = -100
         opt = _build_muon_optimizer(model, None)
