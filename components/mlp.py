@@ -8,7 +8,11 @@ from transformers import PreTrainedConfig
 
 from architectures.config import RainConfig
 from components.norm import RMSNorm, NormArgs, TorchRMSNorm
-
+try:
+    from liger_kernel.ops.swiglu import LigerSwiGLUFunction
+    _HAS_LIGER_SWIGLU = True
+except ImportError:
+    _HAS_LIGER_SWIGLU = False
 
 @dataclass
 class MLPArgs:
@@ -54,6 +58,8 @@ class SwiGLU(MyMLP):
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_LIGER_SWIGLU and x.is_cuda:
+            return self.down(LigerSwiGLUFunction.apply(self.gate(x), self.up(x)))
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 class LowRankMLP(MyMLP):
