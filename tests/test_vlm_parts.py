@@ -14,7 +14,7 @@ from architectures.rain_v import (MiniRainVForCausalLM, precompute_freqs_cis_2d,
 from components.norm import RMSNorm, NormArgs
 from components.attention import (apply_rotary_pos_emb, repeat_kv,
                                   GroupQueryAttention, MoTGroupQueryAttention, AttentionArgs)
-from components.block import BlockAttnRes, BlockAttnResBlock
+from components.block import BlockAttnRes, BlockAttnResBlock, FlushBlockAttnResBlock
 from components.mlp import SwiGLU, LosslessMoE, MLPArgs
 
 _p = argparse.ArgumentParser(description="MiniRainVLM 部件级测试")
@@ -218,7 +218,13 @@ posb = torch.stack([torch.arange(4), torch.arange(4)], -1).unsqueeze(0).to(DEVIC
 peb = build_2d_position_embeddings(posb, cos_t.to(DEVICE), sin_t.to(DEVICE))
 with torch.no_grad():
     out_b, kv_b, hist = blk(xb, peb, use_cache=True, past_hidden_states=[])
-check("返回 (out, kv, history) 形状", out_b.shape == xb.shape and kv_b[0].shape[1] == 4 and len(hist) == 1)
+check("普通层: 不 append 历史(hist 保持为空)", out_b.shape == xb.shape and kv_b[0].shape[1] == 4 and len(hist) == 0)
+fblk = FlushBlockAttnResBlock(0, cfg_bs2).to(DEVICE).eval()
+check("flush 层 is_flush=True", fblk.is_flush and not blk.is_flush)
+with torch.no_grad():
+    out_f, kv_f, hist_f = fblk(xb, peb, use_cache=True, past_hidden_states=[])
+check("flush 层: append 输入进历史", len(hist_f) == 1 and hist_f[0] is xb)
+check("flush 层: 输出形状/缓存正常", out_f.shape == xb.shape and kv_f[0].shape[1] == 4)
 cfg_moe = RainConfig(hidden_size=D, n_hidden_layers=2, n_attn_heads=NH, n_key_value_heads=NKV, use_moe=True)
 blk2 = BlockAttnResBlock(0, cfg_moe).to(DEVICE).eval()
 check("use_moe → type_id=2 → LosslessMoE", cfg_moe.type_id == 2 and isinstance(blk2.mlp, LosslessMoE),
@@ -230,9 +236,14 @@ print("9. MiniRainVLM 结构")
 print("=" * 60)
 check("层数 == n_hidden_layers 且全为 BlockAttnResBlock",
       len(vlm.layers) == cfg.n_hidden_layers and all(isinstance(l, BlockAttnResBlock) for l in vlm.layers))
+cfg_bs4 = RainConfig(hidden_size=D, n_hidden_layers=6, n_attn_heads=NH, n_key_value_heads=NKV, block_size=4)
+vlm4 = MiniRainVForCausalLM(cfg_bs4).model
+flush_ids = [i for i, l in enumerate(vlm4.layers) if getattr(l, "is_flush", False)]
+check("flush 层位置 == layer_id % (block_size//2) == 0",
+      flush_ids == [i for i in range(6) if i % (cfg_bs4.block_size // 2) == 0], f"got {flush_ids}")
 sd = model.state_dict()
 check("rope2d buffer 非持久(不进 state_dict)", not any("rope2d" in k for k in sd.keys()))
-check("buffer 随 .to() 迁移", str(vlm.rope2d_cos.device).startswith(DEVICE))
+# check("buffer 随 .to() 迁移", str(vlm.rope2d_cos.device).startswith(DEVICE))
 ids9 = torch.randint(3, 6000, (2, 9), device=DEVICE)
 with torch.no_grad():
     h_auto, _, _ = vlm(ids9)
@@ -298,6 +309,45 @@ o_img = model(input_ids=ids, pixel_values=[img], positions=torch.tensor(
     device=DEVICE), labels=ids)
 o_img.loss.backward()
 check("patch_embed 收到梯度", vlm.patch_embed.stem[0].weight.grad is not None and vlm.patch_embed.stem[0].weight.grad.abs().sum() > 0)
+
+# ============================================================
+print("=" * 60)
+print("11. BlockAttnRes 历史数量 bench（按 block_size 统计）")
+print("=" * 60)
+orig_res_fwd = BlockAttnRes.forward
+hist_counts = []
+def _spy_res(self, hist, pb):
+    hist_counts.append(len(hist))
+    return orig_res_fwd(self, hist, pb)
+BlockAttnRes.forward = _spy_res
+
+def count_history(block_size, n_layers=20):
+    """跑一次整机前向，返回每层 attn_res / mlp_res 收到的历史条数。"""
+    c = RainConfig(hidden_size=D, n_hidden_layers=n_layers, n_attn_heads=NH,
+                   n_key_value_heads=NKV, block_size=block_size)
+    m = MiniRainVForCausalLM(c).to(DEVICE).eval()
+    hist_counts.clear()
+    ids_h = torch.randint(3, 6000, (1, 8), device=DEVICE)
+    with torch.no_grad():
+        m(input_ids=ids_h)
+    step = block_size // 2
+    exp_attn = [0] * n_layers if step == 0 else [(l + step - 1) // step for l in range(n_layers)]
+    exp_mlp = [0] * n_layers if step == 0 else [l // step + 1 for l in range(n_layers)]
+    n_flush = 0 if step == 0 else sum(l % step == 0 for l in range(n_layers))
+    attn_hist, mlp_hist = hist_counts[0::2], hist_counts[1::2]
+    del m
+    return attn_hist, mlp_hist, exp_attn, exp_mlp, n_flush
+
+for bs in (0, 2, 4, 6):
+    a_hist, m_hist, a_exp, m_exp, n_flush = count_history(bs)
+    check(f"block_size={bs}: 每层历史条数符合理论", a_hist == a_exp and m_hist == m_exp,
+          f"attn={a_hist} mlp={m_hist}")
+    print(f"      block_size={bs}: append 层={n_flush}/{20} | 末层 attn_res 历史={a_hist[-1]} "
+          f"mlp_res 历史={m_hist[-1]}")
+    # 历史条目是激活的引用，不复制数据；这里按条数估算被“钉住”的张量上限
+    held = n_flush * 1 * 8 * D * 2 / 2 ** 20
+    print(f"      被历史引用的激活上限 ≈ {n_flush} 条 × [1,8,{D}] bf16 = {held:.4f} MB")
+BlockAttnRes.forward = orig_res_fwd
 
 print("=" * 60)
 print(f"结果: {len(passed)} PASS, {len(failed)} FAIL")

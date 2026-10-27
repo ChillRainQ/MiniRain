@@ -8,6 +8,7 @@ try:
     import triton
     import triton.language as tl
     HAS_TRITON = True
+    print("triton is available")
 except ImportError:
     HAS_TRITON = False
 

@@ -5,7 +5,7 @@ from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 from architectures.config import RainConfig
-from components.block import BlockAttnResBlock
+from components.block import BlockAttnResBlock, FlushBlockAttnResBlock
 from components.cv import ConvStem
 from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
@@ -118,7 +118,13 @@ class MiniRainVLM(nn.Module):
         # 文本
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
-        self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
+        self.layers = nn.ModuleList([
+            (FlushBlockAttnResBlock
+             if (config.block_size >= 2 and i % (config.block_size // 2) == 0)
+             else BlockAttnResBlock)(i, config)
+            for i in range(config.n_hidden_layers)
+        ])
+        # self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
         self.text_norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size

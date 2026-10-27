@@ -11,6 +11,7 @@ from components.norm import RMSNorm, NormArgs, TorchRMSNorm
 try:
     from liger_kernel.ops.swiglu import LigerSwiGLUFunction
     _HAS_LIGER_SWIGLU = True
+    print("Using Liger SwiGLU")
 except ImportError:
     _HAS_LIGER_SWIGLU = False
 
