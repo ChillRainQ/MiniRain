@@ -61,7 +61,7 @@ class SwiGLU(MyMLP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _HAS_LIGER_SWIGLU and x.is_cuda:
-            return self.down(LigerSwiGLUFunction.apply(self.gate(x), self.up(x)))
+            return self.down(LigerSiLUMulFunction.apply(self.gate(x), self.up(x)))
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 class LowRankMLP(MyMLP):
