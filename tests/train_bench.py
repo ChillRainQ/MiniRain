@@ -294,13 +294,14 @@ def main():
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--mode", choices=["default", "max-autotune"], default="default",
                    help="compile 模式：max-autotune 会实测选优 GEMM，编译时间长 5-10 倍")
-    p.add_argument("--quiet", action="store_true", help="控制台静默，输出只写 results/*.txt")
+    p.add_argument("--quiet", action="store_true", help="控制台静默，输出只写 txt/*.txt")
     args = p.parse_args()
     torch._dynamo.config.recompile_limit = 10000
 
-    # stdout 同时写入 results/train_bench_<时间戳>.txt
-    os.makedirs("results", exist_ok=True)
-    log_path = os.path.join("results", f"train_bench_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    # stdout 同时写入 <脚本所在目录>/txt/train_bench_<时间戳>.txt（与 perf_test 习惯一致，不受运行目录影响）
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "txt")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"train_bench_{time.strftime('%Y%m%d_%H%M%S')}.txt")
     sys.stdout = Tee(log_path, echo=not args.quiet)
     print(f"[log] 输出已写入 {log_path}")
 
