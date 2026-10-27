@@ -58,6 +58,22 @@ BASE_CFG = dict(
 )
 
 
+# ---------------------------------------------------------------- 日志分叉
+class Tee:
+    """把 write/flush 同时分发给多个文件对象（原始 stdout + 日志文件）。"""
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for f in self.files:
+            f.write(data)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+
 # ---------------------------------------------------------------- 基础设施
 def sync(device):
     if device.startswith("cuda"):
@@ -393,7 +409,7 @@ def section_memory(args, model, cfg):
 
 
 # ---------------------------------------------------------------- 入口
-def main():
+def _main_body():
     p = argparse.ArgumentParser(description="MiniRainVLM 性能基准（model_size.py 的 MoT 配置）")
     p.add_argument("--device", default="cuda:5" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
@@ -461,6 +477,24 @@ def main():
     section_memory(args, model, cfg)
     free()
     print("\n完成。")
+
+
+def main():
+    """每次执行把 print 输出同时保存到同目录 txt/ 下（时间戳 + pid 命名）。"""
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "txt")
+    os.makedirs(log_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"perf_test_{ts}_{os.getpid()}.txt")
+    log_file = open(log_path, "w", encoding="utf-8")
+    orig_stdout = sys.stdout
+    sys.stdout = Tee(orig_stdout, log_file)
+    try:
+        _main_body()
+    finally:
+        log_file.flush()
+        log_file.close()
+        sys.stdout = orig_stdout
+        print(f"[log] print 输出已保存到 {log_path}")
 
 
 if __name__ == "__main__":
