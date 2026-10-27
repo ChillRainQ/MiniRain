@@ -322,7 +322,11 @@ def _spy_res(self, hist, pb):
 BlockAttnRes.forward = _spy_res
 
 def count_history(block_size, n_layers=20):
-    """跑一次整机前向，返回每层 attn_res / mlp_res 收到的历史条数。"""
+    """跑一次整机前向，返回每层 attn_res / mlp_res 收到的历史条数。
+
+    block_size 以子层为单位（每层含 attn + mlp 两个子层），
+    故一个块 = block_size 个子层 = block_size//2 个 decoder 层，flush 只能落在整层边界。
+    """
     c = RainConfig(hidden_size=D, n_hidden_layers=n_layers, n_attn_heads=NH,
                    n_key_value_heads=NKV, block_size=block_size)
     m = MiniRainVForCausalLM(c).to(DEVICE).eval()

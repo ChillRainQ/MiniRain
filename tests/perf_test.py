@@ -92,18 +92,36 @@ def bench(fn, iters, warmup, device):
     return (time.perf_counter() - t0) / iters * 1000.0
 
 
+_RUN_PEAK = {"alloc": 0, "reserved": 0}   # 全程峰值（字节），跨 peak_mb 的 reset 不被清零
+
+
+def _bump_run_peak():
+    """把「上次 reset 以来的峰值」并入全程峰值；peak_mb 每次 reset 前调用。"""
+    if not torch.cuda.is_available():
+        return
+    _RUN_PEAK["alloc"] = max(_RUN_PEAK["alloc"], torch.cuda.max_memory_allocated())
+    _RUN_PEAK["reserved"] = max(_RUN_PEAK["reserved"], torch.cuda.max_memory_reserved())
+
+
 def peak_mb(fn, device):
-    """执行 fn 时的峰值显存增量（MB），CPU 上返回 nan。"""
+    """执行 fn 时的峰值显存增量（MB），CPU 上返回 nan。
+
+    内部会 reset peak 统计，reset 前先把上一段峰值记入 _RUN_PEAK，
+    因此全程峰值不会因逐段测量而丢失。
+    """
     if not device.startswith("cuda"):
         fn()
         return float("nan")
     gc.collect()
+    _bump_run_peak()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     fn()
     torch.cuda.synchronize()
-    return (torch.cuda.max_memory_allocated() - base) / 2 ** 20
+    inc = (torch.cuda.max_memory_allocated() - base) / 2 ** 20
+    _bump_run_peak()
+    return inc
 
 
 def free():
@@ -439,6 +457,8 @@ def _main_body():
 
     if args.device.startswith("cuda"):
         torch.cuda.set_device(torch.device(args.device))
+        # 全程峰值统计从进程最早处开始（模型构建前）
+        torch.cuda.reset_peak_memory_stats()
     if args.dtype != "fp32" and not args.device.startswith("cpu"):
         pass
     if args.dtype != "fp32" and not args.device.startswith("cuda"):
@@ -476,6 +496,22 @@ def _main_body():
         free()
     section_memory(args, model, cfg)
     free()
+
+    # ---------------------------------------------------------------- 全程峰值
+    _bump_run_peak()
+    print("\n" + "=" * 78)
+    print("6. 全程峰值显存（模型构建 → 全部 section 结束）")
+    print("=" * 78)
+    if args.device.startswith("cuda"):
+        alloc = _RUN_PEAK["alloc"] / 2 ** 20
+        reserved = _RUN_PEAK["reserved"] / 2 ** 20
+        pct = alloc / total_mb * 100 if total_mb else float("nan")
+        print(f"  已分配峰值 {alloc:>8.1f} MB | 保留峰值 {reserved:>8.1f} MB"
+              f" | 卡容量 {total_mb:.0f} MB，占比 {pct:.1f}%")
+        if pct > 85:
+            print("      ! 全程峰值超过显存 85%，加大 batch/seq 有 OOM 风险")
+    else:
+        print("  CPU 模式，无显存统计")
     print("\n完成。")
 
 
