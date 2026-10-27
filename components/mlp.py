@@ -9,11 +9,12 @@ from transformers import PreTrainedConfig
 from architectures.config import RainConfig
 from components.norm import RMSNorm, NormArgs, TorchRMSNorm
 try:
-    from liger_kernel.ops.swiglu import LigerSwiGLUFunction
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
     _HAS_LIGER_SWIGLU = True
     print("Using Liger SwiGLU")
 except ImportError:
     _HAS_LIGER_SWIGLU = False
+    print("Using Eager SwiGLU")
 
 @dataclass
 class MLPArgs:
