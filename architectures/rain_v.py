@@ -10,24 +10,52 @@ from components.cv import ConvStem
 from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
 from losses.loss import get_loss_fn
+# def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
+#     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
+#     half = head_dim // 2
+#     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half)), 1.0
+#     if rope_scaling is not None:  # YaRN，按轴内维度 half 计算，与 1D 版同式
+#         orig_max, factor, beta_fast, beta_slow, attn_factor = (
+#             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
+#             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+#         )
+#         if end / orig_max > 1.0:
+#             inv_dim = lambda b: (half * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+#             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
+#             ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+#             freqs = freqs * (1 - ramp + ramp / factor)
+#     t = torch.arange(end)
+#     ang = torch.outer(t, freqs)          # [P, half/2]
+#     return ang.cos() * attn_factor, ang.sin() * attn_factor   # 两张表：按行/列索引查
+#
+# def build_2d_position_embeddings(positions, cos_tab, sin_tab):
+#     rows, cols = positions[..., 0], positions[..., 1]
+#     cos = torch.cat([cos_tab[rows], cos_tab[cols]], dim=-1)
+#     sin = torch.cat([sin_tab[rows], sin_tab[cols]], dim=-1)
+#     return torch.cat([cos, cos], dim=-1), torch.cat([sin, sin], dim=-1)
 
-def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
+def precompute_freqs_cis_2d(head_dim: int, end: int = 32 * 1024, rope_base: float = 1e6,
+                            rope_scaling: dict | None = None):
     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
     half = head_dim // 2
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half)), 1.0
     if rope_scaling is not None:  # YaRN，按轴内维度 half 计算，与 1D 版同式
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
-            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0)
         )
         if end / orig_max > 1.0:
             inv_dim = lambda b: (half * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
-            ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
+            ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low)
+                               / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1 - ramp + ramp / factor)
     t = torch.arange(end)
     ang = torch.outer(t, freqs)          # [P, half/2]
     return ang.cos() * attn_factor, ang.sin() * attn_factor   # 两张表：按行/列索引查
+
 
 def build_2d_position_embeddings(positions, cos_tab, sin_tab):
     rows, cols = positions[..., 0], positions[..., 1]
@@ -36,8 +64,52 @@ def build_2d_position_embeddings(positions, cos_tab, sin_tab):
     return torch.cat([cos, cos], dim=-1), torch.cat([sin, sin], dim=-1)
 
 
+def precompute_freqs_cis_1d(head_dim: int, end: int = 32 * 1024,
+                            rope_base: float = 1e6, rope_scaling: dict | None = None):
+    """文本路径：1D RoPE，用满 head_dim 个维度（head_dim//2 个频率）。"""
+    half = head_dim  # 1D：全部维度都给一个轴
+    freqs = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half))
+    attn_factor = 1.0
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 4096),
+            rope_scaling.get("factor", 8),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0),
+        )
+        if end / orig_max > 1.0:
+            inv_dim = lambda b: (half * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
+            ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low)
+                               / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1 - ramp + ramp / factor)
+    t = torch.arange(end)
+    ang = torch.outer(t, freqs)  # [P, head_dim//2]
+    return ang.cos() * attn_factor, ang.sin() * attn_factor
+
+
+def build_position_embeddings(positions, modality_mask, cos1d, sin1d, cos2d, sin2d):
+    """positions: [B,T,2]；modality_mask: [B,T] bool（True=图像侧 token）。
+    返回 cos, sin: [B,T,head_dim]，每个 token 按身份取 1D 或 2D 表。
+    输出布局与旧 build_2d_position_embeddings 完全一致，layer 内 rotate 逻辑不用动。"""
+    rows, cols = positions[..., 0], positions[..., 1]
+    # 文本：1D，行索引即位置（positions 纯文本路径为 (t,t)）
+    cos_t = torch.cat([cos1d[rows], cos1d[rows]], dim=-1)
+    sin_t = torch.cat([sin1d[rows], sin1d[rows]], dim=-1)
+    # 图像：2D（行列各一半维度）
+    cos_i = torch.cat([cos2d[rows], cos2d[cols]], dim=-1)
+    cos_i = torch.cat([cos_i, cos_i], dim=-1)
+    sin_i = torch.cat([sin2d[rows], sin2d[cols]], dim=-1)
+    sin_i = torch.cat([sin_i, sin_i], dim=-1)
+    is_img = modality_mask.unsqueeze(-1)
+    return torch.where(is_img, cos_i, cos_t), torch.where(is_img, sin_i, sin_t)
+
+
 class MiniRainVLM(nn.Module):
     name = "MiniRain-Vision"
+
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
         self.config = config
@@ -51,22 +123,23 @@ class MiniRainVLM(nn.Module):
         # 图像
         self.patch_size = config.patch_size
         assert self.patch_size == 16, f"ConvStem 固定 16× 降采样，config.patch_size={self.patch_size} 暂不支持"
-        # 对于如此尺寸的小模型，可能需要更强的视觉先验，一层卷积可能不行，本身参数就不足。
-        # self.patch_embd = nn.Conv2d(3, config.hidden_size,
-        #                              kernel_size=self.patch_size, stride=self.patch_size)
         self.patch_embed = ConvStem(hidden=config.hidden_size)
         self.img_norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         self.img_patch = self.config.img_patch_token
         self.img_start = self.config.img_start_token
         self.img_end = self.config.img_end_token
         self.img_row = self.config.img_row_token
-        cos_tab, sin_tab = precompute_freqs_cis_2d(
-            self.config.head_dim,
-            end=self.config.max_position_embeddings,
-            rope_base=self.config.rope_theta,
-            rope_scaling=getattr(self.config, "rope_scaling", None))
-        self.register_buffer("rope2d_cos", cos_tab, persistent=False)
-        self.register_buffer("rope2d_sin", sin_tab, persistent=False)
+        # RoPE 表：1D（文本，挂 YaRN）+ 2D（图像，不缩放）。persistent=False 不进 checkpoint。
+        cos1d, sin1d = precompute_freqs_cis_1d(
+            config.head_dim, config.max_position_embeddings,
+            config.rope_theta, config.rope_scaling)
+        cos2d, sin2d = precompute_freqs_cis_2d(
+            config.head_dim, config.max_position_embeddings,
+            config.rope_theta, None)  # 2D 不挂 YaRN
+        self.register_buffer("rope_cos1d", cos1d, persistent=False)
+        self.register_buffer("rope_sin1d", sin1d, persistent=False)
+        self.register_buffer("rope_cos2d", cos2d, persistent=False)
+        self.register_buffer("rope_sin2d", sin2d, persistent=False)
 
     def prepare_inputs_embeds(self, input_ids, pixel_values=None):
         inputs_embeds = self.embed(input_ids)
@@ -113,7 +186,8 @@ class MiniRainVLM(nn.Module):
     def forward(self, input_ids, pixel_values=None, positions=None,
                 attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
         past_key_values = past_key_values or [None] * self.n_hidden_layers
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
@@ -129,18 +203,26 @@ class MiniRainVLM(nn.Module):
                 attention_mask = None
 
         image_bidirectional_mask = None
-        modality_mask = None
         if pixel_values is not None:
-            image_bidirectional_mask = self._build_image_bidirectional_mask(input_ids, attention_mask, hidden_states.dtype)
-            img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
-                                   dtype=torch.long, device=input_ids.device)
-            modality_mask = torch.isin(input_ids, img_ids).long()
+            image_bidirectional_mask = self._build_image_bidirectional_mask(
+                input_ids, attention_mask, hidden_states.dtype)
 
-        if positions is None:  # 纯文本路径：行=列=下标，退化为1D
+        # 图像 token mask：无条件计算（一次 isin，开销可忽略），
+        # 同时服务 rope 选路（bool）和 MoT/attention 路由（long，保持原类型）
+        img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
+                               dtype=torch.long, device=input_ids.device)
+        is_img_tok = torch.isin(input_ids, img_ids)                 # [B,S] bool
+        modality_mask = is_img_tok.long()                           # 给 layer/MoT，保持原语义
+
+        if positions is None:  # 纯文本路径：行=列=下标
             pos = torch.arange(start_pos, start_pos + seq_length, device=input_ids.device)
             pos = pos.unsqueeze(0).expand(batch_size, -1)
             positions = torch.stack([pos, pos], dim=-1)
-        position_embeddings = build_2d_position_embeddings(positions, self.rope2d_cos, self.rope2d_sin)
+
+        # 每 micro-batch 只建一次，20 层复用；文本走 1D 表，图像走 2D 表
+        position_embeddings = build_position_embeddings(
+            positions, is_img_tok,
+            self.rope_cos1d, self.rope_sin1d, self.rope_cos2d, self.rope_sin2d)
 
         presents, past_hidden_states = [], []
         for layer, past_key_value in zip(self.layers, past_key_values):
@@ -162,13 +244,15 @@ class MiniRainVLM(nn.Module):
 
 class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
+
     def __init__(self, config: PreTrainedConfig):
         super().__init__(config)
         self.config = config if config is not None else RainConfig()
         self.model = MiniRainVLM(self.config)
         self.name = self.model.name
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings: self.model.embed.weight = self.lm_head.weight
+        if self.config.tie_word_embeddings:
+            self.model.embed.weight = self.lm_head.weight
         self.loss_fn = get_loss_fn()
         self.post_init()
 
@@ -180,11 +264,11 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache, **kwargs)
 
         loss = None
+        logits = None
         if labels is None:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
         else:
-            logits = None
             # shift 作用在 hidden/labels 上（不是 logits），对齐原版 CE 的语义
             h = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))  # [B*(T-1), H]
             y = labels[..., 1:].reshape(-1)  # [B*(T-1)]，图像段/pad 已是 -100
@@ -230,12 +314,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 # decode 阶段：行=列=连续编号，接在 prompt 末尾之后
                 pos = torch.full((input_ids.shape[0], 1), next_pos, dtype=torch.long, device=input_ids.device)
                 step_positions = torch.stack([pos, pos], dim=-1)
-            # outputs = self.forward(
-            #     input_ids[:, past_len:],
-            #     pixel_values=pixel_values if past_len == 0 else None,  # 图像只在 prefill 进
-            #     positions=step_positions if past_len > 0 else positions,
-            #     attention_mask=attention_mask,
-            #     past_key_values=past_key_values, use_cache=use_cache, **kwargs)
             outputs = self.forward(
                 input_ids[:, past_len:],
                 pixel_values=pixel_values if past_len == 0 else None,
@@ -246,7 +324,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 **kwargs)
             if next_pos is not None: next_pos += 1
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
-            # pyrefly: ignore [unsupported-operation]
             logits = outputs.logits[:, -1, :] / temperature
             # 禁止生成视觉占位/边界 token（含换行 img_row），防止输出污染
             logits[:, [self.config.img_start_token, self.config.img_end_token, 11,
