@@ -6,10 +6,10 @@ from components.norm import *
 from dataclasses import dataclass
 import math
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     """
@@ -26,7 +26,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
-    return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+    return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen,
+                                                                                               num_key_value_heads * n_rep,
+                                                                                               head_dim))
+
 
 @dataclass
 class AttentionArgs:
@@ -41,16 +44,8 @@ _CAUSAL_MASK_CACHE: dict = {}
 
 
 class GroupQueryAttention(nn.Module):
-    """分组查询注意力机制。
-
-    依赖外部定义：AttentionArgs、NormArgs、TorchRMSNorm 和
-    apply_rotary_pos_emb。
-
-    attention_mask 使用 [B, KV_len] 格式，1/True 表示有效 token，
-    0/False 表示 padding；image_bidirectional_mask 应为可广播到
-    [B, H, Q_len, KV_len] 的 mask。布尔或整型 0/1 mask
-    按 1/True 可见、0/False 屏蔽处理；浮点 mask 按加性偏置处理。
-    模态指示（0/1）不属于本类，MoT 分流请用 MoTGroupQueryAttention。
+    """
+    分组查询注意力机制。
     """
 
     @staticmethod
@@ -67,19 +62,11 @@ class GroupQueryAttention(nn.Module):
 
     @staticmethod
     def _prepare_attn_mask(mask, query):
-        """bool/整型 0/1 按可见性处理（转 bool），浮点按加性偏置处理。
-
-        不做 ``.item()`` 数值检查，避免每层一次 GPU 同步。
-        """
         if mask.dtype.is_floating_point:
             return mask.to(device=query.device, dtype=query.dtype)
         return mask.to(device=query.device, dtype=torch.bool)
 
     def _causal_mask(self, seq_len: int, kv_len: int, device):
-        """右下对齐的因果 bool mask，按 (S, KV, device) 共享单条缓存。
-
-        所有层/实例共用同一份，既避免逐层重建 S×KV，也避免每层各存一份。
-        """
         key = (seq_len, kv_len, device)
         cached = _CAUSAL_MASK_CACHE.get("entry")
         if cached is not None and cached[0] == key:
@@ -142,17 +129,17 @@ class GroupQueryAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.n_dropout)
         self.dropout = config.n_dropout
         self.flash = (
-            hasattr(F, "scaled_dot_product_attention") and config.flash_attn
+                hasattr(F, "scaled_dot_product_attention") and config.flash_attn
         )
 
     def forward(
-        self,
-        x,
-        position_embeddings,
-        past_key_value=None,
-        use_cache=False,
-        attention_mask=None,
-        image_bidirectional_mask=None,
+            self,
+            x,
+            position_embeddings,
+            past_key_value=None,
+            use_cache=False,
+            attention_mask=None,
+            image_bidirectional_mask=None,
     ):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -187,9 +174,9 @@ class GroupQueryAttention(nn.Module):
         pad_mask = None
         if attention_mask is not None:
             if (
-                attention_mask.ndim != 2
-                or attention_mask.shape[0] != bsz
-                or attention_mask.shape[1] != kv_len
+                    attention_mask.ndim != 2
+                    or attention_mask.shape[0] != bsz
+                    or attention_mask.shape[1] != kv_len
             ):
                 raise ValueError(
                     "attention_mask 应为 [B, KV_len]，当前形状为 "
@@ -258,7 +245,7 @@ class GroupQueryAttention(nn.Module):
                 )
                 k_positions = torch.arange(kv_len, device=scores.device)
                 causal_mask = (
-                    k_positions.unsqueeze(0) > q_positions.unsqueeze(1)
+                        k_positions.unsqueeze(0) > q_positions.unsqueeze(1)
                 )
                 scores = scores.masked_fill(causal_mask, min_score)
 
@@ -269,6 +256,7 @@ class GroupQueryAttention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.wo(output))
         return output, past_kv
+
 
 # class GroupQueryAttention(nn.Module):
 #     """分组查询注意力机制。"""
@@ -341,11 +329,11 @@ class GroupQueryAttention(nn.Module):
 #         return output, past_kv
 
 
-
 class MoTGroupQueryAttention(nn.Module):
-    """MoT 版 GQA：QKVO 按模态解耦，注意力计算全局共享。
-    modality_mask: (B, T) int，0=文本 1=图像；为 None 时全部走模态 0（纯文本退化为普通 GQA）。
     """
+    MoT 版 GQA
+    """
+
     def __init__(self, args: AttentionArgs):
         super().__init__()
         config = args.config
@@ -450,10 +438,9 @@ class MoTGroupQueryAttention(nn.Module):
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self._project_modal(self.wo, output, idxs)   # wo 也按模态
+        output = self._project_modal(self.wo, output, idxs)  # wo 也按模态
         output = self.resid_dropout(output)
         return output, past_kv
-
 
 
 class MoTAttention(nn.Module):
@@ -513,9 +500,11 @@ class MoTAttention(nn.Module):
         attn_output = self._process_final_output(attn_output, modality_masks)
 
         return attn_output, attn_output_weights
+
     def attention_comp(self, q, k, v, attn_mask=None):
         pass
-    def _merge_qkv(self, expert_outputs: list, modality_masks:torch.Tensor):
+
+    def _merge_qkv(self, expert_outputs: list, modality_masks: torch.Tensor):
         # 确保形状一致
         merged = torch.empty_like(expert_outputs[0])
         for i, expert_output in enumerate(expert_outputs):
@@ -562,7 +551,7 @@ class MoTAttention(nn.Module):
             ]
         )
 
-    def _create_norms(self, dim: int, n_modalities: int, eps: float=1e-5):
+    def _create_norms(self, dim: int, n_modalities: int, eps: float = 1e-5):
         """
         为各个模态创建norm
         """
@@ -587,4 +576,3 @@ class MoTAttention(nn.Module):
 
         # 重新拼回完整序列顺序
         return self._merge_modalities(expert_outputs, modality_masks)
-        

@@ -91,9 +91,6 @@ def precompute_freqs_cis_1d(head_dim: int, end: int = 32 * 1024,
 
 
 def build_position_embeddings(positions, modality_mask, cos1d, sin1d, cos2d, sin2d):
-    """positions: [B,T,2]；modality_mask: [B,T] bool（True=图像侧 token）。
-    返回 cos, sin: [B,T,head_dim]，每个 token 按身份取 1D 或 2D 表。
-    输出布局与旧 build_2d_position_embeddings 完全一致，layer 内 rotate 逻辑不用动。"""
     rows, cols = positions[..., 0], positions[..., 1]
     # 文本：1D，行索引即位置（positions 纯文本路径为 (t,t)）
     cos_t = torch.cat([cos1d[rows], cos1d[rows]], dim=-1)
