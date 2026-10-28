@@ -48,7 +48,23 @@ def main():
     ap.add_argument("--per-file", type=int, default=20000, help="每个 jsonl 抽样条数")
     ap.add_argument("--seq-len", type=int, default=4096)
     ap.add_argument("--imgs-per-seq", type=int, default=2)
+    ap.add_argument("--out", default="bucket_full_stats.txt", help="统计结果落盘路径")
     args = ap.parse_args()
+
+    import sys
+    from datetime import datetime
+    log_fp = open(args.out, "w", encoding="utf-8")
+    class _Tee:
+        def write(self, s):
+            sys.__stdout__.write(s)
+            log_fp.write(s)
+            log_fp.flush()
+        def flush(self):
+            sys.__stdout__.flush()
+            log_fp.flush()
+    sys.stdout = _Tee()
+    print(f"# 统计时间 {datetime.now():%Y-%m-%d %H:%M:%S}  root={args.root}")
+    print(f"# jsonl={args.jsonl} per-file={args.per_file}")
 
     stats = []  # (w, h, source)
     for fp in args.jsonl:
