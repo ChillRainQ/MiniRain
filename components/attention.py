@@ -375,6 +375,9 @@ class MoTGroupQueryAttention(nn.Module):
         # 为空时默认全为文本
         if idxs is None:
             return layers[0](x)
+        # 纯文本快速路径（decode 常态）：其余模态全空时无需 index_select/index_copy
+        if all(idx.numel() == 0 for idx in idxs[1:]):
+            return layers[0](x)
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         out = None

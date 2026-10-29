@@ -104,7 +104,8 @@ class MoTFFN(nn.Module):
         self.norm_v = TorchRMSNorm(norm_args)
 
     def forward(self, x, img_idx=None):
-        if img_idx is None:
+        # 纯文本快速路径（decode 常态）：无图像 token 时直接走文本专家，省掉 nonzero/分拣
+        if img_idx is None or img_idx.numel() == 0:
             return self.mlp_t(self.norm_t(x))
 
         B, T, D = x.shape

@@ -224,6 +224,8 @@ class MiniRainVLM(nn.Module):
                                dtype=torch.long, device=input_ids.device)
         is_img_tok = torch.isin(input_ids, img_ids)                  # [B,S] bool
         modality_mask = is_img_tok.long()
+        # MoTFFN 需要的图像索引在此算一次，避免每层重复 nonzero（decode 时是同步开销）
+        img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0]
 
         image_bidirectional_mask = None
         if pixel_values is not None:
@@ -250,7 +252,8 @@ class MiniRainVLM(nn.Module):
                 attention_mask=attention_mask,
                 past_hidden_states=past_hidden_states,
                 image_bidirectional_mask=image_bidirectional_mask,
-                modality_mask=modality_mask
+                modality_mask=modality_mask,
+                img_idx=img_idx
             )
             presents.append(present)
         hidden_states = self.text_norm(hidden_states)

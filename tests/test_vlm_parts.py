@@ -167,6 +167,41 @@ res.attn_res_query.grad = None
 res([h1, h2], cur).sum().backward()
 check("≥2 候选时 query 有梯度", res.attn_res_query.grad.abs().sum() > 0)
 
+# 6.2 三种实现的等价性：新 forward（堆叠聚合）/ forward_old（堆叠、softmax 不做 float 提升）/
+#     原逐候选循环（优化前的实现，此处内联复刻）
+def loop_ref(m, hist, cur):
+    hs = hist + [cur]
+    logits = torch.stack([torch.matmul(m.attn_res_norm(h), m.attn_res_query) for h in hs])
+    alpha = torch.softmax(logits.float(), dim=0).to(cur.dtype)
+    out = torch.zeros_like(hs[0])
+    for a, h in zip(alpha, hs):
+        out = out + a.unsqueeze(-1) * h
+    return out
+
+# 逐候选循环与堆叠求和的反向顺序不同，半精度下允许 ulp 级差异；堆叠两版应逐位相同
+TOL = {torch.float32: 1e-6, torch.bfloat16: 2e-2, torch.float16: 2e-3}
+N_LIST = (1, 2, 3, 7, 20)
+for dt in (torch.float32, torch.bfloat16, torch.float16):
+    m = BlockAttnRes(cfg).to(DEVICE).to(dt)
+    torch.manual_seed(1)
+    with torch.no_grad():
+        # 非零 query，否则零初始化会让 alpha 恒为均值、掩盖实现差异
+        m.attn_res_query.copy_(torch.randn(D, device=DEVICE).to(dt) * 0.02)
+    exact, worst, worst_n = True, 0.0, None
+    for N in N_LIST:
+        hs = [torch.randn(2, 5, D, device=DEVICE, dtype=dt) for _ in range(N)]
+        cur = torch.randn(2, 5, D, device=DEVICE, dtype=dt)
+        with torch.no_grad():
+            a, b, c = m(hs, cur), m.forward_old(hs, cur), loop_ref(m, hs, cur)
+        exact &= torch.equal(a, b)
+        d = (a.float() - c.float()).abs().max().item()
+        if d > worst:
+            worst, worst_n = d, N
+    tag = str(dt).replace("torch.", "")
+    check(f"{tag}: forward 与 forward_old 逐位一致 (N∈{N_LIST})", exact)
+    check(f"{tag}: forward 与逐候选循环等价", worst <= TOL[dt],
+          f"max diff {worst:.2e} @N={worst_n}, tol {TOL[dt]:.0e}")
+
 # ============================================================
 print("=" * 60)
 print("7. MLP: SwiGLU / LosslessMoE")

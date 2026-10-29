@@ -47,15 +47,13 @@ class BlockAttnRes(nn.Module):
         :return:
         """
         hs = inter_block_history + [partial_block]
-        logits = torch.stack([
-            torch.matmul(self.attn_res_norm(h), self.attn_res_query)
-            for h in hs
-        ])
+        if len(hs) == 1:   # 单候选：alpha=1，等价原样透传
+            return partial_block
+        # 一次性堆叠算 norm/logits，避免逐候选的 Python 循环（decode 时是 launch-bound 主因）
+        V = torch.stack(hs, dim=0)                                        # [N, B, T, D]
+        logits = (self.attn_res_norm(V) * self.attn_res_query).sum(dim=-1)  # [N, B, T]
         alpha = torch.softmax(logits.float(), dim=0).to(partial_block.dtype)
-        output = torch.zeros_like(hs[0])
-        for a, h in zip(alpha, hs):
-            output = output + a.unsqueeze(-1) * h
-        return output
+        return (alpha.unsqueeze(-1) * V).sum(dim=0)
 
     def forward_old(self, inter_block_history: list[torch.Tensor],
                 partial_block: torch.Tensor):
@@ -187,7 +185,8 @@ class BlockAttnResBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None):
+                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None,
+                img_idx=None):
         partial_block = hidden_states
         attn_input = self.attn_res(past_hidden_states, partial_block)
         # flush 决策在 trace 时按子类解析，不产生 layer_id guard
@@ -197,10 +196,11 @@ class BlockAttnResBlock(nn.Module):
                                              use_cache, attention_mask, image_bidirectional_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
-        # MoTFFN 期望 img_idx（索引），从 modality_mask 转换；其他 MLP 不接受此参数
+        # MoTFFN 期望 img_idx（索引），由 VLM 入口统一算一次（避免每层 nonzero）；
         # 当前 1=图像统一走 mlp_v；2/3 为后续视觉子模态预留，届时在此按 id 分派
         if isinstance(self.mlp, MoTFFN):
-            img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0] if modality_mask is not None else None
+            if img_idx is None and modality_mask is not None:
+                img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0]
             mlp_out = self.mlp(mlp_input, img_idx=img_idx)
         else:
             mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
