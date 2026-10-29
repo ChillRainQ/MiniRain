@@ -1,4 +1,5 @@
 import torch
+from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedConfig
 
 from components.mlp import SwiGLU, LosslessMoE, MoTFFN
@@ -38,6 +39,20 @@ class BlockAttnRes(nn.Module):
         super().__init__()
         self.attn_res_norm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
+        # 训练期可选梯度检查点（config.attn_res_checkpoint）：反向重算聚合，
+        # 省掉 stack 缓冲的持有；推理/关闭时完全不生效
+        self.use_checkpoint = bool(getattr(config, "attn_res_checkpoint", True))
+
+    def _aggregate(self, *hs):
+        """堆叠聚合：一次 norm + 一次归约。
+
+        单候选也走同一路径，不早退——否则 q/norm 拿不到 0 梯度而变成 None，
+        DDP 会判为未使用参数。
+        """
+        V = torch.stack(hs, dim=0)                                        # [N, B, T, D]
+        logits = (self.attn_res_norm(V) * self.attn_res_query).sum(dim=-1)  # [N, B, T]
+        alpha = torch.softmax(logits.float(), dim=0).to(V.dtype)
+        return (alpha.unsqueeze(-1) * V).sum(dim=0)
 
     def forward(self, inter_block_history: list[torch.Tensor],
                 partial_block: torch.Tensor):
@@ -47,12 +62,10 @@ class BlockAttnRes(nn.Module):
         :return:
         """
         hs = inter_block_history + [partial_block]
-        # 一次性堆叠算 norm/logits，避免逐候选的 Python 循环（decode 时是 launch-bound 主因）
-        # 注意：单候选时不早退，否则 q/norm 拿不到 0 梯度而变成 None（DDP/优化器会判为未使用参数）
-        V = torch.stack(hs, dim=0)                                        # [N, B, T, D]
-        logits = (self.attn_res_norm(V) * self.attn_res_query).sum(dim=-1)  # [N, B, T]
-        alpha = torch.softmax(logits.float(), dim=0).to(partial_block.dtype)
-        return (alpha.unsqueeze(-1) * V).sum(dim=0)
+        # 检查点只省「为反向保留的中间量」：输入 hs 本身就是既有激活，不额外占用显存
+        if self.use_checkpoint and self.training and torch.is_grad_enabled():
+            return checkpoint(self._aggregate, *hs, use_reentrant=False)
+        return self._aggregate(*hs)
 
     def forward_old(self, inter_block_history: list[torch.Tensor],
                 partial_block: torch.Tensor):

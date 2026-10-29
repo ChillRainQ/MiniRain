@@ -61,6 +61,8 @@ class RainConfig(PretrainedConfig):
         self.full_attn_res = bool(kwargs.get("full_attn_res", False))
         self.block_attn_res = bool(kwargs.get("block_attn_res", False))
         self.block_size = int(kwargs.get("block_size", 0))
+        # 聚合段梯度检查点：反向重算 norm/加权和，省掉 stack 缓冲的持有（长上下文训练省显存）
+        self.attn_res_checkpoint = bool(kwargs.get("attn_res_checkpoint", True))
         self.patch_size = int(kwargs.get("patch_size", 16))
         # vision
         self.vision_ffn_scale: int = int(kwargs.get("vision_ffn_scale", 1))
