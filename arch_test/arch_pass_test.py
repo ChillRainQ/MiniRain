@@ -1,13 +1,14 @@
 import argparse
 import random
+import sys
 import time
 import torch
 from transformers import PreTrainedConfig, AutoTokenizer, TextStreamer
-
+from pathlib import Path
 from architectures.config import RainConfig
 from train.train_util import init_model
 from train.train_util import get_model_params, setup_seed
-
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="MiniRain Pretraining")
