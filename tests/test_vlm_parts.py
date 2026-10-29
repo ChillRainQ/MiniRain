@@ -168,15 +168,9 @@ res([h1, h2], cur).sum().backward()
 check("≥2 候选时 query 有梯度", res.attn_res_query.grad.abs().sum() > 0)
 
 # 6.2 三种实现的等价性：新 forward（堆叠聚合）/ forward_old（堆叠、softmax 不做 float 提升）/
-#     原逐候选循环（优化前的实现，此处内联复刻）
+#     forward_loop（优化前的逐候选循环，模块内保留）
 def loop_ref(m, hist, cur):
-    hs = hist + [cur]
-    logits = torch.stack([torch.matmul(m.attn_res_norm(h), m.attn_res_query) for h in hs])
-    alpha = torch.softmax(logits.float(), dim=0).to(cur.dtype)
-    out = torch.zeros_like(hs[0])
-    for a, h in zip(alpha, hs):
-        out = out + a.unsqueeze(-1) * h
-    return out
+    return m.forward_loop(hist, cur)
 
 # 逐候选循环与堆叠求和的反向顺序不同，半精度下允许 ulp 级差异；堆叠两版应逐位相同
 TOL = {torch.float32: 1e-6, torch.bfloat16: 2e-2, torch.float16: 2e-3}

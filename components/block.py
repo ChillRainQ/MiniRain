@@ -41,7 +41,7 @@ class BlockAttnRes(nn.Module):
         self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
         # 训练期可选梯度检查点（config.attn_res_checkpoint）：反向重算聚合，
         # 省掉 stack 缓冲的持有；推理/关闭时完全不生效
-        self.use_checkpoint = bool(getattr(config, "attn_res_checkpoint", True))
+        self.use_checkpoint = bool(getattr(config, "attn_res_checkpoint", False))
 
     def _aggregate(self, *hs):
         """堆叠聚合：一次 norm + 一次归约。
@@ -82,6 +82,21 @@ class BlockAttnRes(nn.Module):
         alpha = torch.softmax(logits, dim=0)
         # (N, B, T, 1) * (N, B, T, D) -> (B, T, D)
         output = (alpha.unsqueeze(-1) * V).sum(dim=0)
+        return output
+
+    def forward_loop(self, inter_block_history: list[torch.Tensor],
+                     partial_block: torch.Tensor):
+        """优化前的逐候选循环实现，仅保留作对照/回退，勿用于生产路径。
+
+        每个候选各做一次 norm + 一次 GEMV，decode 时 kernel launch 数随候选数线性增长。
+        """
+        hs = inter_block_history + [partial_block]
+        logits = torch.stack([torch.matmul(self.attn_res_norm(h), self.attn_res_query)
+                              for h in hs])                                      # [N, B, T]
+        alpha = torch.softmax(logits.float(), dim=0).to(partial_block.dtype)
+        output = torch.zeros_like(hs[0])
+        for a, h in zip(alpha, hs):
+            output = output + a.unsqueeze(-1) * h
         return output
 
 class MiniRainBlock(nn.Module):
