@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """MiniRainVLM 全链路测试：collator 位置编码 / 双向 mask / 嵌入注入 / 前后向 / generate"""
 import argparse, os, sys, torch
+from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _device import add_device_args, list_gpus, resolve_device
 from transformers import AutoTokenizer
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from architectures.config import RainConfig
 from architectures.rain_v import MiniRainVForCausalLM, build_2d_position_embeddings
 from components.attention import MoTGroupQueryAttention, GroupQueryAttention
@@ -223,6 +225,47 @@ gen2 = model.generate(input_ids=prompt["input_ids"].to(DEVICE),
                       max_new_tokens=4, num_return_sequences=3, do_sample=True, temperature=1.0)
 check("num_return_sequences=3 形状", gen2.shape[0] == 3, f"got {gen2.shape}")
 
+# 位置回归: decode 首个 token 位置 = 各样本 prompt max(row)+1（无 +1 偏移、逐样本独立）
+pos1 = prompt["positions"].to(DEVICE)
+pos_b = torch.cat([pos1, pos1 + torch.tensor([[[10, 10]]], device=DEVICE)], dim=0)
+ids_b = prompt["input_ids"].to(DEVICE).repeat(2, 1)
+am_b = prompt["attention_mask"].to(DEVICE).repeat(2, 1)
+pv_b = [x.to(DEVICE) for x in prompt["pixel_values"]] * 2
+seen_pos, orig_vlm_fwd = [], vlm.forward
+def spy_pos(*a, **kw):
+    p = kw.get("positions")
+    seen_pos.append(None if p is None else p[..., 0].flatten().tolist())
+    return orig_vlm_fwd(*a, **kw)
+vlm.forward = spy_pos
+_ = model.generate(input_ids=ids_b, positions=pos_b, attention_mask=am_b, pixel_values=pv_b,
+                   max_new_tokens=2, do_sample=False, eos_token_id=None)
+vlm.forward = orig_vlm_fwd
+exp_pos = [int(pos_b[i, ..., 0].max().item()) + 1 for i in range(2)]
+check("decode 位置: 首 token == max+1 且逐样本独立", seen_pos[1] == exp_pos,
+      f"got {seen_pos[1]} exp {exp_pos}")
+
+# num_return_sequences>1 且 batch>1: 图像必须与序列一一对齐
+pixel_tags = [torch.zeros(3, 32, 32, device=DEVICE), torch.ones(3, 32, 32, device=DEVICE)]
+seen_pv, orig_model_fwd = [], model.forward
+def stub_forward(input_ids, pixel_values=None, **kw):
+    seen_pv.append([float(p.flatten()[0]) for p in (pixel_values or [])])
+    return SimpleNamespace(logits=torch.zeros(input_ids.shape[0], 1, cfg.vocab_size, device=DEVICE),
+                          past_key_values=None)
+model.forward = stub_forward
+_ = model.generate(input_ids=ids_b, positions=pos_b, attention_mask=am_b, pixel_values=pixel_tags,
+                   max_new_tokens=1, num_return_sequences=2, do_sample=False, eos_token_id=None)
+model.forward = orig_model_fwd
+check("nrs=2+batch=2: 图像顺序 [p0,p0,p1,p1]", seen_pv[0] == [0.0, 0.0, 1.0, 1.0], f"got {seen_pv[0]}")
+
+# use_cache=False + positions: 显式报错而不是形状崩溃
+try:
+    model.generate(input_ids=prompt["input_ids"].to(DEVICE), positions=pos1,
+                   pixel_values=[x.to(DEVICE) for x in prompt["pixel_values"]],
+                   max_new_tokens=1, use_cache=False)
+    check("use_cache=False+positions 显式报错", False)
+except ValueError:
+    check("use_cache=False+positions 显式报错", True)
+
 # 纯文本 generate(无 positions) 回归
 txt_only = col([{"image": None, "text": "你好"}])
 gen3 = model.generate(input_ids=txt_only["input_ids"].to(DEVICE),
@@ -251,6 +294,56 @@ gen_u = model_u.generate(input_ids=prompt["input_ids"].to(DEVICE),
 gen_u_ids = gen_u[0, prompt["input_ids"].shape[1]:].tolist()
 check("强制 argmax 下 27 仍不被生成(屏蔽生效)", IMG_ROW not in gen_u_ids,
       f"gen={gen_u_ids}")
+
+print("=" * 60); print("6. generate_hf: HF GenerationMixin 对接")
+print("=" * 60)
+prompt_ids = prompt["input_ids"].to(DEVICE)
+pos_h = prompt["positions"].to(DEVICE)
+am_h = prompt["attention_mask"].to(DEVICE)
+pv_h = [x.to(DEVICE) for x in prompt["pixel_values"]]
+
+gen_hf = model.generate_hf(input_ids=prompt_ids, positions=pos_h, attention_mask=am_h,
+                           pixel_values=pv_h, max_new_tokens=8, do_sample=False, eos_token_id=None)
+gen_old = model.generate(input_ids=prompt_ids, positions=pos_h, attention_mask=am_h,
+                         pixel_values=pv_h, max_new_tokens=8, do_sample=False, eos_token_id=None)
+check("generate_hf 与 generate 贪心结果一致", torch.equal(gen_hf, gen_old),
+      f"hf={gen_hf[0, -8:].tolist()} old={gen_old[0, -8:].tolist()}")
+check("generate_hf 新增长度 = max_new_tokens",
+      gen_hf.shape[1] == prompt_ids.shape[1] + 8, f"got {gen_hf.shape[1] - prompt_ids.shape[1]}")
+struct_hf = set(gen_hf[0, prompt_ids.shape[1]:].tolist()) & {IMG_START, IMG_END, IMG_PAD, 11, 13, IMG_ROW}
+check("generate_hf 不含视觉占位/边界/换行", len(struct_hf) == 0, f"got {struct_hf}")
+
+# 位置回归: generate_hf 的 decode 首 token 位置 = 各样本 prompt max(row)+1
+seen_pos_hf, orig_vlm_fwd = [], vlm.forward
+def spy_pos_hf(*a, **kw):
+    p = kw.get("positions")
+    seen_pos_hf.append(None if p is None else p[..., 0].flatten().tolist())
+    return orig_vlm_fwd(*a, **kw)
+vlm.forward = spy_pos_hf
+_ = model.generate_hf(input_ids=ids_b, positions=pos_b, attention_mask=am_b, pixel_values=pv_b,
+                      max_new_tokens=2, do_sample=False, eos_token_id=None)
+vlm.forward = orig_vlm_fwd
+check("generate_hf decode 位置: max+1 且逐样本独立", seen_pos_hf[1] == exp_pos,
+      f"got {seen_pos_hf[1]} exp {exp_pos}")
+
+# num_return_sequences>1 且 batch>1: 图像必须与序列一一对齐（HF 只展开 tensor，list 需自展开）
+seen_pv_hf = []
+def stub_forward_hf(input_ids, pixel_values=None, **kw):
+    seen_pv_hf.append([float(p.flatten()[0]) for p in (pixel_values or [])])
+    return MoeCausalLMOutputWithPast(logits=torch.zeros(input_ids.shape[0], 1, cfg.vocab_size, device=DEVICE),
+                                     past_key_values=None)
+model.forward = stub_forward_hf
+_ = model.generate_hf(input_ids=ids_b, positions=pos_b, attention_mask=am_b, pixel_values=pixel_tags,
+                      max_new_tokens=1, num_return_sequences=2, do_sample=True, temperature=1.0)
+model.forward = orig_model_fwd
+check("generate_hf nrs=2+batch=2: 图像顺序 [p0,p0,p1,p1]",
+      seen_pv_hf[0] == [0.0, 0.0, 1.0, 1.0], f"got {seen_pv_hf}")
+
+# 纯文本 generate_hf(无 positions，位置由 cache 长度自动推导)
+gen3_hf = model.generate_hf(input_ids=txt_only["input_ids"].to(DEVICE),
+                            attention_mask=txt_only["attention_mask"].to(DEVICE),
+                            max_new_tokens=4, do_sample=False)
+check("generate_hf 纯文本无 positions 生成", gen3_hf.shape[1] >= txt_only["input_ids"].shape[1] + 1)
 
 print("=" * 60)
 print(f"结果: {len(passed)} PASS, {len(failed)} FAIL")

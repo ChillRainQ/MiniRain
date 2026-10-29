@@ -2,6 +2,7 @@ import torch
 import math
 import torch.nn as nn
 from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 from architectures.config import RainConfig
@@ -102,6 +103,22 @@ def build_position_embeddings(positions, modality_mask, cos1d, sin1d, cos2d, sin
     sin_i = torch.cat([sin_i, sin_i], dim=-1)
     is_img = modality_mask.unsqueeze(-1)
     return torch.where(is_img, cos_i, cos_t), torch.where(is_img, sin_i, sin_t)
+
+
+# config 未暴露、但同样属于视觉占位的 token：11=<|vision_pad|>，13=<|video_pad|>
+EXTRA_VISION_TOKENS = (11, 13)
+
+
+class VisionTokenBanLogitsProcessor(LogitsProcessor):
+    """屏蔽视觉占位/边界 token，避免文本生成串进图像 token（HF generate 用）。"""
+
+    def __init__(self, banned_ids, device="cpu"):
+        self.banned_ids = torch.as_tensor(sorted({int(i) for i in banned_ids}),
+                                          dtype=torch.long, device=device)
+
+    def __call__(self, input_ids, scores):
+        scores.index_fill_(-1, self.banned_ids.to(scores.device), float("-inf"))
+        return scores
 
 
 class MiniRainVLM(nn.Module):
@@ -295,23 +312,26 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                  max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2,
                  streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                  repetition_penalty=1.0, **kwargs):
+        return_kv = kwargs.pop("return_kv", False)
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         if positions is not None: positions = positions.repeat(num_return_sequences, 1, 1)
         if pixel_values is not None and num_return_sequences > 1:
-            pixel_values = list(pixel_values) * num_return_sequences
+            # 与 input_ids.repeat 对齐：每条样本连续复制 nrs 份（list*nrs 是整批循环，会导致图错配）
+            pixel_values = [p for p in pixel_values for _ in range(num_return_sequences)]
         past_key_values = kwargs.pop("past_key_values", None)
-        # 记录 prompt 末尾的位置编号：图像段占用了额外的行号，
-        # decode 新 token 的位置必须从这里+1继续，不能用 past_len
-        next_pos = int(positions[..., 0].max().item()) + 1 if positions is not None else None
+        if not use_cache and positions is not None:
+            raise ValueError("use_cache=False 时 positions 需随序列增长，暂不支持带图 prompt；请改用 use_cache=True")
+        # 每个样本独立维护下一个位置：图像段占用了额外的行号，不能用 past_len；[B]
+        next_pos = positions[..., 0].max(dim=1).values + 1 if positions is not None else None
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         if streamer: streamer.put(input_ids.cpu())
         for _ in range(max_new_tokens):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
             step_positions = None
             if next_pos is not None and past_len > 0:
-                # decode 阶段：行=列=连续编号，接在 prompt 末尾之后
-                pos = torch.full((input_ids.shape[0], 1), next_pos, dtype=torch.long, device=input_ids.device)
+                # decode 阶段：逐样本接在各自 prompt 末尾之后（行=列）
+                pos = next_pos.view(-1, 1)
                 step_positions = torch.stack([pos, pos], dim=-1)
             outputs = self.forward(
                 input_ids[:, past_len:],
@@ -321,7 +341,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values=past_key_values, use_cache=use_cache,
                 logits_to_keep=1 if past_len == 0 else 0,  # prefill 只留最后一个
                 **kwargs)
-            if next_pos is not None: next_pos += 1
+            if step_positions is not None: next_pos = next_pos + 1
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
             # 禁止生成视觉占位/边界 token（含换行 img_row），防止输出污染
@@ -346,5 +366,65 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 finished |= next_token.squeeze(-1).eq(eos_token_id)
                 if finished.all(): break
         if streamer: streamer.end()
-        if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
+        if return_kv: return {'generated_ids': input_ids, 'past_kv': past_key_values}
         return input_ids
+
+    # ---------------------------------------------------------------- HF generate 对接
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
+
+    @staticmethod
+    def _vision_token_ids(config):
+        return (config.img_start_token, config.img_end_token, config.img_patch_token,
+                config.img_row_token) + EXTRA_VISION_TOKENS
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None,
+                                      positions=None, pixel_values=None, **kwargs):
+        kwargs.pop("next_sequence_length", None)   # 由 past_len 统一推导，避免两套口径
+        kwargs.pop("is_first_iteration", None)
+        past_len = 0
+        if past_key_values and past_key_values[0] is not None:
+            past_len = past_key_values[0][0].shape[1]
+        model_inputs = {
+            "input_ids": input_ids[:, past_len:],
+            "past_key_values": past_key_values,
+            "positions": positions[:, past_len:] if positions is not None else None,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values if past_len == 0 else None,
+        }
+        model_inputs.update(kwargs)
+        return model_inputs
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder=False,
+                                            num_new_tokens=1):
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs, model_kwargs, is_encoder_decoder=is_encoder_decoder, num_new_tokens=num_new_tokens)
+        positions = model_kwargs.get("positions")
+        if positions is not None:
+            nxt = positions[..., 0].max(dim=1).values + 1                      # [B]
+            offs = torch.arange(num_new_tokens, device=positions.device)
+            rows = nxt.unsqueeze(1) + offs                                     # [B, n]
+            step = torch.stack([rows, rows], dim=-1).to(positions.dtype)       # [B, n, 2]
+            model_kwargs["positions"] = torch.cat([positions, step], dim=1)
+        return model_kwargs
+
+    @torch.inference_mode()
+    def generate_hf(self, inputs=None, pixel_values=None, positions=None, attention_mask=None,
+                    max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2,
+                    streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
+                    repetition_penalty=1.0, **kwargs):
+        """走 HF GenerationMixin 的 generate"""
+        input_ids = kwargs.pop("input_ids", inputs)
+        if pixel_values is not None and num_return_sequences > 1:
+            pixel_values = [p for p in pixel_values for _ in range(num_return_sequences)]
+        logits_processor = LogitsProcessorList([
+            VisionTokenBanLogitsProcessor(self._vision_token_ids(self.config), input_ids.device)
+        ])
+        return super().generate(
+            input_ids=input_ids, pixel_values=pixel_values, positions=positions,
+            attention_mask=attention_mask, logits_processor=logits_processor,
+            max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+            eos_token_id=eos_token_id, streamer=streamer, use_cache=use_cache,
+            num_return_sequences=num_return_sequences, do_sample=do_sample,
+            repetition_penalty=repetition_penalty, **kwargs)

@@ -28,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument("--block_size", default=2, type=int, help="块大小")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true',
                         help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
-    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--max_new_tokens', default=128, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.8, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--open_thinking', default=1, type=int, help="是否开启自适应思考（0=否，1=是）")
@@ -78,7 +78,7 @@ if __name__ == '__main__':
 
         print('🧠: ', end='')
         st = time.time()
-        generated_ids = model.generate(
+        generated_ids = model.generate_hf(
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
