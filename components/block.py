@@ -47,9 +47,8 @@ class BlockAttnRes(nn.Module):
         :return:
         """
         hs = inter_block_history + [partial_block]
-        if len(hs) == 1:   # 单候选：alpha=1，等价原样透传
-            return partial_block
         # 一次性堆叠算 norm/logits，避免逐候选的 Python 循环（decode 时是 launch-bound 主因）
+        # 注意：单候选时不早退，否则 q/norm 拿不到 0 梯度而变成 None（DDP/优化器会判为未使用参数）
         V = torch.stack(hs, dim=0)                                        # [N, B, T, D]
         logits = (self.attn_res_norm(V) * self.attn_res_query).sum(dim=-1)  # [N, B, T]
         alpha = torch.softmax(logits.float(), dim=0).to(partial_block.dtype)
