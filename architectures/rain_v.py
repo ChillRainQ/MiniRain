@@ -168,14 +168,10 @@ class MiniRainVLM(nn.Module):
 
         return inputs_embeds
 
-    def _build_image_bidirectional_mask(self, input_ids, attention_mask, dtype):
-        device = input_ids.device
-        bsz, seq_len = input_ids.shape
-        img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
-                               dtype=torch.long, device=device)
-        is_img = torch.isin(input_ids, img_ids)  # [B, S]
+    def _build_image_bidirectional_mask(self, is_img, is_start, attention_mask, dtype):
+        device, seq_len = is_img.device, is_img.shape[1]
         # 段号：每遇到一个 <|vision_start|> 递增，同一张图的 token 段号相同
-        seg = torch.cumsum((input_ids == self.img_start).long(), dim=1)  # [B, S]
+        seg = torch.cumsum(is_start.long(), dim=1)  # [B, S]
         same_img = is_img.unsqueeze(2) & is_img.unsqueeze(1) & \
                    (seg.unsqueeze(2) == seg.unsqueeze(1))  # 同段才双向
         causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
@@ -205,17 +201,17 @@ class MiniRainVLM(nn.Module):
             if not has_pad:
                 attention_mask = None
 
+        # 模态掩码：0=文本 1=图像 2/3 预留（后续细分视觉子模态时启用）
+        # 只解析一次：图 mask 复用这里的 is_img_tok / is_start
+        img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
+                               dtype=torch.long, device=input_ids.device)
+        is_img_tok = torch.isin(input_ids, img_ids)                  # [B,S] bool
+        modality_mask = is_img_tok.long()
+
         image_bidirectional_mask = None
         if pixel_values is not None:
             image_bidirectional_mask = self._build_image_bidirectional_mask(
-                input_ids, attention_mask, hidden_states.dtype)
-
-        # 图像 token mask：无条件计算（一次 isin，开销可忽略），
-        # 同时服务 rope 选路（bool）和 MoT/attention 路由（long，保持原类型）
-        img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
-                               dtype=torch.long, device=input_ids.device)
-        is_img_tok = torch.isin(input_ids, img_ids)                 # [B,S] bool
-        modality_mask = is_img_tok.long()                           # 给 layer/MoT，保持原语义
+                is_img_tok, input_ids == self.img_start, attention_mask, hidden_states.dtype)
 
         if positions is None:  # 纯文本路径：行=列=下标
             pos = torch.arange(start_pos, start_pos + seq_length, device=input_ids.device)

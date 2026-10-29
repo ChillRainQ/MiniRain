@@ -86,6 +86,11 @@ is_mot = isinstance(attn0, MoTGroupQueryAttention)
 img_ids_t = torch.tensor([IMG_START, IMG_END, IMG_PAD, IMG_ROW], dtype=torch.long, device=DEVICE)
 print(f"  注意力类型: {type(attn0).__name__}")
 
+def build_img_mask(ids, am, dtype):
+    """测试入口：先解析 is_img/is_start，再交给 mask 构造器（与模型内共享解析一致）。"""
+    is_img = torch.isin(ids, img_ids_t)
+    return vlm._build_image_bidirectional_mask(is_img, ids == IMG_START, am, dtype)
+
 # 混合序列: 1 图(R=2,C=2) + 文本，单样本无 padding
 mix = col([{"image": torch.rand(3, 32, 32), "text": "甲乙丙"}])
 mix_ids = mix["input_ids"].to(DEVICE)
@@ -144,7 +149,7 @@ print("=" * 60)
 batch2 = col([{"image": torch.rand(3, 32, 32), "text": "甲乙丙"},     # R=2,C=2
               {"image": torch.rand(3, 32, 32), "text": "丁"}])
 input_ids = batch2["input_ids"].to(DEVICE)
-mask = vlm._build_image_bidirectional_mask(input_ids, batch2["attention_mask"].to(DEVICE), torch.float32)
+mask = build_img_mask(input_ids, batch2["attention_mask"].to(DEVICE), torch.float32)
 allow = (mask[0, 0] == 0)  # [S, S] True=可见
 ids0 = input_ids[0].tolist()
 img_idx = [i for i, t in enumerate(ids0) if t in (IMG_START, IMG_END, IMG_PAD, IMG_ROW)]
@@ -159,7 +164,7 @@ check("图像不可见未来文本", not any(allow[img_idx[0], t].item() for t i
 ids_2img, pos_2img, _, _ = col.encode_sample(torch.rand(3, 32, 32), "中间")  # 只占位
 seg_ids = [IMG_START, IMG_PAD, IMG_END] + [IMG_START, IMG_PAD, IMG_END]
 seg_ids = torch.tensor([[BOS] + seg_ids + [EOS]], device=DEVICE)
-m2 = vlm._build_image_bidirectional_mask(seg_ids, None, torch.float32)[0, 0]
+m2 = build_img_mask(seg_ids, None, torch.float32)[0, 0]
 g1 = [1, 2, 3]; g2 = [4, 5, 6]
 # 语义记录: allow = causal | same_img → 图2 作为"之后的token"可因果地看见图1（与docstring"跨段隔离"不一致，待确认）
 check("跨图: 图2 可见 图1(causal 并集语义)", all((m2[i, j] == 0).item() for i in g2 for j in g1))
@@ -169,7 +174,7 @@ check("图1 内部双向", all((m2[i, j] == 0).item() for i in g1 for j in g1))
 # padding 屏蔽
 padded = torch.tensor([[BOS, IMG_START, IMG_PAD, IMG_END, 5, PAD]], device=DEVICE)
 pam = torch.tensor([[1, 1, 1, 1, 1, 0]], device=DEVICE)
-m3 = vlm._build_image_bidirectional_mask(padded, pam, torch.float32)[0, 0]
+m3 = build_img_mask(padded, pam, torch.float32)[0, 0]
 check("padding 作为 key 被屏蔽", (m3[:, 5] == float('-inf')).all().item())
 
 print("=" * 60); print("4. 嵌入注入与前向/反向")

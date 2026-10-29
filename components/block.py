@@ -198,8 +198,9 @@ class BlockAttnResBlock(nn.Module):
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         # MoTFFN 期望 img_idx（索引），从 modality_mask 转换；其他 MLP 不接受此参数
+        # 当前 1=图像统一走 mlp_v；2/3 为后续视觉子模态预留，届时在此按 id 分派
         if isinstance(self.mlp, MoTFFN):
-            img_idx = (modality_mask.reshape(-1) == 1).nonzero(as_tuple=True)[0] if modality_mask is not None else None
+            img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0] if modality_mask is not None else None
             mlp_out = self.mlp(mlp_input, img_idx=img_idx)
         else:
             mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))

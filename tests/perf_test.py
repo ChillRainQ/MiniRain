@@ -393,8 +393,9 @@ def section_memory(args, model, cfg):
 
         for s in (2048, 4096):
             fake = torch.randint(100, 16000, (1, s), device=args.device)
-            mem = peak_mb(lambda: model.model._build_image_bidirectional_mask(fake, None, torch.bfloat16),
-                          args.device)
+            no_img = torch.zeros_like(fake, dtype=torch.bool)  # 纯文本 id → 无图像段
+            mem = peak_mb(lambda: model.model._build_image_bidirectional_mask(
+                no_img, no_img, None, torch.bfloat16), args.device)
             resident = s * s * 2 / 2 ** 20  # 单份 [B,1,S,S] bf16
             print(f"  {'图像 mask S=' + str(s):<24}常驻 {resident:>7.1f} MB  构建峰值 +{mem:>7.1f} MB")
 
