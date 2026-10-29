@@ -5,6 +5,9 @@ import time
 import torch
 from transformers import PreTrainedConfig, AutoTokenizer, TextStreamer
 from pathlib import Path
+
+import project
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from architectures.config import RainConfig
 from train.train_util import init_model
@@ -50,7 +53,7 @@ if __name__ == '__main__':
                         block_attn_res=bool(args.use_block_attn_res),
                         full_attn_res=bool(args.use_full_attn_res))
 
-    model, tokenizer = init_model(config, from_weight=args.from_weight)
+    model, tokenizer = init_model(config, from_weight=args.from_weight, tokenizer_path=project.TOKENIZER_PATH)
     prompts = [
         '你有什么特长？',
         '为什么天空是蓝色的',
