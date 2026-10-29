@@ -111,8 +111,7 @@ def free():
 def build_model(args):
     kw = dict(BASE_CFG)
     kw.update(hidden_size=args.hidden, n_hidden_layers=args.layers,
-              block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale,
-              attn_res_checkpoint=args.attn_res_ckpt)
+              block_size=args.block_size, vision_ffn_scale=args.vision_ffn_scale)
     cfg = RainConfig(**kw)
     model = MiniRainVForCausalLM(cfg).to(args.device).to(DTYPES[args.dtype])
     if args.compile:
@@ -278,7 +277,7 @@ def section_train(args, model, total_mb):
 # ---------------------------------------------------------------- 入口
 def main():
     p = argparse.ArgumentParser(description="MiniRainVLM 训练步基准（独立版）")
-    p.add_argument("--device", default="cuda:5" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
@@ -289,8 +288,6 @@ def main():
     p.add_argument("--block-size", type=int, default=BASE_CFG["block_size"])
     p.add_argument("--vision-ffn-scale", type=int, default=BASE_CFG["vision_ffn_scale"])
     p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--no-attn-res-ckpt", dest="attn_res_ckpt", action="store_false",
-                   help="关闭聚合段梯度检查点（换回 ~8% 速度，显存上升）")
     p.add_argument("--text-len", type=int, default=256)
     p.add_argument("--compile", action="store_true", default=True,
                    help="torch.compile（默认开启，--no-compile 关闭）")
