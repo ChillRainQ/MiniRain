@@ -21,7 +21,11 @@
     "<tts_pad>",
     "<tts_text_bos>",
     "<tts_text_eod>",
-    "<tts_text_bos_single>"
+    "<tts_text_bos_single>",
+    "<cpu_call>",
+    "</cpu_call>",
+    "<cpu_response>",
+    "</cpu_response>"
   ],
   "model_max_length": 131072,
   "pad_token": "<|endoftext|>",
