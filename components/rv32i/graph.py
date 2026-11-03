@@ -15,7 +15,7 @@ attention）：
   1. 头不经过 fla 的 Gated DeltaNet。读就是一次 k-hot 求和，没有逐行 RMSNorm，
      所以状态行不需要 ballast 列（省掉 REF_COLS / A_REF / kernel_check）。
   2. 衰减由整数选择子 a in {0,1,2} 直接给出 {1, 0.5, 0}，不用 Qwen 的 exp(dt_bias) 表。
-  3. 状态表按 bank 命名（cnt/rom/rom_raw/regs/quo/ram0/ram1），宽度任意，不由 head_dim 决定。
+  3. 状态表按 bank 命名（cnt/rom/rom_raw/regs/quo/ram0..15/drom），宽度任意，不由 head_dim 决定。
 
 写规则：key 是 one-hot，于是 gated delta 的 beta*(v - k^T S) 就退化成整行覆写，读是
 k-hot 求和。两边都不需要 Qwen/fla 的逐行 RMSNorm，也不需要 exp(dt_bias) 衰减表——
@@ -53,8 +53,16 @@ ALPHA = {0: 1.0, 1: 0.5, 2: 0.0}   # 整数选择子 -> 每 token 的衰减
 RESIDUAL_MAX = 2.0 ** 28           # 超过它，RMSNorm 的分母就不再只由 ballast 决定
 
 BANKS = {                          # bank -> 每行最少列数（0 表示由 Head 自己声明）
-    "cnt": 1, "rom": 1, "rom_raw": 1, "regs": 1, "quo": 1, "ram0": 1, "ram1": 1,
+    "cnt": 1, "rom": 1, "rom_raw": 1, "regs": 1, "quo": 1,
+    # `<cpu_call>` 文本桥（`circuit.text_buffer`）：armed 1×1、cap 1×8、tbuf 160×64
+    "armed": 1, "cap": 1, "tbuf": 1,
 }
+#: RAM 的 16 块 bank（`circuit.RAM_BANKS`）：bank 是字索引的高 4 位，每块 512 行。
+#: bank 越多行选择越便宜、列越贵，16 块是 8192 字下 dim 的拐点（见 `circuit.ram_table`）。
+BANKS.update({f"ram{i}": 1 for i in range(16)})
+#: 只读数据段（`circuit.drom_table`）。一个 head 挂 13 个兄弟 value head，每块 512 行 ×
+#: 32 位——与 RAM 的一块 bank 同形，只是没有写口。
+BANKS["drom"] = 1
 
 
 # ---------------- 线性形式 ----------------
@@ -175,6 +183,8 @@ class Head:
     into: bool = False
     vx: list[VHead] = field(default_factory=list)
     init: list[dict[int, np.ndarray]] | None = None   # 每个 value head 的初值：行 -> 列值
+    #: 行可以**短于** `cols`，缺的列按 0（见 `_init_row`）：写口往表里追加列之后，
+    #: 建设方在建设前拿不到最终列数（`circuit.step_circuit` 的链接值就是后加的）。
     levels: str = "bit"                  # "bit" | "byte" | "decay"
 
     def vheads(self) -> list[VHead]:
@@ -384,16 +394,22 @@ def inputs(node: FFN | Head):
                 for d in e.terms:
                     yield d, True
         return
-    for ch in (node.q, node.k, node.v):
+    for ch in (node.q, node.k):            # q/k 是 head 级的，各套 value 共用
         for c in ch.values():
             for d in c.expr.terms:
                 yield d, bool(c.taps[0])
-    for e in (node.a, *node.z.values()):
-        for d in e.terms:
-            yield d, True
-    if node.beta is not None:
-        for d in node.beta.terms:
-            yield d, True
+    # value 拷贝可能不止一套（ROM 分页就是 101 个兄弟 value head），必须逐套走：
+    # 漏掉 vx 会让 `check_dag` 看不见它们的依赖，成环也就不会报。
+    for vh in node.vheads():
+        for c in vh.v.values():
+            for d in c.expr.terms:
+                yield d, bool(c.taps[0])
+        for e in (vh.a, *vh.z.values()):
+            for d in e.terms:
+                yield d, True
+        if vh.beta is not None:
+            for d in vh.beta.terms:
+                yield d, True
 
 
 # ---------------- 数值求值：float64 理想值 + bf16 硬件模拟 ----------------
@@ -562,6 +578,20 @@ def eval_ffn(node: FFN, m: np.ndarray, check: bool) -> None:
     m[:, node.out] = ideal
 
 
+def _init_row(row, cols: int, name: str) -> np.ndarray:
+    """`init` 的一行 -> 长度 `cols` 的 float64 行。
+
+    **允许短于 `cols`**：`circuit.record_row` 只填“刚被写进去”的那些列，而表的列数
+    还会被之后接上的写口追加（寄存器的链接值就追加了 5 列），调用方在建设前拿不到
+    最终列数。缺的列按 0——与 `compile._head_layer` 的 `S0[r, :len(vals)] = vals` 同义，
+    所以 J1 的容差 0 不受影响。长过列数就是写错了，直接抛。
+    """
+    a = np.array([float(v) for v in row], dtype=np.float64)
+    if a.size > cols:
+        raise ValueError(f"{name}.init: 行宽 {a.size} > 列数 {cols}")
+    return a if a.size == cols else np.pad(a, (0, cols - a.size))
+
+
 def eval_head(node: Head, m: np.ndarray, check: bool, carry: dict | None = None,
               ni: int = 0) -> None:
     carry = {} if carry is None else carry
@@ -608,7 +638,7 @@ def eval_head(node: Head, m: np.ndarray, check: bool, carry: dict | None = None,
             state = carry[ni, "S", x_]
         else:
             init = (node.init or [{}] * (x_ + 1))
-            state = ({r: np.asarray(row, dtype=np.float64).copy()
+            state = ({r: _init_row(row, node.cols, node.name)
                       for r, row in init[x_].items()} if x_ < len(init) else {})
             if check and state:
                 rows = np.stack(list(state.values()))
@@ -734,4 +764,4 @@ if __name__ == "__main__":
     _demo()
 
 
-# 待办（下一轮）：把 RV32 的每个算子写成本文件里的节点；编译期再写 emit（Expr -> 权重）。
+# 待办（下一轮）：把 RV32 的每个算子写成本文件里的节点；编译期再写 compile（Expr -> 权重）。

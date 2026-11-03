@@ -1,422 +1,530 @@
 """
-【已废弃】M0 按 plan.md §2 退役本文件，M2 会整份重写为 graph.py 的设备侧执行器。
-保留至今的唯一原因：下面的 npz schema 是 from_weights() 报错信息的锚点。
-它为什么不能用（host 在 float64 里扮演 attention）见 plan.md §2.3。
+chipformer.py: M2 执行器 —— 把 compile.py 编出来的权重跑成残差序列。
 
+plan.md §3 的 cpu 层。入参是 compile 落盘的 {"manifest", "state"}，出参是每个 token
+之后的残差。**bf16 权重 + fp32 累加，张量里不出现 float64**。
 
-MiniRainVLM-CPU 神经 CPU（载体轨 v8.1）
+它不认识 dim，也不认识指令：只有矩阵乘、状态表和残差坐标。哪些槽是寄存器、哪些位是指令，
+全在 compile 编出来的坐标里，这个文件一个名字都不出现。所以 M3 换成 52 条指令的图，
+这里一行都不用改 —— 这是"没有硬布线"的判据。
 
-本文件只有机制原语；语义全部在 npz 权重与 manifest 里，host 不认识指令/寄存器。
+残差形状（manifest 给）：
+    x = [host(d0) | chip(n_dims) | 零区 | ballast(m)]
+ballast 每维填 2^log2_ballast，只为让 RMSNorm 的分母恒等于 2^log2_den。它不参与任何权重
+读取 —— compile 那边用 touched 掩码验过了。
 
-npz schema（emit.py 必须按此产出）：
-  manifest_json  dict:
-      d_stream     int    流宽
-      d_ff         int>=1 ProgFFN 隐层宽（0 会退化成常数层）
-      feat         dict   协议特征坐标：fam_oh[13] / pay[16] 必给；
-                          fin / is_qs / is_qd / is_jr / pay_hi / qdigit 可选（各 1 个坐标）
-      qdigit_scale int    商数字填充倍率（默认 0x11111111）
-      lag_blocks   [int]  tap 块起点；块宽 = len(feat_coords)，与坐标取值无关
-      code_coords  [20]   exit 预测码坐标（NFAM 4 + NPAY 16）
-      layers       [{attn_reads: [[bank, addr_c, out_c, w]], mlp: bool}]
-      prewrites    [[bank, addr, val, beta, w?]]   层栈之前提交（本 token 的层可读）
-      writes       [[bank, addr, val, beta, w?]]   层栈之后提交（下一 token 读）
-      strict       bool   验收轨：地址/门控/值非精确整数即抛 ExactnessError
-  W_{rom,rom_raw,cnt,regs,quo,ram0,ram1}      状态快照，形状同 ChipState
-  L<i>_{Wa,Wb,V,Wo}_{weight,bias}              第 i 层 ProgFFN 权重（i 从 1 起）
+一个 token 的次序（与 compile.run 逐句同构，只差精度）：
 
-调度表条目取值：int = 流坐标（val 取 x[c:c+w]），float = 结构常数（绝对行 / 常数）；
-  ["regs", 5,   3, 1.0] -> regs[x[5]] = x[3]
-  ["regs", 5.0, 3, 1.0] -> regs[5]    = x[3]
-银行列数：cnt 1 / rom 5 / rom_raw 1 / regs 1 / quo 1 / ram0 1 / ram1 1。
-坐标区间左闭右开且两两不交叠（feat / lag_blocks / code_coords / attn 输出）。
+    FFN   gate = bf16(Wb @ x);   up = bf16(Wa @ x)
+          h    = bf16(relu(gate) * up);   x[rows] += bf16(Wo @ h)
+
+    Head  p     = W @ x                      q/k/v 每个通道一行
+          v     = relu(Σ_lag taps[lag] · p_{t-lag})      lag 0 是本 token
+          alpha = Walpha @ x  == 1 - 0.5·sel
+          S    <- S·alpha;  S[k] <- v;  o = Σ q 选中的行
+          x[d] += o[col]·relu(z[col])·w
+
+    末尾快照  carry[("h", ...)] <- W @ x     用的是本 token 最终的 x
+
+最后那一步是唯一一处容易写错的地方：被 taps 引用的 dim 往往在本 token 更晚才算出来
+（寄存器的写值就是 ALU 的结果，而读口在 ALU 之前），投影当下看到的是 0，只有 token
+末尾的快照才看得到结果。这就是"写回"在权重里的全部含义。
+
+为什么 fp32 够：每个中间量要么本来就是 bf16 值（fp32 是它的超集，装得下且无损），要么是
+"小整数 × 2 的幂"这种能精确表示的数。乘法和累加都不产生需要 25 位以上尾数的中间结果，
+所以 fp32 累加与 compile.run 的 float64 累加逐位相同，J1 的容差仍然卡在 0。
+taps 的滞后组合走 python float（双精度），它是标量控制流而不是数据通路，且参与的每个值
+都能被 fp32 精确表示，所以不破坏上面那条。
+
+和另外两条路的分工：
+    graph.evaluate   dim 语义，float64 理想值 + bf16 模拟 —— "电路对不对"的真身
+    compile.run      权重语义，float64 累加 —— 验"compile 编对了没有"（J1）
+    chipformer.py    权重语义，fp32 累加 —— 验"权重装进 nn.Module 之后行为不变"（M2）
+
+权重全部是 register_buffer，不是 nn.Parameter：它们由 compile 现算，没有一个是训出来的。
 """
 
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_DIRECT = __package__ in (None, "")
+if _DIRECT:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "components.rv32i"
 
-FAMILIES = {
-    "NT": 0, "V": 15, "F0": 15, "F1": 15, "F2": 2,
-    "J": 16, "R": 16, "ST": 16, "SS": 0, "QS": 4, "QD": 7, "HALT": 0, "BYTE": 9,
-}
-FAM_ID = {n: i for i, n in enumerate(FAMILIES)}
-NFAM = max(1, (len(FAMILIES) - 1).bit_length())
-NPAY = 16
-TOKENS = [(f, p) for f, w in FAMILIES.items() for p in range(1 << w)]
-VOCAB = len(TOKENS)
-TOK_ID = {t: i for i, t in enumerate(TOKENS)}
-FINAL = ("NT", "V", "F2", "J", "R", "ST", "SS", "HALT", "BYTE")
-IS_FINAL = torch.tensor([1.0 if TOKENS[t][0] in FINAL else 0.0 for t in range(VOCAB)])
-MARGIN_T = 2.0 ** 20    # GLU 大门（silu(t·g)/t 对整数门精确）
+from .graph import ALPHA, ExactnessError, silu_ok
+
+DTYPE = torch.bfloat16             # 权重的存储与存取精度：设备侧读什么就存什么
+ACC = torch.float32                # 累加精度。设备侧没有 float64
+HIST = 3                           # taps 最多 4 段，所以每路只留 3 个历史
 
 
-# ---------------- 机制原语（结构常数，无语义） ----------------
+# ---------------- 精确性（fp32 版，与 compile.py 那套同义） ----------------
 
-class ExactnessError(RuntimeError):
-    """精确性违约：地址/门控/值不是精确整数（验收轨抛出，替代静默降级）。"""
-
-
-def onehot_val(v: torch.Tensor, n: int, strict: bool = False) -> torch.Tensor:
-    v = torch.as_tensor(v, dtype=torch.float64)
-    if strict:
-        fv = float(v)
-        if fv != round(fv):
-            raise ExactnessError(f"onehot_val: 非整数地址 {fv}")
-        if not 0 <= fv < n:
-            raise ExactnessError(f"onehot_val: 地址 {fv} 越界 [0, {n})")
-    r = torch.arange(n, dtype=torch.float64)
-    return torch.relu(v - r + 1.0) - 2.0 * torch.relu(v - r) + torch.relu(v - r - 1.0)
+def rnd(t: torch.Tensor) -> torch.Tensor:
+    """按 bf16 存取一次再回到 fp32。设备侧每个中间量都要过这道门。"""
+    return t.to(DTYPE).to(ACC)
 
 
-def stream_val(x: torch.Tensor, e, w: int = 1) -> torch.Tensor:
-    """调度表取值：int = 流坐标（x[e] / x[e:e+w]），float = 结构常数（必须 float64）。"""
-    if isinstance(e, int):
-        return x[e] if w == 1 else x[e:e + w]
-    return torch.tensor(float(e), dtype=torch.float64)
+def is_bf16(t) -> torch.Tensor:
+    t = torch.as_tensor(t, dtype=ACC)
+    return (rnd(t) == t) & torch.isfinite(t)
 
 
-class WritePort:
-    def __init__(self, strict: bool = False) -> None:
-        self.ops: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self.strict = strict
-
-    def write(self, bank: str, addr, value, beta) -> None:
-        self.ops.append((bank, torch.as_tensor(addr, dtype=torch.float64),
-                         torch.as_tensor(value, dtype=torch.float64),
-                         torch.as_tensor(beta, dtype=torch.float64)))
-
-    def apply(self, state: "ChipState") -> None:
-        for bank, addr, v, beta in self.ops:
-            S = getattr(state, bank)
-            if self.strict:
-                fb, fa = float(beta), float(addr)
-                if fb not in (0.0, 1.0):
-                    raise ExactnessError(f"WritePort: beta={fb} 非精确 0/1（{bank}）—— 半更新不可逆")
-                if fa != round(fa) or not 0 <= fa < S.shape[0]:
-                    raise ExactnessError(f"WritePort: 地址 {fa} 非法（{bank} 共 {S.shape[0]} 行）—— 静默丢写")
-                vv = torch.as_tensor(v, dtype=torch.float64)
-                if not bool(torch.all(vv == torch.round(vv))):
-                    raise ExactnessError(f"WritePort: {bank} 写入非整数值 {vv.reshape(-1).tolist()}")
-                if S.shape[1] > 1 and vv.numel() != S.shape[1]:
-                    raise ExactnessError(
-                        f"WritePort: {bank} 宽 {S.shape[1]} 列收到 {vv.numel()} 维值（标量广播被禁）")
-            k = onehot_val(addr, S.shape[0], self.strict)
-            delta = torch.as_tensor(v, dtype=torch.float64).reshape(-1) - (k @ S)   # (width,)
-            S.data += beta * torch.outer(k, delta)      # 任意宽度银行的行替换（beta=0 不动）
+def require(ok, what: str, x=None) -> None:
+    ok = torch.as_tensor(ok).reshape(-1).to(torch.bool)
+    if not bool(ok.all()):
+        v = torch.as_tensor(0.0 if x is None else x).reshape(-1).to(ACC)
+        i = int(torch.argmin(ok.to(torch.int8)))
+        raise ExactnessError(f"{what}: 坏值 {float(v[i])!r}")
 
 
-class ChipState(nn.Module):
-    """
-    CPU 状态
+def conv(taps_w, p: float, carry: dict, key) -> float:
+    """conv 投影 + relu。p 是本 token 的投影值，lag >= 1 取 carry 里的历史。"""
+    hist = carry.get(("h",) + key, ())
+    val = 0.0
+    for lag, wt in enumerate(taps_w):
+        if wt:
+            # 历史不足时那一路贡献 0，与 graph.conv 把 xx[:len-lag] 切片成空一致
+            val += wt * (p if lag == 0 else (hist[-lag] if lag <= len(hist) else 0.0))
+    return max(val, 0.0)
+
+
+# ---------------- 层 ----------------
+
+class FFN(nn.Module):
+    """一个 ffn 子层：nu 个 unit 共享三个矩阵，写回自己那几行。
+
+        gate = bf16(Wb @ x)          Wb 每行 = K·b
+        up   = bf16(Wa @ x)          Wa 每行 = a/K
+        h    = bf16(relu(gate)·up)   = a·relu(b)
+        x   += Wo @ h                Wo[slot, unit] = coef
+
+    旧 ProgFFN 是"relu 分支 + GLU 分支拼成 2·d_ff"，这里只有后者：graph 的项是
+    coef·a·relu(b)，a 本身不该过 relu，两条分支也不共用一个 unit 下标。没有 bias ——
+    bias 的角色由 dim 0 的 chip mask（常数 1）承担。
+
+    原地改 x：调用方持有本 token 私有的张量，省掉一次 hidden 宽的拷贝。
     """
 
-    def __init__(self, cfg) -> None:
+    def __init__(self, nu: int, hidden: int) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.register_buffer("cnt", torch.zeros(5, 1, dtype=torch.float64), persistent=False)      # anchor/n/j/v/divk0
-        self.register_buffer("rom", torch.zeros(cfg.rom_size // 4, 5, dtype=torch.float64), persistent=False)
-        self.register_buffer("rom_raw", torch.zeros(cfg.rom_size // 4, 1, dtype=torch.float64), persistent=False)
-        self.register_buffer("regs", torch.zeros(32, 1, dtype=torch.float64), persistent=False)
-        self.register_buffer("quo", torch.zeros(8, 1, dtype=torch.float64), persistent=False)
-        self.register_buffer("ram0", torch.zeros(cfg.ram_words // 2, 1, dtype=torch.float64), persistent=False)
-        self.register_buffer("ram1", torch.zeros(cfg.ram_words // 2, 1, dtype=torch.float64), persistent=False)
+        self.register_buffer("Wb", torch.zeros((nu, hidden), dtype=DTYPE))
+        self.register_buffer("Wa", torch.zeros((nu, hidden), dtype=DTYPE))
+        self.register_buffer("Wo", torch.zeros((hidden, nu), dtype=DTYPE))
+        self.register_buffer("rows", torch.zeros(hidden, dtype=torch.bool))
 
-
-# ---------------- 算术子层（ProgFFN：形状统一，权重逐层来自 npz） ----------------
-
-class ProgFFN(nn.Module):
-    """
-    可编程算术子层
-    """
-
-    def __init__(self, d_stream: int, d_ff: int) -> None:
-        super().__init__()
-        self.Wa = nn.Linear(d_stream, d_ff, bias=True)
-        self.Wb = nn.Linear(d_stream, d_ff, bias=True)
-        self.V = nn.Linear(d_stream, d_ff, bias=True)
-        self.Wo = nn.Linear(2 * d_ff, d_stream, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h1 = torch.relu(self.Wa(x))
-        h2 = F.silu(MARGIN_T * self.Wb(x)) * self.V(x) / MARGIN_T
-        return self.Wo(torch.cat([h1, h2]))
-
-
-
-class ChipLayer(nn.Module):
-    """
-    神经CPU TransformerBlock
-    """
-
-    def __init__(self, idx: int, layer: dict, d_stream: int, d_ff: int) -> None:
-        super().__init__()
-        self.name = f"L{idx + 1}"
-        self.attn_reads = layer.get("attn_reads", [])
-        self.has_mlp = bool(layer.get("mlp"))
-        if self.has_mlp:
-            self.ffn = ProgFFN(d_stream, d_ff)
-
-    def forward(self, x: torch.Tensor, state: ChipState, wp: WritePort) -> torch.Tensor:
-        # ---- attn 槽：状态读（Q = onehot_val(addr)，K/V = 状态 Parameter 行） ----
-        for bank, addr_c, out_c, width in self.attn_reads:
-            S = getattr(state, bank)
-            addr = x[int(addr_c)]
-            k = onehot_val(addr, S.shape[0], wp.strict)
-            v = k @ S                                     # (width,)
-            if wp.strict and not bool(torch.all(v == torch.round(v))):
-                raise ExactnessError(
-                    f"attn_reads: {bank} 读出非整数 {v.reshape(-1).tolist()}"
-                    f"（addr={float(addr)}）—— 状态含小数则地址索引必然泄漏到邻行")
-            x[int(out_c):int(out_c) + int(width)] += v
-        # ---- mlp 槽：编译算术（权重来自 npz；全流宽稀疏路由） ----
-        if self.has_mlp:
-            x = x + self.ffn(x)
+    def forward(self, x: torch.Tensor, check: bool = False) -> torch.Tensor:
+        gate = rnd(self.Wb @ x)
+        up = rnd(self.Wa @ x)
+        if check:
+            require(silu_ok(gate.numpy()), "ffn 门控超出 silu 的精确区间", gate)
+        h = rnd(F.relu(gate) * up)
+        d = rnd(self.Wo @ h)
+        x[self.rows] = x[self.rows] + d[self.rows]
+        if check:
+            require(is_bf16(x[self.rows]), "ffn 残差累加", x[self.rows])
         return x
 
 
-# ---------------- manifest 契约（schema 与静态校验） ----------------
+class VHead(nn.Module):
+    """一张状态表 + 它的衰减 / 写门 / 输出门。同一组 q/k 可以挂多个 VHead（兄弟头）。
 
-def _validate_manifest(manifest: dict, cfg) -> None:
-    """构造期静态校验：违反契约给出指认字段的错误，而不是内部数组的 IndexError。"""
-    def need(cond, msg):
-        if not cond:
-            raise ValueError(f"manifest: {msg}")
-    need("d_stream" in manifest and "d_ff" in manifest, "缺 d_stream / d_ff")
-    need(int(manifest["d_ff"]) >= 1, "d_ff 至少 1（0 会静默退化成 Wo.bias 常数层，S4）")
-    need("layers" in manifest and len(manifest["layers"]) >= 1, "layers 至少一层")
-    feat = manifest.get("feat", {})
-    feat_ok = {"fam_oh", "pay", "fin", "is_qs", "is_qd", "is_jr", "pay_hi", "qdigit"}
-    for nm in feat:
-        need(nm in feat_ok, f"feat.{nm} 不是已知特征（可用 {sorted(feat_ok)}）")
-    need(float(manifest.get("qdigit_scale", 0x11111111)).is_integer(),
-         f"qdigit_scale={manifest.get('qdigit_scale')} 必须整数（strict 轨要求精确整数）")
-    need(len(feat.get("fam_oh", [])) == len(FAMILIES),
-         f"feat.fam_oh 需要 {len(FAMILIES)} 个坐标（每家族一个），给了 {len(feat.get('fam_oh', []))}")
-    need(len(feat.get("pay", [])) == NPAY, f"feat.pay 需要 {NPAY} 个坐标（按位展开）")
-    need(len(manifest.get("code_coords", [])) == NFAM + NPAY,
-         f"code_coords 需要 {NFAM + NPAY} 个坐标")
-    ds = int(manifest["d_stream"])
-    def coord_ok(c, w=1):
-        return isinstance(c, int) and 0 <= c and c + w <= ds
-    for nm, v in feat.items():
-        for c in (v if isinstance(v, list) else [v]):
-            need(coord_ok(int(c)), f"feat.{nm} 坐标 {c} 超出 d_stream={ds}")
-    n_feat = len({int(c) for v in feat.values() for c in
-                  (v if isinstance(v, list) else [v])})
-    for off in manifest.get("lag_blocks", []):
-        need(coord_ok(int(off), n_feat), f"lag_blocks {off} 放不下特征块（稠密宽 {n_feat}）")
-    for c in manifest["code_coords"]:
-        need(coord_ok(int(c)), f"code_coords {c} 超出 d_stream={ds}")
-    bank_cols = {"cnt": 1, "rom": 5, "rom_raw": 1, "regs": 1, "quo": 1,
-                 "ram0": 1, "ram1": 1}
-    # ---- 坐标占用区登记：越界 + 重叠即报错（compile 契约：坐标无重叠）----
-    spans = []
-    def claim(c, w, tag):
-        c = int(c); w = int(w)
-        need(coord_ok(c, w), f"{tag} 坐标 [{c},{c + w}) 越界 d_stream={ds}")
-        for a, b, t0 in spans:
-            need(c + w <= a or b <= c, f"{tag} 坐标 [{c},{c + w}) 与 {t0} [{a},{b}) 重叠")
-        spans.append((c, c + w, tag))
-    for nm, v in feat.items():
-        for c in (v if isinstance(v, list) else [v]):
-            claim(c, 1, f"feat.{nm}")
-    for off in manifest.get("lag_blocks", []):
-        claim(off, n_feat, f"lag_blocks {off}")
-    for c in manifest["code_coords"]:
-        claim(c, 1, "code_coords")
-    for i, layer in enumerate(manifest["layers"]):
-        for bank, addr, out, w in layer.get("attn_reads", []):
-            need(bank in bank_cols, f"layers[{i}].attn_reads 未知银行 {bank}")
-            need(bank_cols[bank] == int(w), f"layers[{i}].attn_reads {bank} 宽度须 {bank_cols[bank]}")
-            # 读地址是引用不是占用：与 writes 的 addr/beta 一样只查越界（addr==out 允许）
-            need(coord_ok(int(addr)), f"layers[{i}].attn_reads 地址坐标 {addr} 越界")
-            claim(out, int(w), f"layers[{i}].attn_reads {bank} 输出")
-    for tbl in ("prewrites", "writes"):
-        for j, entry in enumerate(manifest.get(tbl, [])):
-            need(len(entry) >= 4, f"{tbl}[{j}] 至少 4 项 [bank, addr, val, beta]")
-            bank, addr, val, beta = entry[:4]
-            w = int(entry[4]) if len(entry) > 4 else 1
-            need(bank in bank_cols, f"{tbl}[{j}] 未知银行 {bank}")
-            need(bank_cols[bank] == w, f"{tbl}[{j}] {bank} 宽度须 {bank_cols[bank]}")
-            need(not (isinstance(val, float) and bank_cols[bank] > 1),
-                 f"{tbl}[{j}] {bank} 是多列银行：val 必须给坐标+宽度（标量常数会静默广播成全列同值，S5）")
-            for tag, e in (("addr", addr), ("beta", beta)):
-                if isinstance(e, int):
-                    need(coord_ok(int(e)), f"{tbl}[{j}].{tag} 坐标 {e} 越界")
-            if isinstance(val, int):
-                need(coord_ok(int(val), w), f"{tbl}[{j}].val 坐标 {val}+w 越界")
-    need(all(("attn_reads" in l) or ("mlp" in l) for l in manifest["layers"]),
-         "存在 attn/mlp 全空的层（要么删层，要么显式声明 {\"attn_reads\": [], \"mlp\": False}）")
+    S 不是参数也不是 buffer：它是每个 token 都在变的运行时状态，放在 carry 里按
+    (层号, 头号) 索引。模块只持有 S0（初值）和四个投影。
+    """
+
+    def __init__(self, hidden: int, rows: int, cols: int, v_keys, z_keys,
+                 out_col: torch.Tensor, out_dim: torch.Tensor, out_w: torch.Tensor) -> None:
+        super().__init__()
+        self.cols = cols
+        self.v_keys = list(v_keys)
+        self.z_keys = list(z_keys)
+        self.taps_v: list[list[float]] = [[] for _ in self.v_keys]
+        self.beta_on = False
+        #: `prepare()` 之前一律当“要历史”处理，空 taps 正好都落在这一边
+        self.plain_v: list[int] = []
+        self.lag_v: list[int] = list(range(len(self.v_keys)))
+        self.register_buffer("Wv", torch.zeros((len(self.v_keys), hidden), dtype=DTYPE))
+        self.register_buffer("Wz", torch.zeros((len(self.z_keys), hidden), dtype=DTYPE))
+        self.register_buffer("Walpha", torch.zeros(hidden, dtype=DTYPE))
+        self.register_buffer("Wbeta", torch.zeros(hidden, dtype=DTYPE))
+        self.register_buffer("S0", torch.zeros((rows, cols), dtype=DTYPE))
+        self.register_buffer("out_col", out_col)
+        self.register_buffer("out_dim", out_dim)
+        self.register_buffer("out_w", out_w)
+        self.register_buffer("v_keys_t", torch.tensor(self.v_keys, dtype=torch.long))
+        self.register_buffer("z_keys_t", torch.tensor(self.z_keys, dtype=torch.long))
+        self.register_buffer("plain_v_t", torch.zeros(0, dtype=torch.long))
+
+    def prepare(self) -> None:
+        """按 taps 把 v 通道分两类：`relu(投影)` 的整列批量算，其余逐拍走 `conv`。
+
+        分类只能在这里做——`taps_v` 是 manifest 装完才有的。这一条是整台机器的速度
+        分水岭：单层 745 列逐列 `.item()` + 单元素赋值约 4 ms/token，整列一次算完差
+        30 倍以上（实测 158 ms/token 的主要部分）。
+        """
+        plain = [c for c, t in enumerate(self.taps_v)
+                 if t and t[0] == 1.0 and not any(t[1:])]
+        self.plain_v = plain
+        self.lag_v = [c for c in range(len(self.v_keys)) if c not in set(plain)]
+        self.plain_v_t = torch.tensor(plain, dtype=torch.long)
+
+    def forward(self, x: torch.Tensor, carry: dict, li: int, j: int,
+                sel_k: list, sel_q: list, snap: list, check: bool) -> torch.Tensor:
+        dev = x.device
+        S = carry.get((li, "S", j))
+        if S is None:
+            S = self.S0.to(ACC).clone()
+            carry[(li, "S", j)] = S
+        elif S.device != dev or S.dtype != ACC:
+            # carry 可能是 host 侧注入的：探针在 CPU 上建 S、权重在 GPU 上；参考实现的
+            # `S0` 又是 float64（`probe_slots._bridge`）。跟 x 走，并且收窄到 ACC ——
+            # 值本身是 bf16 精确的，float64 -> fp32 不丢位，但 `index_add_` 不容忍混型
+            S = S.to(device=dev, dtype=ACC)
+            carry[(li, "S", j)] = S
+        vv = torch.zeros(self.cols, dtype=ACC, device=dev)
+        if self.v_keys:
+            pv = self.Wv @ x
+            if len(self.plain_v):
+                # `taps = (1,0,0,0)` 就是 relu(投影)：整列一次算完，不逐列 `.item()`
+                vv[self.v_keys_t[self.plain_v_t]] = torch.clamp(pv[self.plain_v_t], min=0.0)
+            for c in self.lag_v:
+                col = self.v_keys[c]
+                vv[col] = conv(self.taps_v[c], float(pv[c]), carry, ("v", li, j, col))
+                if any(self.taps_v[c][1:]):
+                    snap.append((("v", li, j, col), self.Wv[c]))
+        alpha = float(self.Walpha @ x)
+        beta = float(self.Wbeta @ x) if self.beta_on else 1.0
+        #: 输出门默认 1（没有 z 投影的列），只有 `z_keys` 那几列是算出来的 0/1
+        zc = None
+        if self.z_keys:
+            zc = torch.ones(self.cols, dtype=ACC, device=dev)
+            zc[self.z_keys_t] = self.Wz @ x
+        if check:
+            require(alpha in ALPHA.values(), "衰减 alpha", alpha)
+            require(beta in (1.0, 0.0), "写门 beta", beta)
+            if zc is not None:
+                pz = zc[self.z_keys_t]
+                require(torch.logical_or(pz == 0.0, pz == 1.0), "输出门 z", pz)
+
+        if alpha != 1.0:                      # 1 时乘法是空操作，省掉
+            if alpha == 0.0:
+                S.fill_(0.0)
+            else:
+                S *= alpha
+        if sel_k and beta > 0:
+            S[sel_k[0]] = vv
+        o = torch.zeros(self.cols, dtype=ACC, device=dev)
+        if sel_q:
+            o = sum((S[s] for s in sel_q), o)
+            if check:
+                require(is_bf16(o), "状态表读出", o)
+        if self.out_dim.numel():
+            # 整列一次算完再 `index_add_`：逐列 `x[d] = x[d] + val` 是单层 745 次标量写，
+            # 占了整台机器 70% 的时间。两者逐位相同的原因写在模块开头（每个 val 都是
+            # bf16×{0,1}×1.0，fp32 里精确，所以“先舍入再加”与“先加再舍入”没差）
+            term = o[self.out_col]
+            if zc is not None:
+                term = term * torch.clamp(zc[self.out_col], min=0.0)
+            term = term * self.out_w
+            if check:
+                require(is_bf16(term), "输出列", term)
+            x.index_add_(0, self.out_dim, term)
+            if check:
+                require(is_bf16(x[self.out_dim]), "输出累加", x[self.out_dim])
+        return x
 
 
-# ---------------- 整机 ----------------
+class Head(nn.Module):
+    """一个 head 节点：q / k 两组行选择子 + 若干兄弟 value head。
+
+    q 可以有多个通道同时为 1（两个读口同理选中同一行），k 必须 one-hot —— 一条指令只改
+    一行。这两个约束在 check 下会当场报出来。
+    """
+
+    def __init__(self, hidden: int, name: str, q_keys, k_keys, vheads) -> None:
+        super().__init__()
+        self.name = name
+        self.q_keys = list(q_keys)
+        self.k_keys = list(k_keys)
+        self.taps_q: list[list[float]] = [[] for _ in self.q_keys]
+        self.taps_k: list[list[float]] = [[] for _ in self.k_keys]
+        self.plain_q: list[int] = []
+        self.lag_q: list[int] = list(range(len(self.q_keys)))
+        self.plain_k: list[int] = []
+        self.lag_k: list[int] = list(range(len(self.k_keys)))
+        self.register_buffer("Wq", torch.zeros((len(self.q_keys), hidden), dtype=DTYPE))
+        self.register_buffer("Wk", torch.zeros((len(self.k_keys), hidden), dtype=DTYPE))
+        self.register_buffer("plain_q_t", torch.zeros(0, dtype=torch.long))
+        self.register_buffer("plain_k_t", torch.zeros(0, dtype=torch.long))
+        self.vheads = nn.ModuleList(vheads)
+
+    def prepare(self) -> None:
+        """同 `VHead.prepare`：纯 `relu(投影)` 的通道整列算，带滞后的逐拍走 `conv`。
+
+        q/k 在真固件里大部分是 `(1,0,0,0)`，但写口（`regs` 的 `k`）是 `(0,1,0,0)` ——
+        所以两组必须分开，不能一律当纯通道。
+        """
+        def split(taps: list[list[float]], n: int) -> tuple[list[int], list[int]]:
+            plain = [i for i, t in enumerate(taps) if t and t[0] == 1.0 and not any(t[1:])]
+            return plain, [i for i in range(n) if i not in set(plain)]
+
+        self.plain_q, self.lag_q = split(self.taps_q, len(self.q_keys))
+        self.plain_k, self.lag_k = split(self.taps_k, len(self.k_keys))
+        self.plain_q_t = torch.tensor(self.plain_q, dtype=torch.long)
+        self.plain_k_t = torch.tensor(self.plain_k, dtype=torch.long)
+
+    def forward(self, x: torch.Tensor, carry: dict, li: int,
+                check: bool = False) -> tuple[torch.Tensor, list]:
+        snap: list = []
+        dev = x.device
+        qv = torch.zeros(len(self.q_keys), dtype=ACC, device=dev)
+        kv = torch.zeros(len(self.k_keys), dtype=ACC, device=dev)
+        if self.q_keys:
+            pq = self.Wq @ x
+            if len(self.plain_q):
+                qv[self.plain_q_t] = torch.clamp(pq[self.plain_q_t], min=0.0)
+            for i in self.lag_q:
+                qv[i] = conv(self.taps_q[i], float(pq[i]), carry, ("q", li, self.q_keys[i]))
+                if any(self.taps_q[i][1:]):
+                    snap.append((("q", li, self.q_keys[i]), self.Wq[i]))
+        if self.k_keys:
+            pk = self.Wk @ x
+            if len(self.plain_k):
+                kv[self.plain_k_t] = torch.clamp(pk[self.plain_k_t], min=0.0)
+            for i in self.lag_k:
+                kv[i] = conv(self.taps_k[i], float(pk[i]), carry, ("k", li, self.k_keys[i]))
+                if any(self.taps_k[i][1:]):
+                    snap.append((("k", li, self.k_keys[i]), self.Wk[i]))
+        sel_k = [self.k_keys[i] for i in torch.nonzero(kv > 0).flatten().tolist()]
+        sel_q = [self.q_keys[i] for i in torch.nonzero(qv > 0).flatten().tolist()]
+        if check:
+            both = torch.cat([qv, kv])
+            if both.numel():
+                require(torch.logical_or(both == 0.0, both == 1.0),
+                        f"{self.name}: 门控必须是 0/1", both)
+            require(len(sel_k) <= 1, f"{self.name}: key 必须 one-hot",
+                    torch.tensor([len(sel_k)], dtype=ACC))
+            if sel_q:
+                vals = qv[qv > 0]
+                require(vals == vals[0], f"{self.name}: query 必须等值 multi-hot", vals)
+        for j, vh in enumerate(self.vheads):
+            vh(x, carry, li, j, sel_k, sel_q, snap, check)
+        return x, snap
+
+
+# ---------------- 执行器 ----------------
 
 class NeuralCPU(nn.Module):
-    """
-    神经 CPU
+    """这台神经 CPU 的本体：compile 的权重 + manifest 的结构 → 能跑 token 流的 nn.Module。
+
+    一个 token 一拍，一拍走完所有子层。状态表（VHead 的 S）就是寄存器文件与存储器，
+    taps 历史就是跨拍的组合延迟。子层“是什么”不在这里——哪些槽是 pc、哪些位是 opcode，
+    全在 compile 编出来的坐标里，这个类一个名字都不认识。
+
+    结构全部由 manifest 恢复：哪一层是 ffn、哪些是 head、每路的 taps、每列写到哪个 dim。
+    所以它只认落盘文件，不需要同进程里留着一个 Compiled 对象。
     """
 
-    def __init__(self, cfg, manifest: dict, strict: bool | None = None) -> None:
+    def __init__(self, manifest: dict, state: dict[str, torch.Tensor] | None = None,
+                 strict: bool = False) -> None:
         super().__init__()
-        _validate_manifest(manifest, cfg)             # 契约先行：报错指认字段
-        self.cfg = cfg
-        self.manifest = manifest
-        # 验收轨：strict 模式全程断言地址/门控/值的精确整数性（ExactnessError）
-        self.strict = bool(manifest.get("strict", False)) if strict is None else bool(strict)
-        self.state = ChipState(cfg)
-        n_layers = len(manifest["layers"])              # 层数由 manifest（compile 的深度摊派）决定
-        self.layers = nn.ModuleList(
-            [ChipLayer(i, manifest["layers"][i], manifest["d_stream"], manifest["d_ff"])
-             for i in range(n_layers)])
-        # ---- token 嵌入表：协议特征坐标行，init 物化（结构常数缓冲）----
-        # 稠密索引：表宽 = len(feat_coords)（与坐标取值无关），fidx 做坐标->列映射；
-        # feat 坐标放高位不再撑爆内存（旧实现表宽 = max(coord)+1）。
-        feat = manifest["feat"]                         # {"fam_oh": [coords], "pay": [coords], "fin": c, ...}
-        self.feat_coords = sorted(c for v in feat.values() for c in (v if isinstance(v, list) else [v]))
-        fidx = {c: i for i, c in enumerate(self.feat_coords)}
-        table = torch.zeros(VOCAB, len(self.feat_coords), dtype=torch.float64)
-        ar = torch.arange(VOCAB)
-        fam_ids = torch.tensor([FAM_ID[TOKENS[t][0]] for t in range(VOCAB)])
-        pays = torch.tensor([TOKENS[t][1] for t in range(VOCAB)], dtype=torch.int64)
-        if "fam_oh" in feat:
-            fam_c = torch.tensor([fidx[int(c)] for c in feat["fam_oh"]])
-            table[ar, fam_c[fam_ids]] = 1.0
-        if "pay" in feat:
-            for i, c in enumerate(feat["pay"]):
-                table[ar, fidx[int(c)]] = ((pays >> i) & 1).double()
-        for nm, getter in (("fin", lambda t: IS_FINAL[t].item()),
-                             ("is_qs", lambda t: float(TOKENS[t][0] == "QS")),
-                             ("is_qd", lambda t: float(TOKENS[t][0] == "QD")),
-                             ("is_jr", lambda t: float(TOKENS[t][0] in ("J", "R")))):
-            if nm in feat:
-                table[:, fidx[int(feat[nm])]] = torch.tensor([getter(t) for t in range(VOCAB)])
-        # 商数字协议字段（供 prewrites 读取；对所有 token 无差别填充，host 不区分家族）
-        qscale = float(manifest.get("qdigit_scale", 0x11111111))
-        if "pay_hi" in feat:
-            table[:, fidx[int(feat["pay_hi"])]] = (pays >> 4).double()
-        if "qdigit" in feat:
-            table[:, fidx[int(feat["qdigit"])]] = (pays & 15).double() * qscale
-        self.register_buffer("embed", table, persistent=False)
-        # ---- 固定码本（±1，向量化构造；与 embed 内容/宽度不同）----
-        fb = ((fam_ids.unsqueeze(1) >> torch.arange(NFAM)) & 1).double()
-        pb = ((pays.unsqueeze(1) >> torch.arange(NPAY)) & 1).double()
-        self.register_buffer("codebook", torch.cat([fb, pb], 1) * 2.0 - 1.0,
-                             persistent=False)                              # (VOCAB, 20)
-        self.code_coords = [int(c) for c in manifest["code_coords"]]
-        # ---- tap：上几个 token 的特征块（默认无 tap；t−1, t−2, ...）----
-        self.lag_blocks = [int(o) for o in manifest.get("lag_blocks", [])]
-        # ---- 预写表：层栈之前提交的协议写（旧版硬编码的商数字预填已迁入 manifest）----
-        self.prewrites = list(manifest.get("prewrites", []))
-        self.double()                                     # 全机 float64（位精确语义要求）
+        self.spec = dict(manifest)
+        self.strict = bool(strict)
+        self.d0 = int(manifest["d0"])
+        self.hidden = int(manifest["hidden"])
+        self.n_dims = int(manifest["n_dims"])
+        self.m = int(manifest["m"])
+        self.ballast0 = self.hidden - self.m
+        self.ballast = float(2.0 ** int(manifest["log2_ballast"]))
+        self.log2_den = int(manifest["log2_den"])
+        self.vocab = int(manifest["vocab"])
+        #: dim 号 -> 残差槽号。**压槽之后这两个不是一回事**：`n_dims` 是槽数，
+        #: `slot_of` 是按原 dim 排的映射表（一维一槽时它是恒等映射）。manifest 里凡是
+        #: 记着“哪个 dim”的地方（token 特征、head 输出列）都得先过这张表
+        self.dim_slot = [int(s) for s in manifest.get("slot_of") or range(self.n_dims)]
+        #: token 末尾仍持有自己槽的 dim。压槽之后**只有它们能从残差里读回来**，其余的
+        #: 槽已经被后面的 dim 接手（读到的会是别人的值，不会报错）。`slot_of` 缺省时
+        #: 一维一槽，全部 dim 都还在。
+        self.final_dims = [int(d) for d in
+                           manifest.get("final_dims") or range(len(self.dim_slot))]
+        self.feat_dims = [int(d) for d in manifest["feat_dims"]]
+        self.register_buffer("feat_slots",
+                             torch.tensor([self.d0 + self.dim_slot[d] for d in self.feat_dims],
+                                          dtype=torch.long))
+        self.register_buffer("feat",
+                             torch.zeros((self.vocab, len(self.feat_dims)), dtype=DTYPE))
+        self.layers = nn.ModuleList([self._build(l) for l in manifest["layers"]])
+        if state is not None:
+            self.load_compiled_state(state)
+        self._widen()
 
-    # ---- 权重装载（npz schema 见模块 docstring；缺失 key 一律报错，不静默跳过） ----
-    @classmethod
-    def from_weights(cls, cfg, path: str | Path, strict: bool | None = None) -> "NeuralCPU":
-        z = np.load(path, allow_pickle=False)
-        if "manifest_json" not in z:
-            raise KeyError("npz 缺 manifest_json（emit.py 必须产出，见模块 docstring 的 npz schema）")
-        manifest = json.loads(str(z["manifest_json"]))
-        cpu = cls(cfg, manifest, strict)
-        missing = []
-        for key in ("rom", "rom_raw", "regs", "quo", "ram0", "ram1", "cnt"):
-            k = f"W_{key}"
-            if k not in z:
-                missing.append(k)
-            else:
-                t = torch.as_tensor(z[k], dtype=torch.float64)
-                tgt = getattr(cpu.state, key)
-                if t.shape != tgt.shape:
-                    raise ValueError(f"{k} 形状 {tuple(t.shape)} != 期望 {tuple(tgt.shape)}")
-                if cpu.strict and not bool(torch.all(t == torch.round(t))):
-                    raise ExactnessError(
-                        f"{k} 含 {int((t != torch.round(t)).sum())} 个非整数 —— 状态快照必须精确整数，"
-                        "否则每次地址索引都会泄漏到邻行并被行值量级放大")
-                tgt.data.copy_(t)
-        for i in range(len(manifest["layers"])):
-            ffn = getattr(cpu.layers[i], "ffn", None)
-            if ffn is None:
+    def _widen(self) -> "NeuralCPU":
+        """权重转成 fp32 常驻。
+
+        权重是不变的，而原来每次投影都做一次 `W.to(ACC)`（bf16 -> fp32 拷贝）：36 层 ×
+        几百列，每 token 重复三万多份拷贝，占整台机器三分之一的时间（实测我编 100 拍
+        有 34946 次 `.to`）。内存翻倍换这个，数值一点不变——bf16 值在 fp32 里精确。
+        """
+        def rewire(m: nn.Module, k: str) -> None:
+            m.register_buffer(k, getattr(m, k).to(ACC))
+
+        for l in self.layers:
+            if isinstance(l, FFN):
+                for k in ("Wb", "Wa", "Wo"):
+                    rewire(l, k)
                 continue
-            for pname, p in ffn.named_parameters():
-                k = f"L{i + 1}_{pname.replace('.', '_')}"
-                if k not in z:
-                    missing.append(k)
+            rewire(l, "Wq")
+            rewire(l, "Wk")
+            for vh in l.vheads:
+                for k in ("Wv", "Wz", "Walpha", "Wbeta"):
+                    rewire(vh, k)
+        return self
+
+    # ---- 结构重建：manifest -> 模块 ----
+
+    def _build(self, l: dict) -> nn.Module:
+        if l["kind"] == "ffn":
+            return FFN(int(l["units"]), self.hidden)
+        vhs = [VHead(self.hidden, int(l["rows"]), int(l["cols"]),
+                     [int(c) for c in vh["v"]], [int(c) for c in vh["z"]],
+                     torch.tensor([o[0] for o in vh["out"]], dtype=torch.long),
+                     # out_dim 在这里就加上 d0：模块里只认残差的绝对槽位，
+                     # 否则每次写回都要记着“再偏移一次”（d0=0 时看不出错）
+                     torch.tensor([self.d0 + self.dim_slot[o[1]] for o in vh["out"]],
+                                  dtype=torch.long),
+                     torch.tensor([float(o[2]) for o in vh["out"]], dtype=ACC))
+               for vh in l["vh"]]
+        head = Head(self.hidden, l["name"],
+                    [int(k) for k in l["q"]], [int(k) for k in l["k"]], vhs)
+        for i, key in enumerate(head.q_keys):
+            head.taps_q[i] = [float(t) for t in l["q"][str(key)]]
+        for i, key in enumerate(head.k_keys):
+            head.taps_k[i] = [float(t) for t in l["k"][str(key)]]
+        head.prepare()
+        for j, vh in enumerate(head.vheads):
+            for c, col in enumerate(vh.v_keys):
+                vh.taps_v[c] = [float(t) for t in l["vh"][j]["v"][str(col)]]
+            vh.prepare()
+        return head
+
+    def load_compiled_state(self, state: dict[str, torch.Tensor]) -> "NeuralCPU":
+        """把 compile.py 的扁平 state（`L0_Wa` 这种 key）按结构摆进来。
+
+        不走 load_state_dict：那边认的是模块路径（`layers.0.Wa`），而 compile 落的是
+        `L0_Wa`。两套命名都合理，与其在中间做一次改名，不如在这里显式按 manifest 摆一次
+        —— 顺手把"缺哪个 key、形状差多少"直接报出来，而不是等 forward 炸在 einsum 里。
+        """
+
+        def put(dst: torch.Tensor, key: str) -> None:
+            if key not in state:
+                raise KeyError(f"state 缺 {key}（manifest 里有对应结构）")
+            src = state[key]
+            if tuple(src.shape) != tuple(dst.shape):
+                raise ValueError(f"{key}: 形状 {tuple(src.shape)} != 期望 {tuple(dst.shape)}")
+            dst.copy_(src)
+
+        put(self.feat, "feat")
+        for i, l in enumerate(self.layers):
+            if isinstance(l, FFN):
+                put(l.Wb, f"L{i}_Wb")
+                put(l.Wa, f"L{i}_Wa")
+                put(l.Wo, f"L{i}_Wo")
+                # 行掩码是算出来的，不落盘：Wo 哪几行非零，本层就写哪几行
+                l.rows.copy_(l.Wo.abs().sum(1) > 0)
+                continue
+            for s, key in enumerate(l.q_keys):
+                put(l.Wq[s], f"L{i}_Wq_p{key}")
+            for s, key in enumerate(l.k_keys):
+                put(l.Wk[s], f"L{i}_Wk_{key}")
+            for j, vh in enumerate(l.vheads):
+                for c, col in enumerate(vh.v_keys):
+                    put(vh.Wv[c], f"L{i}_Wv_{j}_{col}")
+                for c, col in enumerate(vh.z_keys):
+                    put(vh.Wz[c], f"L{i}_Wz_{j}_{col}")
+                put(vh.Walpha, f"L{i}_Walpha_{j}")
+                vh.beta_on = f"L{i}_Wbeta_{j}" in state
+                if vh.beta_on:
+                    put(vh.Wbeta, f"L{i}_Wbeta_{j}")
+                put(vh.S0, f"S_{i}_{j}")
+        return self
+
+    @classmethod
+    def from_compiled(cls, c, strict: bool = False) -> "NeuralCPU":
+        """同进程里直接装 compile 的产物，省掉一次落盘。"""
+        return cls(c.manifest(), c.state(), strict)
+
+    @classmethod
+    def from_file(cls, path, strict: bool = False) -> "NeuralCPU":
+        """只认落盘文件 —— 这是设备侧真正的装载路径。"""
+        z = torch.load(Path(path), map_location="cpu", weights_only=True)
+        return cls(z["manifest"], z["state"], strict)
+
+    # ---- 前向 ----
+
+    def forward(self, tokens, carry: dict | None = None, check: bool | None = None):
+        """跑一串 token，返回 (每个 token 之后的残差 (n, hidden) fp32, carry)。
+
+        tokens 是整数序列，负数表示"这一拍没有 token"（特征全 0，与 compile.run 同语义）。
+        carry 跨调用保留，所以一次喂一个 token 就是流式 decode —— 状态表与 taps 历史都在
+        carry 里，模型自己没有任何跨 token 的隐状态。
+        """
+        check = self.strict if check is None else bool(check)
+        carry = {} if carry is None else carry
+        dev = self.feat.device          # 权重在 CPU 就在 CPU，搬到 GPU 就跟着上去
+        n = len(tokens)
+        out = torch.zeros((n, self.hidden), dtype=ACC, device=dev)
+        for t in range(n):
+            tok = int(tokens[t])
+            if tok >= self.vocab:
+                raise IndexError(f"token {tok} 超出 vocab {self.vocab}")
+            x = torch.zeros(self.hidden, dtype=ACC, device=dev)
+            if tok >= 0:
+                x[self.feat_slots] = self.feat[tok].to(ACC)
+            x[self.ballast0:] = self.ballast
+            snap: list = []
+            for li, layer in enumerate(self.layers):
+                if isinstance(layer, FFN):
+                    layer(x, check=check)
                 else:
-                    t = torch.as_tensor(z[k], dtype=torch.float64)
-                    if t.shape != p.shape:
-                        raise ValueError(f"{k} 形状 {tuple(t.shape)} != 期望 {tuple(p.shape)}")
-                    p.data.copy_(t)
-        if missing:
-            raise KeyError(f"npz 缺 {len(missing)} 个权重 key: {missing[:5]}{' …' if len(missing) > 5 else ''}"
-                           "（key 名见 docstring；emit.py 必须与之一致）")
-        return cpu
+                    _, sn = layer(x, carry, li, check=check)
+                    snap += sn
+            for key, w in snap:      # 末尾快照：读的是本 token 最终的 x，不是投影当下的 x
+                h = carry.setdefault(("h",) + key, [])
+                h.append(float(w @ x))
+                del h[:-HIST]
+            out[t] = x
+        return out, carry
 
-    def _schedule(self, wp: WritePort, table: list, x: torch.Tensor) -> None:
-        """静态调度表 -> WritePort：int 取流坐标、float 取结构常数（host 不认识语义）。"""
-        for entry in table:
-            bank, addr, val, beta = entry[:4]
-            w = int(entry[4]) if len(entry) > 4 else 1
-            wp.write(bank, stream_val(x, addr), stream_val(x, val, w), stream_val(x, beta))
-
-    @torch.no_grad()
-    def forward(self, t: int, hist: list[int]) -> torch.Tensor:
-        wp = WritePort(self.strict)
-        # ---- 流初始化：本 token 特征坐标 + tap（t−1, t−2, ... 的特征块）----
-        x = torch.zeros(self.manifest["d_stream"], dtype=torch.float64)
-        x[self.feat_coords] = self.embed[t]              # 稠密特征行 -> feat 坐标
-        fd = torch.arange(len(self.feat_coords))       # tap 块内稠密偏移（块宽 = len，不再吃 feat_max）
-        for k, off in enumerate(self.lag_blocks):
-            if len(hist) >= k + 2:
-                x[off + fd] = self.embed[hist[-k - 2]]  # tap：上 k+1 个 token 的特征行
-        # ---- 预写：manifest 声明、层栈之前立即提交（本 token 的层可读）----
-        if self.prewrites:
-            pre = WritePort(self.strict)
-            self._schedule(pre, self.prewrites, x)
-            pre.apply(self.state)
-        # ---- N 个统一层 ----
-        for L in self.layers:
-            x = L(x, self.state, wp)
-        # ---- 静态写口提交（commit；下一 token 读 post-commit 状态）----
-        self._schedule(wp, self.manifest.get("writes", []), x)
-        wp.apply(self.state)
-        # ---- exit：code 坐标上的 ±1 预测码，tied-embedding 一致度打分 ----
-        code = x[self.code_coords]
-        if self.strict:
-            mag = code.abs()
-            if not bool(torch.all(mag == mag[0])):
-                raise ExactnessError(
-                    f"exit: code 坐标幅值不一致 |v|∈[{float(mag.min())}, {float(mag.max())}]"
-                    " —— 码本 margin 仅 2，幅值抖动会让 argmax 偏向小编号 token")
-        return self.codebook @ code
-
-    @torch.no_grad()
-    def step(self, t: int, hist: list[int]) -> tuple[int, torch.Tensor]:
-        """forward + argmax：返回 (下一 token id, logits)。"""
-        logits = self.forward(t, hist)
-        return int(torch.argmax(logits).item()), logits
-
-    def run(self, max_tokens: int = 1_000_000) -> tuple[list[int], list[int]]:
-        """监视器（非 CPU 语义）：驱动 token 序列，按 HALT / BYTE 家族做 I/O。"""
-        t = TOK_ID[("NT", 0)]
-        hist = [t]
-        stdout: list[int] = []
-        for _ in range(max_tokens):
-            nxt, _ = self.step(t, hist)
-            hist.append(nxt)
-            if TOKENS[nxt][0] == "HALT":
-                return hist, stdout
-            if TOKENS[nxt][0] == "BYTE":
-                stdout.append(TOKENS[nxt][1] & 0xFF)
-            t = nxt
-        raise RuntimeError("token limit")
+    def residual(self, tokens, carry: dict | None = None, check: bool | None = None):
+        """只要残差的便捷入口（丢掉 carry，等于重新开始一条流）。"""
+        return self.forward(tokens, carry, check)[0]
 
 
-def main() -> None:
-    raise SystemExit("chipformer v8.1 已废弃（plan.md M0）：本文件将在 M2 整份重写为 graph.py 的"
-                     "设备侧执行器。当前不内置语义/自测，也不接受 npz。")
+# ---------------- 自检 ----------------
+
+def _demo() -> None:
+    from components.rv32i import compile as cc
+    from components.rv32i.tests.probe_graph import build, gen
+
+    g, _, _ = build()
+    toks = gen(__import__("random").Random(20261101))
+    c = cc.compile(g, vocab=1 << 16)
+    ex = NeuralCPU.from_compiled(c)
+    got, _ = ex(toks)
+    want = cc.run(c, toks)
+    L = c.layout
+    chip = slice(L.d0, L.d0 + L.n_dims)
+    assert torch.equal(got[:, chip], want[:, chip].to(ACC)), "fp32 执行器与 float64 参考不一致"
+    print(f"自检  fp32 NeuralCPU vs compile.run: 逐位一致  {tuple(got.shape)}")
+
+
+if __name__ == "__main__":
+    _demo()

@@ -95,7 +95,6 @@ def sra(vm, ins: Instr) -> None:
     vm.write(ins.rd, sx(vm.regs[ins.rs1], 32) >> (vm.regs[ins.rs2] & 31))
 
 
-# ---------------- I 型算术逻辑（带立即数） ----------------
 
 @factory.code
 def addi(vm, ins: Instr) -> None:
@@ -140,7 +139,6 @@ def srai(vm, ins: Instr) -> None:
     vm.write(ins.rd, sx(vm.regs[ins.rs1], 32) >> (ins.imm & 31))
 
 
-# ---------------- U 型（高位立即数） ----------------
 
 @factory.code
 def lui(vm, ins: Instr) -> None:
@@ -154,7 +152,6 @@ def auipc(vm, ins: Instr) -> None:
     vm.write(ins.rd, vm.pc + (ins.imm << 12))   # vm.pc = 本条指令地址（vm 未推进）
 
 
-# ---------------- 跳转与分支（控制流：显式设置 vm.pc） ----------------
 
 @factory.code
 def jal(vm, ins: Instr) -> int:
@@ -203,7 +200,6 @@ def bge(vm, ins: Instr) -> int | None:
     return None
 
 
-# ---------------- 访存 ----------------
 
 @factory.code
 def lw(vm, ins: Instr) -> None:
@@ -216,7 +212,7 @@ def sw(vm, ins: Instr) -> None:
     """写 32-bit 字：mem[rs1 + imm] = rs2，小端；地址必须 4 字节对齐，否则 trap。"""
     vm.sw(ins.rs1, ins.imm, vm.regs[ins.rs2])
 
-# ---------------- v2 第一批：比较置位 ----------------
+
 
 @factory.code
 def slt(vm, ins: Instr) -> None:
@@ -242,7 +238,7 @@ def sltiu(vm, ins: Instr) -> None:
     vm.write(ins.rd, 1 if vm.regs[ins.rs1] < (ins.imm & WORD_MASK) else 0)
 
 
-# ---------------- v2 第一批：无符号分支 ----------------
+
 
 @factory.code
 def bltu(vm, ins: Instr) -> int | None:
@@ -260,7 +256,7 @@ def bgeu(vm, ins: Instr) -> int | None:
     return None
 
 
-# ---------------- v2 第一批：字节/半字访存 ----------------
+
 
 @factory.code
 def lb(vm, ins: Instr) -> None:
@@ -298,7 +294,7 @@ def sh(vm, ins: Instr) -> None:
     vm.sh(ins.rs1, ins.imm, vm.regs[ins.rs2])
 
 
-# ---------------- v2 第一批：环境调用（占位） ----------------
+
 
 @factory.code
 def ecall(vm, ins: Instr) -> None:
@@ -311,7 +307,6 @@ def ebreak(vm, ins: Instr) -> None:
     """断点（占位）：调试器接口，v1 直接 trap。"""
     raise RV32Trap_placeholder("ebreak: 断点未实现")
 
-# ---------------- v2 第二批：fence 占位 ----------------
 
 @factory.code
 def fence(vm, ins: Instr) -> None:
@@ -323,7 +318,6 @@ def fence_i(vm, ins: Instr) -> None:
     """指令屏障（占位）：取指不自修改（ROM 无写口）时天然满足，no-op。"""
 
 
-# ---------------- v2 第二批：M 扩展（神经版 32 拍：shift-add / restoring） ----------------
 
 def _trunc_div(a: int, b: int) -> int:
     """截断向零的整数除法（RV32M 语义；Python // 是向下取整，不可直接用）。"""
@@ -398,7 +392,6 @@ def remu(vm, ins: Instr) -> None:
     b = vm.regs[ins.rs2]
     vm.write(ins.rd, vm.regs[ins.rs1] if b == 0 else vm.regs[ins.rs1] % b)
 
-# ---------------- v2 第三批：Zba ----------------
 
 @factory.code
 def sh1add(vm, ins: Instr) -> None:

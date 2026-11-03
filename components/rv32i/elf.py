@@ -15,6 +15,7 @@ if _DIRECT:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "components.rv32i"
 
+from .constant import ROM_BASE
 from .core import RV32Trap
 
 EM_RISCV = 243
@@ -84,19 +85,19 @@ def load_elf(mem, elf: ElfFile, data: bytes) -> int:
 
 # ---------------- 合成分段自测（不依赖外部 gcc） ----------------
 
-def _make_test_elf() -> bytes:
-    """构造一个最小合法 ELF32：1 个 PT_LOAD（8 字节 @0x10000），入口同址。"""
+def _make_test_elf(base: int = ROM_BASE) -> bytes:
+    """构造一个最小合法 ELF32：1 个 PT_LOAD（8 字节 @base），入口同址。"""
     text = b"\x13\x05\x00\x00\x73\x00\x10\x00"   # addi a0,zero,0 ; ebreak（占位字节）
     phoff, phentsize = 52, 32
     e = bytearray(52)
     struct.pack_into("<16sHHIIIIIHHHHHH", e, 0,
                      b"\x7fELF" + bytes([1, 1, 1]) + bytes(9),   # 魔数/32位/小端/版本
                      2, EM_RISCV, 1,              # EXEC, RISC-V, version
-                     0x10000,                     # entry
+                     base,                        # entry
                      phoff, 0, 0, 52, phentsize, 1, 0, 0, 0)
     ph = bytearray(32)
     struct.pack_into("<IIIIIIII", ph, 0,
-                     PT_LOAD, phoff + phentsize, 0x10000, 0x10000,
+                     PT_LOAD, phoff + phentsize, base, base,
                      len(text), len(text), 5, 0x1000)
     return bytes(e) + bytes(ph) + text
 
@@ -104,14 +105,14 @@ def _make_test_elf() -> bytes:
 def main() -> None:
     from .core import Memory, RV32Config
     cfg = RV32Config()
-    data = _make_test_elf()
+    data = _make_test_elf(cfg.rom_base)
     elf = parse_elf(data)
-    assert elf.entry == 0x10000 and len(elf.segments) == 1
+    assert elf.entry == cfg.rom_base and len(elf.segments) == 1
     mem = Memory(cfg)
     entry = load_elf(mem, elf, data)
-    assert entry == 0x10000
-    assert mem.fetch_word(0x10000) == 0x00000513    # addi a0,zero,0
-    assert mem.fetch_word(0x10004) == 0x00100073    # ebreak
+    assert entry == cfg.rom_base
+    assert mem.fetch_word(cfg.rom_base) == 0x00000513    # addi a0,zero,0
+    assert mem.fetch_word(cfg.rom_base + 4) == 0x00100073    # ebreak
     try:
         parse_elf(b"not an elf at all.................")
         raise AssertionError("expected trap for bad magic")

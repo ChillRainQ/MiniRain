@@ -5,11 +5,17 @@ RV32I 指令集
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
-# ISA 字宽掩码。本层是纯编码/译码，不依赖 RV32Config（可以直接 python isa.py 跑），
-# 所以在这里自持一份；配置层的真源是 core.RV32Config.word_mask。
-WORD_MASK = (1 << 32) - 1
+_DIRECT = __package__ in (None, "")
+if _DIRECT:                       # `python isa.py` 直跑时补包路径（本层仍不依赖 RV32Config）
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "components.rv32i"
+
+# 字宽掩码只有一份（`constant.WORD_MASK`），编码/译码与参考机的 `word_mask` 不可能分岔。
+from .constant import WORD_MASK
 
 OP_OP     = 0b0110011   # R 型算术逻辑（add/sub/sll/...）
 OP_IMM    = 0b0010011   # I 型算术逻辑（addi/andi/slli/...）
@@ -81,9 +87,10 @@ TABLE: dict[str, tuple[str, int, int, int]] = {
     "rem":    ("R", OP_OP, 0b110, 0x01),     # 余（有符号）
     "remu":   ("R", OP_OP, 0b111, 0x01),     # 余（无符号）
     # --- v2 第三批：Zba（地址计算加速） ---
-    "sh1add": ("R", OP_OP, 0b100, 0x04),     # rd = (rs1 << 1) + rs2
-    "sh2add": ("R", OP_OP, 0b100, 0x14),     # rd = (rs1 << 2) + rs2
-    "sh3add": ("R", OP_OP, 0b100, 0x34),     # rd = (rs1 << 3) + rs2
+    # 编码按 RISC-V 规范：funct7 恒为 0x10，funct3 = 2/4/6 区分 1/2/3 位移
+    "sh1add": ("R", OP_OP, 0b010, 0x10),     # rd = (rs1 << 1) + rs2
+    "sh2add": ("R", OP_OP, 0b100, 0x10),     # rd = (rs1 << 2) + rs2
+    "sh3add": ("R", OP_OP, 0b110, 0x10),     # rd = (rs1 << 3) + rs2
 }
 
 _BASE_OFF = {"lw", "lb", "lbu", "lh", "lhu", "jalr"}   # 基址寻址写法的 I 型
