@@ -160,32 +160,6 @@ class MiniRainVLM(nn.Module):
         self.register_buffer("rope_sin1d", sin1d, persistent=False)
         self.register_buffer("rope_cos2d", cos2d, persistent=False)
         self.register_buffer("rope_sin2d", sin2d, persistent=False)
-        # chip 段（M4）：默认不挂。它跑的是 CPU 自己的 record token 流，与文本/图像
-        # 这条路径**不通残差**，所以不注册成子模块（→ 不进 state_dict、旧 ckpt 照旧 strict）
-        object.__setattr__(self, "_chip", None)
-        object.__setattr__(self, "_chip_out", None)
-
-    def attach_chip(self, seg=None, firmware=None):
-        """把 chip 段挂在层栈之前（§4 M4）。
-
-        段是**旁路**：文本/图像路径只多一次调用，`hidden_states` 一个 bit 都不碰，
-        所以 J4（"接上宿主后 ppl 不变"）是结构性的，不靠投影权重恰好为 0。
-
-        `seg` 不给就现编（真固件约 10 s / 165 MB）：`attach_chip(firmware=...)`。
-        **刻意不走 `self.chip = seg`**：那会被 `nn.Module.__setattr__` 注册成子模块，
-        编译权重就混进 `state_dict`，旧 ckpt 一加载就报 unexpected keys。
-        """
-        if seg is None:
-            from components.rv32i.host import ChipSegment
-            seg = ChipSegment.build(firmware, d0=self.config.hidden_size)
-        object.__setattr__(self, "_chip", seg)
-        return seg
-
-    def chip_step(self, tokens, carry=None):
-        """跑芯片段的一串 CPU token，返回 (残差 (n, hidden) fp32, carry)。"""
-        if getattr(self, "_chip", None) is None:
-            raise RuntimeError("没挂芯片段：先 attach_chip()")
-        return self._chip.step(tokens, carry)
 
     def prepare_inputs_embeds(self, input_ids, pixel_values=None):
         inputs_embeds = self.embed(input_ids)
@@ -226,8 +200,7 @@ class MiniRainVLM(nn.Module):
         return mask.unsqueeze(1)
 
     def forward(self, input_ids, pixel_values=None, positions=None,
-                attention_mask=None, past_key_values=None, use_cache=False,
-                cpu_tokens=None, cpu_carry=None, **kwargs):
+                attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
@@ -270,10 +243,6 @@ class MiniRainVLM(nn.Module):
             self.rope_cos1d, self.rope_sin1d, self.rope_cos2d, self.rope_sin2d)
 
         presents, past_hidden_states = [], []
-        # chip 段插在层栈之前（§4 M4）：一次前向一拍 CPU，与文本 token 不是同一条
-        # 路径，所以这里既不读也不写 hidden_states。结果挂在 `_chip_out` 上给调用方取。
-        if cpu_tokens is not None and getattr(self, "_chip", None) is not None:
-            object.__setattr__(self, "_chip_out", self._chip.step(cpu_tokens, cpu_carry))
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present, past_hidden_states = layer(
                 hidden_states,

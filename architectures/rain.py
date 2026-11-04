@@ -44,27 +44,9 @@ class MiniRainModel(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-        # chip 段（M4）：默认不挂，与 rain_v 的 MiniRainVLM 同一套约定（旁路，不进 state_dict）
-        object.__setattr__(self, "_chip", None)
-        object.__setattr__(self, "_chip_out", None)
-
-    def attach_chip(self, seg=None, firmware=None):
-        """挂上 chip 段（旁路）。见 `components/rv32i/host.py` 与 rain_v 的同名方法。"""
-        if seg is None:
-            from components.rv32i.host import ChipSegment
-            seg = ChipSegment.build(firmware, d0=self.config.hidden_size)
-        object.__setattr__(self, "_chip", seg)
-        return seg
-
-    def chip_step(self, tokens, carry=None):
-        """跑芯片段的一串 CPU token，返回 (残差 (n, hidden) fp32, carry)。"""
-        if getattr(self, "_chip", None) is None:
-            raise RuntimeError("没挂芯片段：先 attach_chip()")
-        return self._chip.step(tokens, carry)
-        
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
-                cpu_tokens=None, cpu_carry=None, **kwargs):
+                **kwargs):
         batch_size, seq_length = input_ids.shape
         
         if hasattr(past_key_values, 'layers'): past_key_values = None
@@ -77,9 +59,6 @@ class MiniRainModel(nn.Module):
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
         past_hidden_states = []
-        # chip 段插在层栈之前：它跑 CPU 自己的 record token 流，不碰 hidden_states
-        if cpu_tokens is not None and getattr(self, "_chip", None) is not None:
-            object.__setattr__(self, "_chip_out", self._chip.step(cpu_tokens, cpu_carry))
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present, past_hidden_states = layer(
                 hidden_states,

@@ -45,13 +45,12 @@ class RV32Config:
     heap_base: int = HEAP_BASE     # 堆从 0x100 起（低端保留：中断向量等扩展位）
     stack_top: int = STACK_TOP     # 栈顶（RAM 顶端，向下增长）
 
-    # ---- `<cpu_call>` 文本缓冲（M5 前置，电路侧的内存，不在 `Memory` 里）----
-    # Qwen 的文本 token 落在 `text_base` 起、每行 `text_row` 字节。地址上是 RAM 上界之上的
-    # 一块空洞：`text_base` 恰好等于 `stack_top`，但栈是向下长的，不撞车；再往上是
+    # ---- `<cpu_call>` 文本缓冲（`Memory` 的第三段：只读、不可取指）----
+    # token 落在 `text_base` 起、每行 `text_row` 字节。地址上是 RAM 上界之上的一块空洞：
+    # `text_base` 恰好等于 `stack_top`，但栈是向下长的，不撞车；再往上是
     # `drom_base = 0x20000`，中间还空 105 KB。
     # `cap_max` 是“同时捕获的 token 数”，行号 **1-based**（第 k 个 token 写第 k 行，第 0 行
-    # 空着，照 Qwenputer 的约定）；`text_rows = 160` 给 128 个 token 留 32 行余量，因为 7 位
-    # 行号只到 127。账在 plan.md §9「载荷上限 80 -> 128」。
+    # 空着）；`text_rows = 160` 给 128 个 token 留 32 行余量，因为 7 位行号只到 127。
     text_base: int = TEXT_BASE
     text_rows: int = TEXT_ROWS
     text_row: int = TEXT_ROW       # 每行字节数 = 单个 token 的最坏 UTF-8 长度
@@ -98,12 +97,12 @@ class RV32Config:
 
     @property
     def rom_words(self) -> int:
-        """ROM 指令容量 = rom_size / 4；神经版取指权重表的行数。"""
+        """ROM 指令容量 = rom_size / 4。"""
         return self.rom_size // 4
 
     @property
     def ram_words(self) -> int:
-        """RAM 字数；神经版 MemState 的行数（M ∈ R^{ram_words × word_bits}）。"""
+        """RAM 字数 = ram_size / 4。"""
         return self.ram_size // 4
 
 
@@ -207,8 +206,7 @@ class Memory:
 class RegisterFile:
     """x0..x31，word_bits 宽；x0 恒 0（write 丢弃，组件层保证）。
 
-    神经映射（ISA.md §6.2）：32 槽的小 MemState——one-hot 读、门控写，
-    x0 槽写门控恒 0。容量定死，覆盖写，无淘汰问题。
+    32 槽，定长；x0 恒 0（写丢弃），其余覆盖写。
     """
     def __init__(self, cfg: RV32Config) -> None:
         self.cfg = cfg

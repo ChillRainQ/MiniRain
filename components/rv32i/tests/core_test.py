@@ -66,9 +66,7 @@ def main() -> None:
     assert st.regs[1] == 41 and st.regs[2] == 42
 
     # 取指段属性：哈佛——只有 ROM 可取指，RAM 里就算放的是一条合法指令也不许取。
-    # 电路侧没有这条通路（`circuit.py` 的 `fetch()` 就是 `rom()`，`q` 接 `cnt`；RAM 的表
-    # `q` 接 `res`），所以参考机默认也得跟上，否则会出现“参考机过了、电路挂”的分叉。
-    # `ram_executable` 是给冯诺依曼变体留的显式开关，不影响电路。
+    # `ram_executable` 是给冯诺依曼变体留的显式开关。
     word = encode_i("addi", 1, 0, 41).to_bytes(4, "little")
     cfg_x = RV32Config(ram_executable=True)
     st_x = State(cfg_x)
