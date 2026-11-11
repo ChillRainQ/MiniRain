@@ -1,5 +1,5 @@
 """
-interpreter.py: ISA-RV32 v1 参考解释器
+interpreter.py: ISA-RV32 参考解释器
 """
 
 from __future__ import annotations

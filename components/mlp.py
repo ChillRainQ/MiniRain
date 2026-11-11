@@ -52,21 +52,97 @@ class MLP(MyMLP):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
+class FastWeightProgrammer(nn.Module):
+    """学习 prompt 条件的低秩更新规则：ΔW = scale * Σᵣ αᵣ uᵣvᵣᵀ。
+
+    u/v 是可学习的更新基，controller 只生成每个基的混合系数，避免直接回归完整权重。
+    最后一层零初始化使初始 ΔW=0，启用 FWP 不会改变未训练模型的行为。
+    """
+    names = ("gate", "up", "down")
+
+    def __init__(self, linears: dict[str, nn.Linear], prompt_size: int, rank: int,
+                 hidden_size: int, update_scale: float):
+        super().__init__()
+        self.update_scale = update_scale
+        self.controller = nn.Sequential(
+            nn.Linear(prompt_size, hidden_size), nn.SiLU(), nn.Linear(hidden_size, 3 * rank))
+        nn.init.zeros_(self.controller[-1].weight)
+        nn.init.zeros_(self.controller[-1].bias)
+        self.u = nn.ParameterDict()
+        self.v = nn.ParameterDict()
+        for name, linear in linears.items():
+            out_features, in_features = linear.weight.shape
+            self.u[name] = nn.Parameter(torch.empty(rank, out_features))
+            self.v[name] = nn.Parameter(torch.empty(rank, in_features))
+            nn.init.normal_(self.u[name], std=0.02)
+            nn.init.normal_(self.v[name], std=0.02)
+        # 运行时状态不是模型参数，不进 state_dict；首轮创建，多轮累加，新会话清空
+        self._delta_cache = None
+
+    def forward(self, prompt_context: torch.Tensor):
+        coefficients = self.controller(prompt_context).chunk(3, dim=-1)
+        return tuple(
+            torch.einsum("br,ro,ri->boi", alpha, self.u[name], self.v[name]) * self.update_scale
+            for name, alpha in zip(self.names, coefficients))
+
+    def cache(self, deltas):
+        self._delta_cache = tuple(delta.detach() for delta in deltas)
+
+    def clear(self):
+        self._delta_cache = None
+
+
 class SwiGLU(MyMLP):
-    def __init__(self, args: MLPArgs):
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        fwp_rank = int(getattr(config, "fwp_rank", 0))
+        self.fwp = FastWeightProgrammer(
+            {"gate": self.gate, "up": self.up, "down": self.down},
+            prompt_size=args.hidden_size, rank=fwp_rank,
+            hidden_size=int(getattr(config, "fwp_hidden_size", 128)),
+            update_scale=float(getattr(config, "fwp_update_scale", 1.0)),
+        ) if fwp_rank > 0 else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _HAS_LIGER_SWIGLU and x.is_cuda:
+    @staticmethod
+    def _updated_linear(x, linear, delta, batch_idx=None):
+        if delta is None:
+            return linear(x)
+        if batch_idx is not None:
+            delta = delta.index_select(0, batch_idx)
+        weight = linear.weight.unsqueeze(0) + delta  # W_eff = W + ΔW，每个样本独立
+        if x.dim() == 2:
+            out = torch.einsum("ni,noi->no", x, weight)
+        else:
+            out = torch.einsum("bti,boi->bto", x, weight)
+        return out if linear.bias is None else out + linear.bias
+
+    def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
+                batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
+        deltas = None
+        if self.fwp is not None:
+            if fwp_context is not None:
+                deltas = self.fwp(fwp_context)
+                if fwp_accumulate and self.fwp._delta_cache is not None:
+                    deltas = tuple(old + new for old, new in zip(self.fwp._delta_cache, deltas))
+                if not self.training:
+                    self.fwp.cache(deltas)
+            else:
+                deltas = self.fwp._delta_cache
+            if deltas is None:
+                raise RuntimeError("FWP 缺少 prompt 更新：请先执行 prefill 或传入 fwp_context")
+        gate_delta, up_delta, down_delta = deltas if deltas is not None else (None, None, None)
+        if deltas is None and _HAS_LIGER_SWIGLU and x.is_cuda:
             return self.down(LigerSiLUMulFunction.apply(self.gate(x), self.up(x)))
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        gate = self._updated_linear(x, self.gate, gate_delta, batch_idx)
+        up = self._updated_linear(x, self.up, up_delta, batch_idx)
+        return self._updated_linear(F.silu(gate) * up, self.down, down_delta, batch_idx)
 
 class LowRankMLP(MyMLP):
     ...
-
+ 
 class SiTUGLU(MyMLP):
     def __init__(self, args: MLPArgs):
         super().__init__()
@@ -96,17 +172,18 @@ class MoTFFN(nn.Module):
     def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
-        self.mlp_t = SwiGLU(args)
+        self.mlp_t = SwiGLU(args, config=config)
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
-                                    bias=args.bias))
+                                    bias=args.bias), config=config)
         self.norm_t = TorchRMSNorm(norm_args)
         self.norm_v = TorchRMSNorm(norm_args)
 
-    def forward(self, x, img_idx=None):
+    def forward(self, x, img_idx=None, fwp_context=None, fwp_accumulate=False):
         # 纯文本快速路径（decode 常态）：无图像 token 时直接走文本专家，省掉 nonzero/分拣
         if img_idx is None or img_idx.numel() == 0:
-            return self.mlp_t(self.norm_t(x))
+            return self.mlp_t(self.norm_t(x), fwp_context=fwp_context,
+                              fwp_accumulate=fwp_accumulate)
 
         B, T, D = x.shape
         flat = x.reshape(-1, D)
@@ -119,7 +196,10 @@ class MoTFFN(nn.Module):
                                (img_idx, self.norm_v, self.mlp_v)):
             if idx.numel() == 0:
                 continue
-            y = mlp(norm(flat.index_select(0, idx)))
+            # MoT 将 token 展平后仍需知道其所属样本，才能选择该样本自己的 ΔW
+            batch_idx = torch.div(idx, T, rounding_mode="floor")
+            y = mlp(norm(flat.index_select(0, idx)), fwp_context=fwp_context,
+                    batch_idx=batch_idx, fwp_accumulate=fwp_accumulate)
             if out is None:
                 out = y.new_empty(B * T, D)
             out.index_copy_(0, idx, y)

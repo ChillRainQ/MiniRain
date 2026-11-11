@@ -5,6 +5,7 @@ import argparse, sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from _device import add_device_args, list_gpus, resolve_device
@@ -15,7 +16,7 @@ from components.norm import RMSNorm, NormArgs
 from components.attention import (apply_rotary_pos_emb, repeat_kv,
                                   GroupQueryAttention, MoTGroupQueryAttention, AttentionArgs)
 from components.block import BlockAttnRes, BlockAttnResBlock, FlushBlockAttnResBlock
-from components.mlp import SwiGLU, LosslessMoE, MLPArgs
+from components.mlp import SwiGLU, LosslessMoE, MLPArgs, MoTFFN
 
 _p = argparse.ArgumentParser(description="MiniRainVLM 部件级测试")
 add_device_args(_p)
@@ -209,6 +210,69 @@ for w, n in [(sg.gate.weight, "gate"), (sg.up.weight, "up"), (sg.down.weight, "d
 sg(xm).sum().backward()
 check("SwiGLU 三个权重都有梯度",
       all(w.grad is not None and w.grad.abs().sum() > 0 for w in [sg.gate.weight, sg.up.weight, sg.down.weight]))
+
+# FWP：prompt -> 混合系数 -> 低秩更新基叠加 -> W+ΔW
+cfg_fwp = RainConfig(hidden_size=D, fwp_rank=2, fwp_hidden_size=32)
+sg_fwp = SwiGLU(MLPArgs(hidden_size=D, intermediate_size=64, bias=False), config=cfg_fwp).to(DEVICE)
+ctx = torch.randn(2, D, device=DEVICE)
+ref = sg_fwp.down(F.silu(sg_fwp.gate(xm)) * sg_fwp.up(xm))
+check("FWP 零初始化时输出与原 SwiGLU 完全一致", torch.equal(sg_fwp(xm, fwp_context=ctx), ref))
+with torch.no_grad():
+    nn.init.normal_(sg_fwp.fwp.controller[-1].weight, std=0.02)
+deltas = sg_fwp.fwp(ctx)
+check("FWP 三个 ΔW 与 gate/up/down 权重同形",
+      all(d.shape == (2, *w.shape) for d, w in zip(
+          deltas, [sg_fwp.gate.weight, sg_fwp.up.weight, sg_fwp.down.weight])))
+check("不同 prompt 生成不同更新", not torch.equal(deltas[0][0], deltas[0][1]))
+sg_fwp.train()
+out_fwp = sg_fwp(xm, fwp_context=ctx)
+g = sg_fwp._updated_linear(xm, sg_fwp.gate, deltas[0])
+u = sg_fwp._updated_linear(xm, sg_fwp.up, deltas[1])
+ref_fwp = sg_fwp._updated_linear(F.silu(g) * u, sg_fwp.down, deltas[2])
+check("FWP 前向使用合并后的 W+ΔW", torch.equal(out_fwp, ref_fwp))
+out_fwp.square().mean().backward()
+check("FWP controller 可反向学习",
+      sg_fwp.fwp.controller[-1].weight.grad is not None
+      and sg_fwp.fwp.controller[-1].weight.grad.abs().sum() > 0)
+check("FWP 更新基可反向学习",
+      all(p.grad is not None and p.grad.abs().sum() > 0
+          for p in list(sg_fwp.fwp.u.values()) + list(sg_fwp.fwp.v.values())))
+sg_fwp.eval()
+with torch.no_grad():
+    prefill = sg_fwp(xm, fwp_context=ctx)
+    decode = sg_fwp(xm[:, :1])
+    decode_ref = sg_fwp(xm[:, :1], fwp_context=ctx)
+check("FWP decode 复用 prefill 更新", torch.equal(decode, decode_ref))
+check("FWP 运行时 ΔW 不进入 state_dict", not any("delta_cache" in k for k in sg_fwp.state_dict()))
+sg_fwp.fwp.clear()
+try:
+    sg_fwp(xm[:, :1])
+    cache_guard = False
+except RuntimeError:
+    cache_guard = True
+check("FWP 清空状态后禁止无 prefill decode", cache_guard)
+
+mot_cfg = RainConfig(hidden_size=D, use_mot=True, vision_ffn_scale=2, fwp_rank=2, fwp_hidden_size=32)
+mot = MoTFFN(2, MLPArgs(hidden_size=D, intermediate_size=64, bias=False),
+             NormArgs(dim=D, eps=1e-6), mot_cfg).to(DEVICE).eval()
+for branch in (mot.mlp_t, mot.mlp_v):
+    with torch.no_grad():
+        nn.init.normal_(branch.fwp.controller[-1].weight, std=0.02)
+x_mot = torch.randn(2, 4, D, device=DEVICE)
+img_idx_mot = torch.tensor([3], device=DEVICE)  # 仅样本 0 的最后一个 token 走图像专家
+ctx_a = torch.randn(2, D, device=DEVICE)
+ctx_b = ctx_a.clone()
+ctx_b[1] = ctx_b[1] + 1.0
+ctx_c = ctx_a.clone()
+ctx_c[0] = ctx_c[0] + 1.0
+with torch.no_grad():
+    mot_a = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_a)
+    mot_b = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_b)
+    mot_c = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_c)
+check("MoT FWP 修改样本1不影响样本0", torch.equal(mot_a[0], mot_b[0]))
+check("MoT FWP 文本专家响应自身 prompt", not torch.equal(mot_a[1], mot_b[1]))
+check("MoT FWP 图像专家响应自身 prompt", not torch.equal(mot_a[0, -1], mot_c[0, -1]))
+
 moe = LosslessMoE(dim=D, intermediate_size=64, num_experts=4, top_k=2, num_shared_experts=1, aux_scale=0.01).to(DEVICE).eval()
 with torch.no_grad():
     out_moe, logits_m, aux_m = moe(xm)
@@ -319,6 +383,56 @@ with torch.no_grad():
     o2 = m2(input_ids=ids9)
 check("state_dict 往返后输出一致", torch.allclose(o.logits, o2.logits, atol=1e-6),
       f"max diff {(o.logits - o2.logits).abs().max():.2e}")
+
+# FWP 整机：显式 prompt 边界、端到端梯度、generate prefill/decode 状态
+cfg_fwp_model = RainConfig(hidden_size=D, n_hidden_layers=2, n_attn_heads=NH,
+                           n_key_value_heads=NKV, block_size=2, fwp_rank=2, fwp_hidden_size=32)
+m_fwp = MiniRainVForCausalLM(cfg_fwp_model).to(DEVICE).train()
+try:
+    m_fwp(input_ids=ids9, labels=lab)
+    prompt_guard = False
+except ValueError as exc:
+    prompt_guard = "prompt_mask" in str(exc)
+check("FWP 训练缺少 prompt_mask 时显式报错", prompt_guard)
+prompt_mask9 = torch.zeros_like(ids9)
+prompt_mask9[:, :4] = 1
+o_fwp = m_fwp(input_ids=ids9, labels=lab, prompt_mask=prompt_mask9)
+o_fwp.loss.backward()
+fwp_controller_params = [p for n, p in m_fwp.named_parameters() if "fwp.controller" in n]
+check("FWP 整机 loss 反向到全部 controller",
+      len(fwp_controller_params) > 0
+      and all(p.grad is not None for p in fwp_controller_params))
+m_fwp.eval()
+with torch.no_grad():
+    for name, param in m_fwp.named_parameters():
+        if name.endswith("fwp.controller.2.weight"):
+            nn.init.normal_(param, std=0.02)
+    generated_fwp = m_fwp.generate_hf(input_ids=ids9, max_new_tokens=2, do_sample=False)
+check("FWP generate_hf 正常生成", generated_fwp.shape == (2, 11))
+fwp_modules = [m for m in m_fwp.model.modules() if m.__class__.__name__ == "FastWeightProgrammer"]
+check("FWP prefill 后每层都有运行时更新", len(fwp_modules) > 0
+      and all(m._delta_cache is not None for m in fwp_modules))
+with torch.no_grad():
+    turn1 = m_fwp.generate(input_ids=ids9, max_new_tokens=1, do_sample=False, return_kv=True)
+    delta_turn1 = [d.clone() for d in fwp_modules[0]._delta_cache]
+    turn2_ids = torch.cat([turn1["generated_ids"], ids9[:, :2]], dim=1)
+    past_len = turn1["past_kv"][0][0].shape[1]
+    turn2_context = m_fwp.model.embed(turn2_ids[:, past_len:]).mean(dim=1)
+    turn2_increment = fwp_modules[0](turn2_context)
+    turn2 = m_fwp.generate(input_ids=turn2_ids, past_key_values=turn1["past_kv"],
+                           max_new_tokens=1, do_sample=False, return_kv=True)
+    delta_turn2 = [d.clone() for d in fwp_modules[0]._delta_cache]
+    turn3_ids = torch.cat([turn2["generated_ids"], ids9[:, 2:4]], dim=1)
+    m_fwp.generate_hf(input_ids=turn3_ids, past_key_values=turn2["past_kv"],
+                      max_new_tokens=1, do_sample=False)
+check("FWP 手写 generate 多轮快权 = 旧快权 + 本轮增量",
+      all(torch.allclose(new, old + increment, atol=1e-6)
+          for old, new, increment in zip(delta_turn1, delta_turn2, turn2_increment)),
+      f"max diff {max((new - old - increment).abs().max().item() for old, new, increment in zip(delta_turn1, delta_turn2, turn2_increment)):.2e}")
+check("FWP generate_hf 带 KV 时根据新增 prompt 更新快权",
+      all(not torch.equal(old, new) for old, new in zip(delta_turn2, fwp_modules[0]._delta_cache)))
+m_fwp.model.reset_fwp()
+check("FWP 新生成/reset 清空全部序列状态", all(m._delta_cache is None for m in fwp_modules))
 # MoE 整机
 m_moe = MiniRainVForCausalLM(cfg_moe).to(DEVICE).eval()
 with torch.no_grad():

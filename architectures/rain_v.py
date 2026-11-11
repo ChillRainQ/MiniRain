@@ -8,9 +8,20 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from architectures.config import RainConfig
 from components.block import BlockAttnResBlock, FlushBlockAttnResBlock
 from components.cv import ConvStem
+from components.mlp import FastWeightProgrammer
 from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
 from losses.loss import get_loss_fn
+
+
+class _LegacyKVCache(list):
+    """给跨 generate 调用的旧版 list 缓存补齐 HF 只读接口，不改变模型缓存格式。"""
+    is_compileable = False
+
+    def get_seq_length(self):
+        return self[0][0].shape[1] if self and self[0] is not None else 0
+
+
 # def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
 #     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
 #     half = head_dim // 2
@@ -199,15 +210,44 @@ class MiniRainVLM(nn.Module):
                            torch.full((), float("-inf"), dtype=dtype, device=device))
         return mask.unsqueeze(1)
 
+    def reset_fwp(self):
+        """清除所有 SwiGLU 的运行时 ΔW；慢权重和 checkpoint 不受影响。"""
+        for module in self.modules():
+            if isinstance(module, FastWeightProgrammer):
+                module.clear()
+
     def forward(self, input_ids, pixel_values=None, positions=None,
-                attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+                attention_mask=None, past_key_values=None, use_cache=False,
+                prompt_mask=None, fwp_prefill=None, fwp_accumulate=False, **kwargs):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
         past_key_values = past_key_values or [None] * self.n_hidden_layers
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
-        hidden_states = self.dropout(self.prepare_inputs_embeds(input_ids, pixel_values))
+        inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values)
+        hidden_states = self.dropout(inputs_embeds)
+
+        # 首轮汇总完整 prompt；带 KV 的新一轮只汇总新增 token；decode 复用本轮 ΔW。
+        # 训练必须显式划分 prompt，否则整段 teacher-forcing 序列会把未来 token 泄漏给更新器。
+        fwp_context = None
+        if fwp_prefill is None:
+            fwp_prefill = start_pos == 0 or seq_length > 1
+        if self.config.fwp_rank > 0 and fwp_prefill:
+            if self.training and prompt_mask is None:
+                raise ValueError("启用 FWP 的训练前向必须传 prompt_mask，防止未来 token 泄漏")
+            if prompt_mask is not None and prompt_mask.shape != input_ids.shape:
+                expected = (batch_size, start_pos + seq_length)
+                if start_pos == 0 or prompt_mask.shape != expected:
+                    raise ValueError(f"prompt_mask 形状应为 {tuple(input_ids.shape)}，实际为 {tuple(prompt_mask.shape)}")
+            context_mask = prompt_mask if prompt_mask is not None else attention_mask
+            if context_mask is not None and context_mask.shape[1] != seq_length:
+                context_mask = context_mask[:, -seq_length:]
+            if context_mask is None:
+                context_mask = torch.ones_like(input_ids)
+            weights = context_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+            fwp_context = ((inputs_embeds * weights).sum(dim=1)
+                           / weights.sum(dim=1).clamp_min(1.0))
 
         # padding 判断只做一次（避免注意力里每层 .item() 同步）；全有效时置 None 走因果快路径
         if attention_mask is not None:
@@ -253,7 +293,9 @@ class MiniRainVLM(nn.Module):
                 past_hidden_states=past_hidden_states,
                 image_bidirectional_mask=image_bidirectional_mask,
                 modality_mask=modality_mask,
-                img_idx=img_idx
+                img_idx=img_idx,
+                fwp_context=fwp_context,
+                fwp_accumulate=fwp_accumulate,
             )
             presents.append(present)
         hidden_states = self.text_norm(hidden_states)
@@ -276,11 +318,13 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         self.post_init()
 
     def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
-                past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+                past_key_values=None, use_cache=False, logits_to_keep=0, labels=None,
+                prompt_mask=None, fwp_prefill=None, fwp_accumulate=False, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids, pixel_values=pixel_values, positions=positions,
             attention_mask=attention_mask, past_key_values=past_key_values,
-            use_cache=use_cache, **kwargs)
+            use_cache=use_cache, prompt_mask=prompt_mask, fwp_prefill=fwp_prefill,
+            fwp_accumulate=fwp_accumulate, **kwargs)
 
         loss = None
         logits = None
@@ -316,13 +360,17 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                  streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                  repetition_penalty=1.0, **kwargs):
         return_kv = kwargs.pop("return_kv", False)
+        past_key_values = kwargs.pop("past_key_values", None)
+        fwp_accumulate = past_key_values is not None
+        if past_key_values is None:
+            self.model.reset_fwp()
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         if positions is not None: positions = positions.repeat(num_return_sequences, 1, 1)
         if pixel_values is not None and num_return_sequences > 1:
             # 与 input_ids.repeat 对齐：每条样本连续复制 nrs 份（list*nrs 是整批循环，会导致图错配）
             pixel_values = [p for p in pixel_values for _ in range(num_return_sequences)]
-        past_key_values = kwargs.pop("past_key_values", None)
+        fwp_prefill = True
         if not use_cache and positions is not None:
             raise ValueError("use_cache=False 时 positions 需随序列增长，暂不支持带图 prompt；请改用 use_cache=True")
         # 每个样本独立维护下一个位置：图像段占用了额外的行号，不能用 past_len；[B]
@@ -343,7 +391,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values, use_cache=use_cache,
                 logits_to_keep=1 if past_len == 0 else 0,  # prefill 只留最后一个
-                **kwargs)
+                fwp_prefill=fwp_prefill, fwp_accumulate=fwp_accumulate, **kwargs)
+            fwp_prefill = False
             if step_positions is not None: next_pos = next_pos + 1
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
@@ -403,6 +452,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                                             num_new_tokens=1):
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=is_encoder_decoder, num_new_tokens=num_new_tokens)
+        if "fwp_prefill" in model_kwargs:
+            model_kwargs["fwp_prefill"] = False  # 首轮新增 prompt 已汇总，后续 decode 只读快权
         positions = model_kwargs.get("positions")
         if positions is not None:
             nxt = positions[..., 0].max(dim=1).values + 1                      # [B]
@@ -418,7 +469,11 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                     streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                     repetition_penalty=1.0, **kwargs):
         """走 HF GenerationMixin 的 generate"""
+        if kwargs.get("past_key_values") is None:
+            self.model.reset_fwp()
         input_ids = kwargs.pop("input_ids", inputs)
+        if type(kwargs.get("past_key_values")) is list:
+            kwargs["past_key_values"] = _LegacyKVCache(kwargs["past_key_values"])
         if pixel_values is not None and num_return_sequences > 1:
             pixel_values = [p for p in pixel_values for _ in range(num_return_sequences)]
         logits_processor = LogitsProcessorList([
@@ -430,4 +485,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             eos_token_id=eos_token_id, streamer=streamer, use_cache=use_cache,
             num_return_sequences=num_return_sequences, do_sample=do_sample,
-            repetition_penalty=repetition_penalty, **kwargs)
+            repetition_penalty=repetition_penalty, disable_compile=True,
+            **({"fwp_prefill": True,
+                "fwp_accumulate": kwargs.get("past_key_values") is not None}
+               if self.config.fwp_rank > 0 else {}), **kwargs)

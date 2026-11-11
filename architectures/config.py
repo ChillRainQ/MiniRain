@@ -63,6 +63,10 @@ class RainConfig(PretrainedConfig):
         self.block_size = int(kwargs.get("block_size", 0))
         # 聚合段梯度检查点：反向重算 norm/加权和，省掉 stack 缓冲的持有（长上下文训练省显存）
         self.attn_res_checkpoint = bool(kwargs.get("attn_res_checkpoint", False))
+        # FWP：prompt 条件的低秩慢权重更新；0=关闭。覆盖 Dense/MoT 的 SwiGLU，不含 MoE
+        self.fwp_rank = int(kwargs.get("fwp_rank", 0))
+        self.fwp_hidden_size = int(kwargs.get("fwp_hidden_size", 128))
+        self.fwp_update_scale = float(kwargs.get("fwp_update_scale", 1.0))
         self.patch_size = int(kwargs.get("patch_size", 16))
         # vision
         self.vision_ffn_scale: int = int(kwargs.get("vision_ffn_scale", 1))
