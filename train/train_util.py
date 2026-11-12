@@ -150,12 +150,12 @@ def get_model_params(model, config) :
     if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
     else: Logger(f'Model Params: {total:.2f}M')
 
-def init_model(config, from_weight='pretrain', tokenizer_path='../tokenizers', save_dir='../outputs', device='cuda'):
+def init_model(config, from_weight='pretrain', tokenizer_path='../tokenizers', save_dir='../outputs', device='cuda', model_type: str = 'v'):
     """
     初始化模型
     """
     device = device if torch.cuda.is_available() else 'cpu'
-    model = MiniRainVForCausalLM(config) if config.model_type_ in ['v', 'V'] else MiniRainForCausalLM(config)
+    model = MiniRainVForCausalLM(config) if model_type in ['v', 'V'] else MiniRainForCausalLM(config)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     if from_weight != "none":

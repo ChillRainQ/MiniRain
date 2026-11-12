@@ -172,6 +172,12 @@ class MiniRainVLM(nn.Module):
         self.register_buffer("rope_cos2d", cos2d, persistent=False)
         self.register_buffer("rope_sin2d", sin2d, persistent=False)
 
+        # FWP 默认关：fwp_rank>0 时必须有模块真正接上，否则会静默失效（SwiGLU 本身不带 FWP）
+        if self.config.fwp_rank > 0 and not any(
+                isinstance(m, FastWeightProgrammer) for m in self.modules()):
+            raise ValueError("fwp_rank>0 但模型里没有任何 FastWeightProgrammer："
+                             "SwiGLU 不内置 FWP，需把文本侧 MLP 换成 SwiGLUWithFWP")
+
     def prepare_inputs_embeds(self, input_ids, pixel_values=None):
         inputs_embeds = self.embed(input_ids)
         if pixel_values is None:

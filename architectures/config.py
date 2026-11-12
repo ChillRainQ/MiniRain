@@ -18,7 +18,7 @@ class RainConfig(PretrainedConfig):
             self.type_id = 3
         else:
             self.type_id = 1
-        self.model_type_: str = str(kwargs.get("model_type", ""))
+        # self.model_type_: str = str(kwargs.get("model_type", ""))
         self.vocab_size: int = int(kwargs.get("vocab_size", 16384))
         self.hidden_size: int = hidden_size
         self.n_hidden_layers: int = n_hidden_layers

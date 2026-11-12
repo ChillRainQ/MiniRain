@@ -16,7 +16,7 @@ from components.norm import RMSNorm, NormArgs
 from components.attention import (apply_rotary_pos_emb, repeat_kv,
                                   GroupQueryAttention, MoTGroupQueryAttention, AttentionArgs)
 from components.block import BlockAttnRes, BlockAttnResBlock, FlushBlockAttnResBlock
-from components.mlp import SwiGLU, LosslessMoE, MLPArgs, MoTFFN
+from components.mlp import SwiGLU, SwiGLUWithFWP, LosslessMoE, MLPArgs, MoTFFN
 
 _p = argparse.ArgumentParser(description="MiniRainVLM 部件级测试")
 add_device_args(_p)
@@ -225,10 +225,13 @@ check("SwiGLU 三个权重都有梯度",
 
 # FWP：prompt -> 混合系数 -> 两次低秩乘积，不物化完整 ΔW
 cfg_fwp = RainConfig(hidden_size=D, fwp_rank=2, fwp_hidden_size=32)
-check("FWP 默认关闭（不传 fwp=True 时 fwp is None）",
-      SwiGLU(MLPArgs(hidden_size=D, intermediate_size=64, bias=False), config=cfg_fwp).fwp is None)
-sg_fwp = SwiGLU(MLPArgs(hidden_size=D, intermediate_size=64, bias=False), config=cfg_fwp,
-                fwp=True).to(DEVICE)
+args_fwp = MLPArgs(hidden_size=D, intermediate_size=64, bias=False)
+check("FWP 默认关：SwiGLU 不内置 FWP", SwiGLU(args_fwp, config=cfg_fwp).fwp is None)
+check("未显式 opt-in 时 SwiGLUWithFWP 也不创建 FWP",
+      SwiGLUWithFWP(args_fwp, config=cfg_fwp).fwp is None)
+check("fwp_rank=0 时 SwiGLUWithFWP 退化为普通 SwiGLU",
+      SwiGLUWithFWP(args_fwp, config=RainConfig(hidden_size=D), fwp=True).fwp is None)
+sg_fwp = SwiGLUWithFWP(args_fwp, config=cfg_fwp, fwp=True).to(DEVICE)
 ctx = torch.randn(2, D, device=DEVICE)
 ref = sg_fwp.down(F.silu(sg_fwp.gate(xm)) * sg_fwp.up(xm))
 check("FWP 零初始化时输出与原 SwiGLU 完全一致", torch.equal(sg_fwp(xm, fwp_context=ctx), ref))

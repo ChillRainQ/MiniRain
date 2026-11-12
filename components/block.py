@@ -2,7 +2,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedConfig
 
-from components.mlp import SwiGLU, LosslessMoE, MoTFFN
+from components.mlp import SwiGLU, SwiGLUWithFWP, LosslessMoE, MoTFFN
 from components.mlp import MLPArgs
 from components.norm import NormArgs
 from components.attention import AttentionArgs, MoTGroupQueryAttention
@@ -110,8 +110,8 @@ class MiniRainBlock(nn.Module):
         self.attn = GroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
-                                  bias=False), config=config, fwp=True)
+        self.mlp = SwiGLUWithFWP(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
+                                         bias=False), config=config, fwp=True)
 
 
     def forward(self, hidden_states, position_embeddings,
@@ -141,9 +141,9 @@ class FullAttnResBlock(nn.Module):
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
-            self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                      intermediate_size=config.intermediate_size, bias=False), config=config,
-                              fwp=True)
+            self.mlp = SwiGLUWithFWP(MLPArgs(hidden_size=config.hidden_size,
+                                             intermediate_size=config.intermediate_size, bias=False), config=config,
+                                     fwp=True)
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                   intermediate_size=config.intermediate_size, num_experts=config.n_experts)
@@ -198,9 +198,9 @@ class BlockAttnResBlock(nn.Module):
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
-            self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                      intermediate_size=config.intermediate_size, bias=False), config=config,
-                              fwp=True)
+            self.mlp = SwiGLUWithFWP(MLPArgs(hidden_size=config.hidden_size,
+                                             intermediate_size=config.intermediate_size, bias=False), config=config,
+                                     fwp=True)
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                    intermediate_size=config.intermediate_size, num_experts=config.n_experts)

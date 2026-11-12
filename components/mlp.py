@@ -101,22 +101,32 @@ class FastWeightProgrammer(nn.Module):
         self._alpha_cache = None
 
 class SwiGLU(MyMLP):
+    """纯 SwiGLU 快路径：不内置 FWP，self.fwp 恒为 None（FWP 默认关）。
+
+    需要 FWP 用 SwiGLUWithFWP。这里保留 fwp 属性，是为了让“未接入 FWP”可被显式断言，
+    而不是靠 hasattr 判断。
+    """
+
     def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.fwp = None  # 默认关：本类不构建 FWP
 
     def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
                 batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
-class SwiGLUWithFWP(MyMLP):
+class SwiGLUWithFWP(SwiGLU):
+    """opt-in 的 FWP 版本。
+
+    继承 SwiGLU，故 isinstance(m, SwiGLU) 仍成立，block 里的分支无需区分两种类。
+    两层开关：模块级 fwp=True 且 config.fwp_rank > 0，任一不满足即退化为普通 SwiGLU。
+    """
+
     def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
-        super().__init__()
-        self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-        self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        super().__init__(args, config, fwp)
         # FWP 默认关闭：需显式传 fwp=True 才创建，开启后 rank 仍由 config.fwp_rank 决定
         fwp_rank = int(getattr(config, "fwp_rank", 0)) if fwp else 0
         self.fwp = FastWeightProgrammer(
@@ -181,7 +191,8 @@ class MoTFFN(nn.Module):
     def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
-        self.mlp_t = SwiGLU(args, config=config, fwp=True)   # 文本专家显式开启
+        # 文本专家 opt-in：fwp_rank=0 时退化为普通 SwiGLU
+        self.mlp_t = SwiGLUWithFWP(args, config=config, fwp=True)
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
                                     bias=args.bias))  # 视觉专家默认关：FWP 只作用于文本侧
