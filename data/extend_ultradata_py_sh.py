@@ -27,6 +27,11 @@ GB = 1_000_000_000
 REPO = 'openbmb/UltraData-Code'
 REVISION = '8ce985cfd4522832c8b986e05968c87fffa0c66a'
 
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "ultradata"
+
 @dataclass(frozen=True)
 class Job:
     name: str
@@ -231,6 +236,7 @@ def download(job, out, args):
 
 
 def main():
+
     parser = argparse.ArgumentParser(description='Only extend Python and Shell UltraData-Code parts')
     parser.add_argument('--out', type=Path, required=True,
                         help='Existing directory containing code_l2_py.jsonl and *.state.json')
@@ -242,6 +248,12 @@ def main():
     parser.add_argument('--min-chars', type=int, default=1)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
+    output_dir = (
+        Path(args.out).expanduser().resolve()
+        if args.out
+        else DEFAULT_OUTPUT_DIR
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
     if args.python_gb < 0 or args.shell_gb < 0 or args.save_every_rows <= 0 or args.min_chars < 0:
         parser.error('容量和参数不得为负，save-every-rows 必须大于零')
     out = args.out.expanduser().resolve()
