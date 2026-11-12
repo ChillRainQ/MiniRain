@@ -1,7 +1,10 @@
 
 """
 MiniRain-Vision UltraData Downloader
-====================================
+=====================================
+
+Source:
+    HF-Mirror: https://hf-mirror.com
 
 Datasets:
     openbmb/Ultra-FineWeb
@@ -10,33 +13,36 @@ Datasets:
     openbmb/UltraData-Math
 
 Features:
-    - Hardcoded Hugging Face token
-    - Authentication validation
+    - HF-Mirror endpoint
+    - No HF authentication for public datasets
     - Streaming download
+    - Sequential reading (no shuffle)
     - GB capacity allocation
     - Resume support
-    - Immutable dataset revisions
-    - JSONL output
-    - Automatic orphan file recovery
+    - Pinned dataset revisions
+    - Atomic checkpoints
+    - Automatic orphan recovery
     - Script-relative output directory
+    - First-sample heartbeat
 """
 
 # ============================================================
-# 1. Token configuration
+# 1. Environment configuration
+# IMPORTANT: before importing datasets/huggingface_hub
 # ============================================================
 
 import os
 
-# Replace with your own Hugging Face read token.
-HF_TOKEN = "xxx"
+HF_ENDPOINT = "https://hf-mirror.com"
 
-if HF_TOKEN and not HF_TOKEN.startswith("hf_"):
-    raise ValueError("Invalid HF_TOKEN format")
+os.environ["HF_ENDPOINT"] = HF_ENDPOINT
 
-# Set environment variables before importing HF libraries.
-if HF_TOKEN and "REPLACE_WITH_YOUR_TOKEN" not in HF_TOKEN:
-    os.environ["HF_TOKEN"] = HF_TOKEN
-    os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
+# Avoid Xet requests that may bypass or be unsupported by mirrors.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+# Network timeout settings (seconds)
+os.environ["HF_HUB_ETAG_TIMEOUT"] = "30"
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 
 
 # ============================================================
@@ -46,11 +52,13 @@ if HF_TOKEN and "REPLACE_WITH_YOUR_TOKEN" not in HF_TOKEN:
 import json
 import time
 import argparse
+import threading
+
+from itertools import chain
 from dataclasses import dataclass
 from pathlib import Path
 
 from datasets import load_dataset
-from huggingface_hub import HfApi
 
 
 # ============================================================
@@ -61,14 +69,36 @@ GB = 1_000_000_000
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "data" / "ultradata"
+DEFAULT_OUTPUT_DIR = (
+    SCRIPT_DIR / "data" / "ultradata"
+)
 
+
+# Dataset revisions previously resolved successfully.
+DATASET_REVISIONS = {
+
+    "openbmb/Ultra-FineWeb":
+        "02c85641e3d19a854be2e09139c25adaa9518063",
+
+    "openbmb/Ultra-FineWeb-L3":
+        "bc3b1ba986fcaef6871b9790a413b16267c2de0f",
+
+    "openbmb/UltraData-Code":
+        "8ce985cfd4522832c8b986e05968c87fffa0c66a",
+
+    "openbmb/UltraData-Math":
+        "fe10db8efd35597fd7fcff8ff576b5ec4ea5ff87",
+}
+
+
+# Text dataset allocation weights.
 GROUP_WEIGHTS = {
     "l2": 2.000,
     "l3": 2.140,
     "code": 0.855,
     "math": 0.705,
 }
+
 
 CODE_LANG_WEIGHTS = {
     "py": 0.40,
@@ -84,6 +114,7 @@ CODE_LANG_WEIGHTS = {
     "sh": 0.02,
 }
 
+
 MATH_CONFIGS = [
     "UltraData-Math-L3-Conversation-Synthetic",
     "UltraData-Math-L3-Multi-Style-Synthetic",
@@ -98,6 +129,7 @@ MATH_CONFIGS = [
 
 @dataclass
 class Job:
+
     name: str
     group: str
     repo: str
@@ -108,43 +140,7 @@ class Job:
 
 
 # ============================================================
-# 5. Authentication
-# ============================================================
-
-def authenticate():
-
-    token = HF_TOKEN.strip()
-
-    if (
-        not token
-        or not token.startswith("hf_")
-        or "REPLACE_WITH_YOUR_TOKEN" in token
-    ):
-        raise RuntimeError(
-            "Please configure your HF_TOKEN at the top of this script."
-        )
-
-    print("\n[AUTH] Checking Hugging Face authentication...")
-
-    api = HfApi(token=token)
-
-    try:
-        user = api.whoami()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Hugging Face authentication failed: {exc}"
-        ) from exc
-
-    username = user.get("name", "unknown")
-
-    print(f"[AUTH] Authenticated as: {username}")
-    print("[AUTH] Explicit token authentication enabled.")
-
-    return token, api
-
-
-# ============================================================
-# 6. Build jobs
+# 5. Build download jobs
 # ============================================================
 
 def build_jobs(args):
@@ -216,7 +212,7 @@ def build_jobs(args):
             )
 
     # --------------------------------------------------------
-    # UltraData Code L2 / L3
+    # UltraData-Code L2 / L3
     # --------------------------------------------------------
 
     languages = [
@@ -236,7 +232,8 @@ def build_jobs(args):
         raise ValueError("Code languages cannot be empty")
 
     lang_sum = sum(
-        CODE_LANG_WEIGHTS[x] for x in languages
+        CODE_LANG_WEIGHTS[x]
+        for x in languages
     )
 
     for tier, tier_weight in [
@@ -266,7 +263,7 @@ def build_jobs(args):
             )
 
     # --------------------------------------------------------
-    # UltraData Math L3
+    # UltraData-Math L3
     # --------------------------------------------------------
 
     for i, config in enumerate(MATH_CONFIGS):
@@ -286,7 +283,7 @@ def build_jobs(args):
 
 
 # ============================================================
-# 7. Capacity allocation
+# 6. Capacity allocation
 # ============================================================
 
 def allocate_group_quotas(args):
@@ -323,7 +320,9 @@ def allocate_group_quotas(args):
             if i == len(groups) - 1:
                 amount = total - used
             else:
-                amount = int(total * weight / weight_sum)
+                amount = int(
+                    total * weight / weight_sum
+                )
 
             result[group] = amount
             used += amount
@@ -331,6 +330,7 @@ def allocate_group_quotas(args):
         return result
 
     if not all(v is not None for v in values.values()):
+
         raise ValueError(
             "Specify --total-gb OR all four individual capacities."
         )
@@ -355,12 +355,22 @@ def allocate_job_quotas(jobs, group_quotas):
             if job.group == group
         ]
 
-        if group_bytes <= 0 or not group_jobs:
+        if group_bytes <= 0:
             continue
+
+        if not group_jobs:
+            raise ValueError(
+                f"No jobs configured for group {group}"
+            )
 
         weight_sum = sum(
             job.weight for job in group_jobs
         )
+
+        if weight_sum <= 0:
+            raise ValueError(
+                f"Invalid weight for group {group}"
+            )
 
         used = 0
 
@@ -380,31 +390,113 @@ def allocate_job_quotas(jobs, group_quotas):
 
 
 # ============================================================
-# 8. Resolve immutable dataset revisions
+# 7. Atomic JSON state
 # ============================================================
 
-def resolve_revisions(jobs, api, requested_revision):
+def save_json_atomic(path, data):
 
-    revisions = {}
+    temp = path.with_name(path.name + ".tmp")
 
-    repositories = sorted({
-        job.repo for job in jobs
-    })
+    with open(temp, "w", encoding="utf-8") as f:
 
-    print("\n[REVISION] Resolving dataset versions")
-
-    for repo in repositories:
-
-        info = api.dataset_info(
-            repo_id=repo,
-            revision=requested_revision,
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
         )
 
-        revisions[repo] = info.sha
+        f.flush()
+        os.fsync(f.fileno())
 
-        print(f"  {repo}: {info.sha}")
+    os.replace(temp, path)
 
-    return revisions
+
+def load_state(path):
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def make_signature(job, revision):
+
+    return {
+        "repo": job.repo,
+        "config": job.config,
+        "split": job.split,
+        "revision": revision,
+
+        # Explicitly identifies sequential iteration.
+        "stream_order": "sequential-v1",
+    }
+
+
+def make_state(
+    signature,
+    source_rows,
+    records,
+    bytes_done,
+    target_bytes,
+    exhausted=False,
+    limit_reached=False,
+):
+
+    return {
+        **signature,
+        "source_rows": source_rows,
+        "records": records,
+        "bytes": bytes_done,
+        "target_bytes": target_bytes,
+        "exhausted": exhausted,
+        "limit_reached": limit_reached,
+    }
+
+
+# ============================================================
+# 8. Backup and recovery
+# ============================================================
+
+def backup_file(path, suffix="backup"):
+
+    if not path.exists():
+        return
+
+    stamp = (
+        time.strftime("%Y%m%d_%H%M%S")
+        + f"_{time.time_ns() % 1_000_000:06d}"
+    )
+
+    backup = path.with_name(
+        f"{path.stem}.{suffix}_{stamp}{path.suffix}"
+    )
+
+    os.replace(path, backup)
+
+    print(f"[BACKUP] {backup.name}")
+
+
+def backup_pair(output_path, state_path, suffix="stale"):
+
+    backup_file(output_path, suffix)
+    backup_file(state_path, suffix)
+
+
+def recover_orphan_files(output_path, state_path):
+
+    if output_path.exists() == state_path.exists():
+        return
+
+    print(
+        f"[RECOVERY] Incomplete file pair: "
+        f"{output_path.stem}"
+    )
+
+    backup_pair(
+        output_path,
+        state_path,
+        suffix="orphan",
+    )
 
 
 # ============================================================
@@ -420,6 +512,7 @@ def value_to_text(value):
         return value
 
     if isinstance(value, (dict, list, tuple)):
+
         return json.dumps(
             value,
             ensure_ascii=False,
@@ -431,13 +524,20 @@ def value_to_text(value):
 
 def extract_text(row, job):
 
-    # Code L3: prefer full_content.
+    # --------------------------------------------------------
+    # Code L3
+    # --------------------------------------------------------
+
     if (
         job.group == "code"
         and job.config == "UltraData-Code-L3"
     ):
 
-        for key in ("full_content", "content", "raw_content"):
+        for key in (
+            "full_content",
+            "content",
+            "raw_content",
+        ):
 
             value = row.get(key)
 
@@ -448,10 +548,14 @@ def extract_text(row, job):
                 if text.strip():
                     return text
 
-        # Structured fallback.
         parts = []
 
-        for key in ("task", "analysis", "solution", "test"):
+        for key in (
+            "task",
+            "analysis",
+            "solution",
+            "test",
+        ):
 
             value = row.get(key)
 
@@ -464,9 +568,13 @@ def extract_text(row, job):
                         f"## {key.upper()}\n{text}"
                     )
 
-        return "\n\n".join(parts)
+        if parts:
+            return "\n\n".join(parts)
 
-    # FineWeb / Math / Code L2.
+    # --------------------------------------------------------
+    # General text fields
+    # --------------------------------------------------------
+
     for key in (
         "content",
         "text",
@@ -476,21 +584,6 @@ def extract_text(row, job):
         "messages",
         "conversations",
         "conversation",
-    ):
-
-        value = row.get(key)
-
-        if value is not None:
-
-            text = value_to_text(value)
-
-            if text.strip():
-                return text
-
-    # Generic structured fallback.
-    parts = []
-
-    for key in (
         "question",
         "problem",
         "analysis",
@@ -506,16 +599,30 @@ def extract_text(row, job):
             text = value_to_text(value)
 
             if text.strip():
-                parts.append(f"{key}:\n{text}")
+                return text
 
-    return "\n\n".join(parts)
+    # --------------------------------------------------------
+    # Generic fallback:
+    # preserve the complete row instead of silently discarding
+    # an unfamiliar schema.
+    # --------------------------------------------------------
+
+    if row:
+
+        return json.dumps(
+            row,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return ""
 
 
 # ============================================================
-# 10. Metadata extraction
+# 10. Metadata
 # ============================================================
 
-def extract_metadata(row, job):
+def extract_metadata(row):
 
     keys = (
         "uuid",
@@ -546,7 +653,7 @@ def extract_metadata(row, job):
 
 
 # ============================================================
-# 11. Build JSONL record
+# 11. JSONL record
 # ============================================================
 
 def make_record(row, job, min_chars):
@@ -562,111 +669,44 @@ def make_record(row, job, min_chars):
         "config": job.config,
         "split": job.split,
         "language": job.language,
-        "metadata": extract_metadata(row, job),
+        "metadata": extract_metadata(row),
     }
 
 
 # ============================================================
-# 12. Atomic state saving
+# 12. First sample heartbeat
 # ============================================================
 
-def save_json_atomic(path, data):
+def next_with_heartbeat(iterator, label, interval=15):
 
-    temp = path.with_name(path.name + ".tmp")
+    stop_event = threading.Event()
 
-    with open(temp, "w", encoding="utf-8") as f:
+    def heartbeat():
 
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
+        while not stop_event.wait(interval):
 
-        f.flush()
-        os.fsync(f.fileno())
+            print(
+                f"[STREAM] Still waiting for data: {label}",
+                flush=True,
+            )
 
-    os.replace(temp, path)
-
-
-def load_state(path):
-
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def make_signature(job, revision, args):
-
-    return {
-        "repo": job.repo,
-        "config": job.config,
-        "split": job.split,
-        "revision": revision,
-        "seed": args.seed,
-    }
-
-
-def make_state(
-    signature,
-    source_rows,
-    records,
-    bytes_done,
-    target_bytes,
-    exhausted=False,
-    limit_reached=False,
-):
-
-    return {
-        **signature,
-        "source_rows": source_rows,
-        "records": records,
-        "bytes": bytes_done,
-        "target_bytes": target_bytes,
-        "exhausted": exhausted,
-        "limit_reached": limit_reached,
-    }
-
-
-# ============================================================
-# 13. Orphan file recovery
-# ============================================================
-
-def recover_orphan_files(output_path, state_path):
-
-    if output_path.exists() == state_path.exists():
-        return
-
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    print(
-        f"\n[RECOVERY] Incomplete file pair detected: "
-        f"{output_path.stem}"
+    thread = threading.Thread(
+        target=heartbeat,
+        daemon=True,
     )
 
-    if output_path.exists():
+    thread.start()
 
-        backup = output_path.with_name(
-            f"{output_path.stem}.orphan_{timestamp}.jsonl"
-        )
+    try:
+        return next(iterator)
 
-        os.replace(output_path, backup)
-
-        print(f"[RECOVERY] Orphan data backed up: {backup.name}")
-
-    if state_path.exists():
-
-        backup = state_path.with_name(
-            f"{state_path.stem}.orphan_{timestamp}.json"
-        )
-
-        os.replace(state_path, backup)
-
-        print(f"[RECOVERY] Orphan state backed up: {backup.name}")
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
 
 
 # ============================================================
-# 14. Download one dataset split
+# 13. Download one dataset
 # ============================================================
 
 def download_job(
@@ -675,10 +715,10 @@ def download_job(
     output_dir,
     revision,
     args,
-    token,
 ):
 
     output_path = output_dir / f"{job.name}.jsonl"
+
     state_path = output_dir / f"{job.name}.state.json"
 
     if quota <= 0:
@@ -687,11 +727,10 @@ def download_job(
     signature = make_signature(
         job,
         revision,
-        args,
     )
 
     # --------------------------------------------------------
-    # Overwrite
+    # Explicit overwrite
     # --------------------------------------------------------
 
     if args.overwrite:
@@ -700,7 +739,7 @@ def download_job(
         state_path.unlink(missing_ok=True)
 
     # --------------------------------------------------------
-    # Recover orphan files
+    # Orphan recovery
     # --------------------------------------------------------
 
     recover_orphan_files(
@@ -709,78 +748,136 @@ def download_job(
     )
 
     # --------------------------------------------------------
-    # Resume
+    # Resume variables
     # --------------------------------------------------------
 
     source_rows = 0
     records = 0
     bytes_done = 0
+
     exhausted = False
     limit_reached = False
     old_target = quota
 
+    # --------------------------------------------------------
+    # Existing files
+    # --------------------------------------------------------
+
     if output_path.exists():
 
-        state = load_state(state_path)
+        try:
 
-        for key, value in signature.items():
+            state = load_state(state_path)
 
-            if state.get(key) != value:
+            valid_signature = all(
+                state.get(key) == value
+                for key, value in signature.items()
+            )
 
-                raise RuntimeError(
-                    f"{job.name}: resume setting changed: {key}. "
-                    "Use original settings or --overwrite."
+            if not valid_signature:
+
+                print(
+                    f"[RECOVERY] Old download settings detected: "
+                    f"{job.name}"
                 )
 
-        source_rows = int(state["source_rows"])
-        records = int(state["records"])
-        bytes_done = int(state["bytes"])
-        exhausted = bool(state.get("exhausted", False))
-        limit_reached = bool(state.get("limit_reached", False))
-        old_target = int(state.get("target_bytes", quota))
+                backup_pair(
+                    output_path,
+                    state_path,
+                    suffix="stale",
+                )
 
-        actual_size = output_path.stat().st_size
+            else:
 
-        if actual_size < bytes_done:
+                source_rows = int(
+                    state["source_rows"]
+                )
 
-            raise RuntimeError(
-                f"{job.name}: output file is smaller than state."
+                records = int(
+                    state["records"]
+                )
+
+                bytes_done = int(
+                    state["bytes"]
+                )
+
+                exhausted = bool(
+                    state.get("exhausted", False)
+                )
+
+                limit_reached = bool(
+                    state.get("limit_reached", False)
+                )
+
+                old_target = int(
+                    state.get("target_bytes", quota)
+                )
+
+                actual_size = output_path.stat().st_size
+
+                if actual_size < bytes_done:
+
+                    print(
+                        "[RECOVERY] File shorter than checkpoint."
+                    )
+
+                    backup_pair(
+                        output_path,
+                        state_path,
+                        suffix="corrupt",
+                    )
+
+                    source_rows = 0
+                    records = 0
+                    bytes_done = 0
+                    exhausted = False
+                    limit_reached = False
+
+                elif bytes_done > quota:
+
+                    raise RuntimeError(
+                        f"{job.name}: existing file exceeds "
+                        "the requested quota."
+                    )
+
+                else:
+
+                    # Remove uncommitted bytes after the last
+                    # valid checkpoint.
+                    with open(output_path, "r+b") as f:
+                        f.truncate(bytes_done)
+
+                    print(
+                        f"[RESUME] {job.name}: "
+                        f"{bytes_done / GB:.3f} GB, "
+                        f"{records:,} records, "
+                        f"{source_rows:,} source rows"
+                    )
+
+        except (ValueError, KeyError, json.JSONDecodeError):
+
+            print(
+                f"[RECOVERY] Invalid state: {job.name}"
             )
 
-        if bytes_done > quota:
-
-            raise RuntimeError(
-                f"{job.name}: existing output exceeds new quota. "
-                "Increase quota or use --overwrite."
+            backup_pair(
+                output_path,
+                state_path,
+                suffix="invalid",
             )
 
-        # Discard data written after the last checkpoint.
-        with open(output_path, "r+b") as f:
-            f.truncate(bytes_done)
+            source_rows = 0
+            records = 0
+            bytes_done = 0
+            exhausted = False
+            limit_reached = False
 
-        print(
-            f"[RESUME] {job.name}: "
-            f"{bytes_done / GB:.3f} GB, "
-            f"{records:,} records"
-        )
+    # --------------------------------------------------------
+    # Create fresh pair
+    # --------------------------------------------------------
 
-        # Same target, previously stopped because next row
-        # would exceed remaining space.
-        if limit_reached and old_target == quota:
+    if not output_path.exists():
 
-            print(f"[SKIP] {job.name}: target already reached")
-            return {
-                "name": job.name,
-                "target_bytes": quota,
-                "downloaded_bytes": bytes_done,
-                "records": records,
-                "source_rows": source_rows,
-                "exhausted": exhausted,
-            }
-
-    else:
-
-        # Create both files and immediately save initial state.
         output_path.touch()
 
         save_json_atomic(
@@ -796,9 +893,13 @@ def download_job(
 
         print(f"[NEW] {job.name}")
 
-    if exhausted or bytes_done >= quota:
+    # --------------------------------------------------------
+    # Completed checks
+    # --------------------------------------------------------
 
-        print(f"[SKIP] {job.name}: completed")
+    if exhausted:
+
+        print(f"[SKIP] {job.name}: source exhausted")
 
         return {
             "name": job.name,
@@ -806,7 +907,33 @@ def download_job(
             "downloaded_bytes": bytes_done,
             "records": records,
             "source_rows": source_rows,
-            "exhausted": exhausted,
+            "exhausted": True,
+        }
+
+    if bytes_done >= quota:
+
+        print(f"[SKIP] {job.name}: quota reached")
+
+        return {
+            "name": job.name,
+            "target_bytes": quota,
+            "downloaded_bytes": bytes_done,
+            "records": records,
+            "source_rows": source_rows,
+            "exhausted": False,
+        }
+
+    if limit_reached and old_target == quota:
+
+        print(f"[SKIP] {job.name}: target already reached")
+
+        return {
+            "name": job.name,
+            "target_bytes": quota,
+            "downloaded_bytes": bytes_done,
+            "records": records,
+            "source_rows": source_rows,
+            "exhausted": False,
         }
 
     # --------------------------------------------------------
@@ -820,7 +947,15 @@ def download_job(
     print(f"  Revision: {revision}")
     print(f"  Target: {quota / GB:.3f} GB")
 
-    print("[STREAM] Calling load_dataset...", flush=True)
+    print(
+        f"[MIRROR] Endpoint: {HF_ENDPOINT}",
+        flush=True,
+    )
+
+    print(
+        "[STREAM] Calling load_dataset...",
+        flush=True,
+    )
 
     ds = load_dataset(
         path=job.repo,
@@ -828,36 +963,46 @@ def download_job(
         split=job.split,
         streaming=True,
         revision=revision,
-        token=token,
+        token=False,
     )
 
-    print("[STREAM] load_dataset returned.", flush=True)
-    print("[STREAM] Features:", ds.features, flush=True)
+    print(
+        "[STREAM] load_dataset returned.",
+        flush=True,
+    )
 
-    # 下载阶段不进行 Shuffle，顺序读取数据
-    print("[STREAM] Sequential streaming enabled.", flush=True)
+    print(
+        "[STREAM] Features:",
+        ds.features,
+        flush=True,
+    )
+
+    # Sequential streaming. No shuffle.
+    print(
+        "[STREAM] Sequential reading enabled.",
+        flush=True,
+    )
 
     if source_rows:
+
         print(
-            f"[STREAM] Skipping {source_rows:,} rows...",
+            f"[STREAM] Replaying {source_rows:,} rows...",
             flush=True,
         )
+
         ds = ds.skip(source_rows)
 
-    print("[STREAM] Waiting for first sample...", flush=True)
+    iterator = iter(ds)
 
     # --------------------------------------------------------
-    # Download
+    # Download loop
     # --------------------------------------------------------
-
-    mode = "r+b" if output_path.exists() else "w+b"
 
     start_time = time.time()
     start_bytes = bytes_done
     last_report = start_time
 
     stopped_by_size = False
-    first_sample = True
     skipped_oversize = 0
 
     def persist(
@@ -882,24 +1027,62 @@ def download_job(
             ),
         )
 
-    with open(output_path, mode) as f:
+    with open(output_path, "r+b") as f:
 
         f.truncate(bytes_done)
         f.seek(bytes_done)
 
         try:
 
-            for row in ds:
+            print(
+                "[STREAM] Waiting for first sample...",
+                flush=True,
+            )
 
-                if first_sample:
+            try:
 
-                    print(
-                        "[STREAM] First sample received. "
-                        f"Keys: {list(row.keys())}",
-                        flush=True,
-                    )
+                first_row = next_with_heartbeat(
+                    iterator,
+                    job.name,
+                    interval=15,
+                )
 
-                    first_sample = False
+            except StopIteration:
+
+                print(
+                    "[STREAM] Dataset is empty.",
+                    flush=True,
+                )
+
+                persist(
+                    f,
+                    is_exhausted=True,
+                )
+
+                return {
+                    "name": job.name,
+                    "target_bytes": quota,
+                    "downloaded_bytes": bytes_done,
+                    "records": records,
+                    "source_rows": source_rows,
+                    "exhausted": True,
+                }
+
+            print(
+                "[STREAM] First sample received.",
+                flush=True,
+            )
+
+            print(
+                "[STREAM] Keys:",
+                list(first_row.keys()),
+                flush=True,
+            )
+
+            for row in chain(
+                (first_row,),
+                iterator,
+            ):
 
                 record = make_record(
                     row,
@@ -923,16 +1106,18 @@ def download_job(
 
                     line_size = len(line)
 
-                    # Skip an individual record larger than
-                    # the entire target capacity.
-                    if bytes_done == 0 and line_size > quota:
+                    # Skip a single record that cannot fit
+                    # into the entire quota.
+                    if (
+                        bytes_done == 0
+                        and line_size > quota
+                    ):
 
                         source_rows += 1
                         skipped_oversize += 1
                         continue
 
-                    # Do not consume the row when it does
-                    # not fit. It will be retried if quota grows.
+                    # Do not consume a row that does not fit.
                     if bytes_done + line_size > quota:
 
                         stopped_by_size = True
@@ -949,7 +1134,10 @@ def download_job(
                         stopped_by_size = True
                         break
 
-                # Checkpoint
+                # ------------------------------------------------
+                # Periodic checkpoint
+                # ------------------------------------------------
+
                 if (
                     source_rows > 0
                     and source_rows % args.save_every_rows == 0
@@ -957,7 +1145,10 @@ def download_job(
 
                     persist(f)
 
+                # ------------------------------------------------
                 # Progress
+                # ------------------------------------------------
+
                 now = time.time()
 
                 if now - last_report >= 5:
@@ -972,7 +1163,7 @@ def download_job(
                     ) / elapsed / (1024 ** 2)
 
                     print(
-                        f"\r  "
+                        f"\r"
                         f"{bytes_done / GB:.3f} / "
                         f"{quota / GB:.3f} GB"
                         f" | records={records:,}"
@@ -986,14 +1177,20 @@ def download_job(
 
         except KeyboardInterrupt:
 
-            print("\n[INTERRUPTED] Saving checkpoint...")
+            print(
+                "\n[INTERRUPTED] Saving checkpoint...",
+                flush=True,
+            )
 
             persist(f)
             raise
 
         except Exception:
 
-            print("\n[ERROR] Saving checkpoint...")
+            print(
+                "\n[ERROR] Saving checkpoint...",
+                flush=True,
+            )
 
             persist(f)
             raise
@@ -1015,8 +1212,16 @@ def download_job(
         f"  Records: {records:,}\n"
         f"  Source rows: {source_rows:,}\n"
         f"  Oversized skipped: {skipped_oversize:,}\n"
-        f"  Time: {elapsed:.1f}s"
+        f"  Time: {elapsed:.1f}s",
+        flush=True,
     )
+
+    if bytes_done < quota and not stopped_by_size:
+
+        print(
+            f"[WARN] {job.name}: source exhausted "
+            "before reaching target."
+        )
 
     return {
         "name": job.name,
@@ -1029,31 +1234,39 @@ def download_job(
 
 
 # ============================================================
-# 15. Manifest
+# 14. Manifest
 # ============================================================
 
 def save_manifest(
     output_dir,
     group_quotas,
     results,
-    revisions,
 ):
 
     manifest = {
+
+        "source": HF_ENDPOINT,
+
         "unit": "decimal GB",
+
         "group_quotas": {
-            k: v / GB
-            for k, v in group_quotas.items()
+            key: value / GB
+            for key, value in group_quotas.items()
         },
-        "revisions": revisions,
+
+        "revisions": DATASET_REVISIONS,
+
         "results": results,
+
         "total_target_bytes": sum(
             group_quotas.values()
         ),
+
         "total_saved_bytes": sum(
-            x["downloaded_bytes"]
-            for x in results
+            item["downloaded_bytes"]
+            for item in results
         ),
+
         "updated_at": time.strftime(
             "%Y-%m-%d %H:%M:%S"
         ),
@@ -1066,13 +1279,13 @@ def save_manifest(
 
 
 # ============================================================
-# 16. CLI
+# 15. CLI
 # ============================================================
 
 def parse_args():
 
     parser = argparse.ArgumentParser(
-        description="MiniRain-Vision UltraData Downloader"
+        description="MiniRain-Vision HF-Mirror Downloader"
     )
 
     parser.add_argument(
@@ -1090,13 +1303,7 @@ def parse_args():
         "--out",
         type=str,
         default=None,
-        help="Output directory; default is script_dir/data/ultradata",
-    )
-
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default="main",
+        help="Output directory",
     )
 
     parser.add_argument(
@@ -1130,18 +1337,6 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    parser.add_argument(
-        "--shuffle-buffer",
-        type=int,
-        default=1000,
-    )
-
-    parser.add_argument(
         "--save-every-rows",
         type=int,
         default=1000,
@@ -1162,18 +1357,19 @@ def parse_args():
 
 
 # ============================================================
-# 17. Main
+# 16. Main
 # ============================================================
 
 def main():
 
     args = parse_args()
 
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
+
     if args.save_every_rows <= 0:
         raise ValueError("--save-every-rows must be positive")
-
-    if args.shuffle_buffer <= 0:
-        raise ValueError("--shuffle-buffer must be positive")
 
     if args.min_chars < 0:
         raise ValueError("--min-chars cannot be negative")
@@ -1191,13 +1387,7 @@ def main():
             )
 
     # --------------------------------------------------------
-    # Authentication FIRST
-    # --------------------------------------------------------
-
-    token, api = authenticate()
-
-    # --------------------------------------------------------
-    # Build jobs
+    # Jobs and capacity
     # --------------------------------------------------------
 
     jobs = build_jobs(args)
@@ -1210,11 +1400,11 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Output directory
+    # Output
     # --------------------------------------------------------
 
     output_dir = (
-        Path(args.out).resolve()
+        Path(args.out).expanduser().resolve()
         if args.out
         else DEFAULT_OUTPUT_DIR
     )
@@ -1225,17 +1415,13 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Resolve revisions
+    # Revisions
     # --------------------------------------------------------
 
-    revisions = resolve_revisions(
-        jobs,
-        api,
-        args.revision,
-    )
+    revisions = DATASET_REVISIONS
 
     # --------------------------------------------------------
-    # Print plan
+    # Print configuration
     # --------------------------------------------------------
 
     total_target = sum(group_quotas.values())
@@ -1244,6 +1430,18 @@ def main():
     print("MiniRain-Vision UltraData Downloader")
     print("=" * 65)
 
+    print(f"[MIRROR] Endpoint: {HF_ENDPOINT}")
+    print("[MIRROR] Authentication: disabled (public datasets)")
+    print("[STREAM] Sequential reading: enabled")
+    print("[STREAM] Shuffle: disabled")
+
+    print("\n[REVISION] Using pinned versions")
+
+    for repo, sha in revisions.items():
+        print(f"  {repo}: {sha}")
+
+    print("\n[CAPACITY]")
+
     for group, quota in group_quotas.items():
 
         print(
@@ -1251,12 +1449,14 @@ def main():
         )
 
     print("-" * 65)
-    print(f"{'TOTAL':8s}: {total_target / GB:10.3f} GB")
+    print(
+        f"{'TOTAL':8s}: "
+        f"{total_target / GB:10.3f} GB"
+    )
 
     print(f"Output: {output_dir}")
-    print(f"Seed: {args.seed}")
-    print(f"Shuffle buffer: {args.shuffle_buffer}")
-    print(f"Authentication: verified")
+    print(f"Checkpoint interval: {args.save_every_rows} rows")
+
     print("=" * 65)
 
     # --------------------------------------------------------
@@ -1269,7 +1469,10 @@ def main():
 
         for job in jobs:
 
-            quota = job_quotas.get(job.name, 0)
+            quota = job_quotas.get(
+                job.name,
+                0,
+            )
 
             if quota <= 0:
                 continue
@@ -1280,23 +1483,25 @@ def main():
                 output_dir=output_dir,
                 revision=revisions[job.repo],
                 args=args,
-                token=token,
             )
 
             if result is not None:
                 results.append(result)
 
+            # Save manifest after each job.
             save_manifest(
                 output_dir,
                 group_quotas,
                 results,
-                revisions,
             )
 
     except KeyboardInterrupt:
 
         print("\n[STOPPED] Checkpoints saved.")
-        print("Run the same command again to resume.")
+        print(
+            "Run the same command again to resume."
+        )
+
         return
 
     except Exception as exc:
@@ -1306,7 +1511,7 @@ def main():
         )
 
         print(
-            "Existing data and checkpoints have been preserved."
+            "Existing data and checkpoints are preserved."
         )
 
         raise
@@ -1316,19 +1521,19 @@ def main():
     # --------------------------------------------------------
 
     actual = sum(
-        x["downloaded_bytes"]
-        for x in results
+        item["downloaded_bytes"]
+        for item in results
     )
 
     print("\n" + "=" * 65)
     print("DOWNLOAD SUMMARY")
     print("=" * 65)
 
-    for result in results:
+    for item in results:
 
         print(
-            f"{result['name']:35s}"
-            f"{result['downloaded_bytes'] / GB:9.3f} GB"
+            f"{item['name']:35s}"
+            f"{item['downloaded_bytes'] / GB:9.3f} GB"
         )
 
     print("-" * 65)
