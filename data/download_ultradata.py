@@ -1,46 +1,45 @@
 
+#!/usr/bin/env python3
 """
 MiniRain-Vision UltraData Downloader
-=====================================
 
-Source:
-    HF-Mirror: https://hf-mirror.com
+HF-Mirror streaming downloader.
 
-Datasets:
-    openbmb/Ultra-FineWeb
-    openbmb/Ultra-FineWeb-L3
-    openbmb/UltraData-Code
-    openbmb/UltraData-Math
+Default budget: 80 GB
+    Ultra-FineWeb L2 : 28.070 GB
+    Ultra-FineWeb L3 : 30.035 GB
+    UltraData-Code   : 12.000 GB
+        Python       :  7.200 GB
+        Shell        :  2.400 GB
+        CMD reserved :  2.400 GB
+    UltraData-Math   :  9.895 GB
+
+Only Python and sh are downloaded from UltraData-Code.
+The reserved CMD budget is not downloaded.
 
 Features:
-    - HF-Mirror endpoint
-    - No HF authentication for public datasets
-    - Streaming download
-    - Sequential reading (no shuffle)
-    - GB capacity allocation
-    - Resume support
-    - Pinned dataset revisions
-    - Atomic checkpoints
-    - Automatic orphan recovery
-    - Script-relative output directory
-    - First-sample heartbeat
+    - HF-Mirror
+    - Streaming
+    - Sequential reading
+    - Pinned revisions
+    - Resume from existing state
+    - Atomic checkpoint
+    - GB quota allocation
+    - Dry run
+    - No overwrite of original manifest.json
 """
 
 # ============================================================
-# 1. Environment configuration
-# IMPORTANT: before importing datasets/huggingface_hub
+# 1. Environment
 # ============================================================
 
 import os
 
 HF_ENDPOINT = "https://hf-mirror.com"
 
+# Set before importing datasets / huggingface_hub.
 os.environ["HF_ENDPOINT"] = HF_ENDPOINT
-
-# Avoid Xet requests that may bypass or be unsupported by mirrors.
 os.environ["HF_HUB_DISABLE_XET"] = "1"
-
-# Network timeout settings (seconds)
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "30"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 
@@ -54,8 +53,8 @@ import time
 import argparse
 import threading
 
-from itertools import chain
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 
 from datasets import load_dataset
@@ -69,14 +68,16 @@ GB = 1_000_000_000
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DEFAULT_OUTPUT_DIR = (
-    SCRIPT_DIR / "data" / "ultradata"
-)
+# data/download_ultradata.py
+# data/ultradata/
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "ultradata"
 
 
-# Dataset revisions previously resolved successfully.
+# ============================================================
+# 4. Dataset revisions
+# ============================================================
+
 DATASET_REVISIONS = {
-
     "openbmb/Ultra-FineWeb":
         "02c85641e3d19a854be2e09139c25adaa9518063",
 
@@ -91,7 +92,11 @@ DATASET_REVISIONS = {
 }
 
 
-# Text dataset allocation weights.
+# ============================================================
+# 5. Dataset weights
+# ============================================================
+
+# Keep original 80GB allocation proportions.
 GROUP_WEIGHTS = {
     "l2": 2.000,
     "l3": 2.140,
@@ -99,20 +104,20 @@ GROUP_WEIGHTS = {
     "math": 0.705,
 }
 
+# Code ratios are relative to the ENTIRE Code budget.
+#
+# Python: 60%
+# Shell : 20%
+# CMD   : 20% reserved, not downloaded.
+#
+# Do NOT normalize these to sum to 1.
 
 CODE_LANG_WEIGHTS = {
-    "py": 0.40,
-    "cpp": 0.12,
-    "cs": 0.05,
-    "go": 0.08,
-    "java": 0.10,
-    "js": 0.10,
-    "php": 0.03,
-    "r": 0.01,
-    "rb": 0.01,
-    "rust": 0.08,
-    "sh": 0.02,
+    "py": 0.60,
+    "sh": 0.20,
 }
+
+CMD_RESERVED_RATIO = 0.20
 
 
 MATH_CONFIGS = [
@@ -124,12 +129,11 @@ MATH_CONFIGS = [
 
 
 # ============================================================
-# 4. Job definition
+# 6. Job definition
 # ============================================================
 
 @dataclass
 class Job:
-
     name: str
     group: str
     repo: str
@@ -140,7 +144,7 @@ class Job:
 
 
 # ============================================================
-# 5. Build download jobs
+# 7. Build jobs
 # ============================================================
 
 def build_jobs(args):
@@ -212,29 +216,14 @@ def build_jobs(args):
             )
 
     # --------------------------------------------------------
-    # UltraData-Code L2 / L3
+    # UltraData-Code
+    #
+    # Python: 60% of Code budget
+    # Shell : 20% of Code budget
+    # CMD   : 20% reserved
+    #
+    # L2 / L3 split is controlled by code_l2_ratio.
     # --------------------------------------------------------
-
-    languages = [
-        x.strip()
-        for x in args.code_languages.split(",")
-        if x.strip()
-    ]
-
-    invalid = set(languages) - set(CODE_LANG_WEIGHTS)
-
-    if invalid:
-        raise ValueError(
-            f"Unsupported Code languages: {invalid}"
-        )
-
-    if not languages:
-        raise ValueError("Code languages cannot be empty")
-
-    lang_sum = sum(
-        CODE_LANG_WEIGHTS[x]
-        for x in languages
-    )
 
     for tier, tier_weight in [
         ("L2", args.code_l2_ratio),
@@ -244,7 +233,7 @@ def build_jobs(args):
         if tier_weight <= 0:
             continue
 
-        for lang in languages:
+        for lang, lang_weight in CODE_LANG_WEIGHTS.items():
 
             jobs.append(
                 Job(
@@ -253,17 +242,13 @@ def build_jobs(args):
                     repo="openbmb/UltraData-Code",
                     config=f"UltraData-Code-{tier}",
                     split=lang,
-                    weight=(
-                        tier_weight
-                        * CODE_LANG_WEIGHTS[lang]
-                        / lang_sum
-                    ),
+                    weight=tier_weight * lang_weight,
                     language=lang,
                 )
             )
 
     # --------------------------------------------------------
-    # UltraData-Math L3
+    # UltraData-Math
     # --------------------------------------------------------
 
     for i, config in enumerate(MATH_CONFIGS):
@@ -283,7 +268,7 @@ def build_jobs(args):
 
 
 # ============================================================
-# 6. Capacity allocation
+# 8. Allocate group quotas
 # ============================================================
 
 def allocate_group_quotas(args):
@@ -295,18 +280,24 @@ def allocate_group_quotas(args):
         "math": args.math_gb,
     }
 
+    # --------------------------------------------------------
+    # Total GB mode
+    # --------------------------------------------------------
+
     if args.total_gb is not None:
 
         if any(v is not None for v in values.values()):
             raise ValueError(
-                "Do not combine --total-gb "
-                "with individual capacities."
+                "Cannot combine --total-gb with "
+                "individual group capacities."
             )
 
         if args.total_gb <= 0:
-            raise ValueError("--total-gb must be positive")
+            raise ValueError(
+                "--total-gb must be positive."
+            )
 
-        total = int(args.total_gb * GB)
+        total = round(args.total_gb * GB)
 
         weight_sum = sum(GROUP_WEIGHTS.values())
 
@@ -329,38 +320,75 @@ def allocate_group_quotas(args):
 
         return result
 
-    if not all(v is not None for v in values.values()):
+    # --------------------------------------------------------
+    # Individual group capacities
+    # --------------------------------------------------------
 
+    if not all(v is not None for v in values.values()):
         raise ValueError(
-            "Specify --total-gb OR all four individual capacities."
+            "Specify --total-gb OR all four "
+            "individual capacities."
         )
 
     if any(v < 0 for v in values.values()):
-        raise ValueError("Capacity cannot be negative")
+        raise ValueError(
+            "Capacity cannot be negative."
+        )
 
     return {
-        group: int(value * GB)
+        group: round(value * GB)
         for group, value in values.items()
     }
 
 
-def allocate_job_quotas(jobs, group_quotas):
+# ============================================================
+# 9. Allocate individual job quotas
+# ============================================================
+
+def allocate_job_quotas(jobs, group_quotas, args):
 
     quotas = {}
 
     for group, group_bytes in group_quotas.items():
+
+        if group_bytes <= 0:
+            continue
 
         group_jobs = [
             job for job in jobs
             if job.group == group
         ]
 
-        if group_bytes <= 0:
+        # ----------------------------------------------------
+        # Code: absolute ratios, no normalization
+        # ----------------------------------------------------
+
+        if group == "code":
+
+            for lang, ratio in CODE_LANG_WEIGHTS.items():
+
+                lang_total = round(group_bytes * ratio)
+
+                l2_bytes = round(
+                    lang_total * args.code_l2_ratio
+                )
+
+                l3_bytes = lang_total - l2_bytes
+
+                quotas[f"code_l2_{lang}"] = l2_bytes
+                quotas[f"code_l3_{lang}"] = l3_bytes
+
+            # Remaining budget belongs to CMD.
+            # No dataset job is created for it.
             continue
+
+        # ----------------------------------------------------
+        # Other groups: original normalized weights
+        # ----------------------------------------------------
 
         if not group_jobs:
             raise ValueError(
-                f"No jobs configured for group {group}"
+                f"No jobs configured for group: {group}"
             )
 
         weight_sum = sum(
@@ -369,7 +397,7 @@ def allocate_job_quotas(jobs, group_quotas):
 
         if weight_sum <= 0:
             raise ValueError(
-                f"Invalid weight for group {group}"
+                f"Invalid weight in group: {group}"
             )
 
         used = 0
@@ -380,7 +408,9 @@ def allocate_job_quotas(jobs, group_quotas):
                 amount = group_bytes - used
             else:
                 amount = int(
-                    group_bytes * job.weight / weight_sum
+                    group_bytes
+                    * job.weight
+                    / weight_sum
                 )
 
             quotas[job.name] = amount
@@ -390,12 +420,14 @@ def allocate_job_quotas(jobs, group_quotas):
 
 
 # ============================================================
-# 7. Atomic JSON state
+# 10. Atomic state saving
 # ============================================================
 
 def save_json_atomic(path, data):
 
-    temp = path.with_name(path.name + ".tmp")
+    temp = path.with_name(
+        path.name + ".tmp"
+    )
 
     with open(temp, "w", encoding="utf-8") as f:
 
@@ -419,6 +451,12 @@ def load_state(path):
         return json.load(f)
 
 
+# ============================================================
+# 11. State signature
+#
+# Keep this consistent with original sequential downloader.
+# ============================================================
+
 def make_signature(job, revision):
 
     return {
@@ -426,8 +464,6 @@ def make_signature(job, revision):
         "config": job.config,
         "split": job.split,
         "revision": revision,
-
-        # Explicitly identifies sequential iteration.
         "stream_order": "sequential-v1",
     }
 
@@ -454,53 +490,7 @@ def make_state(
 
 
 # ============================================================
-# 8. Backup and recovery
-# ============================================================
-
-def backup_file(path, suffix="backup"):
-
-    if not path.exists():
-        return
-
-    stamp = (
-        time.strftime("%Y%m%d_%H%M%S")
-        + f"_{time.time_ns() % 1_000_000:06d}"
-    )
-
-    backup = path.with_name(
-        f"{path.stem}.{suffix}_{stamp}{path.suffix}"
-    )
-
-    os.replace(path, backup)
-
-    print(f"[BACKUP] {backup.name}")
-
-
-def backup_pair(output_path, state_path, suffix="stale"):
-
-    backup_file(output_path, suffix)
-    backup_file(state_path, suffix)
-
-
-def recover_orphan_files(output_path, state_path):
-
-    if output_path.exists() == state_path.exists():
-        return
-
-    print(
-        f"[RECOVERY] Incomplete file pair: "
-        f"{output_path.stem}"
-    )
-
-    backup_pair(
-        output_path,
-        state_path,
-        suffix="orphan",
-    )
-
-
-# ============================================================
-# 9. Text extraction
+# 12. Text conversion
 # ============================================================
 
 def value_to_text(value):
@@ -512,7 +502,6 @@ def value_to_text(value):
         return value
 
     if isinstance(value, (dict, list, tuple)):
-
         return json.dumps(
             value,
             ensure_ascii=False,
@@ -521,6 +510,10 @@ def value_to_text(value):
 
     return str(value)
 
+
+# ============================================================
+# 13. Text extraction
+# ============================================================
 
 def extract_text(row, job):
 
@@ -602,13 +595,10 @@ def extract_text(row, job):
                 return text
 
     # --------------------------------------------------------
-    # Generic fallback:
-    # preserve the complete row instead of silently discarding
-    # an unfamiliar schema.
+    # Generic fallback
     # --------------------------------------------------------
 
     if row:
-
         return json.dumps(
             row,
             ensure_ascii=False,
@@ -619,7 +609,7 @@ def extract_text(row, job):
 
 
 # ============================================================
-# 10. Metadata
+# 14. Metadata extraction
 # ============================================================
 
 def extract_metadata(row):
@@ -653,7 +643,7 @@ def extract_metadata(row):
 
 
 # ============================================================
-# 11. JSONL record
+# 15. JSONL record
 # ============================================================
 
 def make_record(row, job, min_chars):
@@ -674,10 +664,14 @@ def make_record(row, job, min_chars):
 
 
 # ============================================================
-# 12. First sample heartbeat
+# 16. Wait heartbeat
 # ============================================================
 
-def next_with_heartbeat(iterator, label, interval=15):
+def next_with_heartbeat(
+    iterator,
+    label,
+    interval=15,
+):
 
     stop_event = threading.Event()
 
@@ -706,7 +700,90 @@ def next_with_heartbeat(iterator, label, interval=15):
 
 
 # ============================================================
-# 13. Download one dataset
+# 17. Prepare existing files
+#
+# Important:
+# - Never silently discard an existing dataset.
+# - Never reset a mismatching checkpoint.
+# - Never shrink a dataset to a smaller target.
+# ============================================================
+
+def prepare_job(job, quota, output_dir, revision):
+
+    data_path = output_dir / f"{job.name}.jsonl"
+    state_path = output_dir / f"{job.name}.state.json"
+
+    signature = make_signature(job, revision)
+
+    if data_path.exists() != state_path.exists():
+
+        raise RuntimeError(
+            f"{job.name}: JSONL/state file mismatch. "
+            "Both files must exist for resuming."
+        )
+
+    if not data_path.exists():
+
+        state = make_state(
+            signature,
+            source_rows=0,
+            records=0,
+            bytes_done=0,
+            target_bytes=quota,
+        )
+
+        return data_path, state_path, state, False
+
+    state = load_state(state_path)
+
+    # Check original revision and stream order.
+    for key, value in signature.items():
+
+        if state.get(key) != value:
+
+            raise RuntimeError(
+                f"{job.name}: checkpoint mismatch: {key}. "
+                f"Existing={state.get(key)!r}, "
+                f"Expected={value!r}. "
+                "Refusing unsafe resume."
+            )
+
+    for key in ("source_rows", "records", "bytes"):
+
+        if key not in state:
+            raise RuntimeError(
+                f"{job.name}: missing state field {key}"
+            )
+
+        if int(state[key]) < 0:
+            raise RuntimeError(
+                f"{job.name}: invalid state field {key}"
+            )
+
+    recorded_bytes = int(state["bytes"])
+    actual_bytes = data_path.stat().st_size
+
+    if actual_bytes < recorded_bytes:
+
+        raise RuntimeError(
+            f"{job.name}: JSONL smaller than checkpoint. "
+            "Refusing unsafe resume."
+        )
+
+    if recorded_bytes > quota:
+
+        raise RuntimeError(
+            f"{job.name}: existing saved data "
+            f"({recorded_bytes / GB:.3f} GB) "
+            f"exceeds target ({quota / GB:.3f} GB). "
+            "Existing data will not be truncated."
+        )
+
+    return data_path, state_path, state, True
+
+
+# ============================================================
+# 18. Download one job
 # ============================================================
 
 def download_job(
@@ -717,240 +794,179 @@ def download_job(
     args,
 ):
 
-    output_path = output_dir / f"{job.name}.jsonl"
-
-    state_path = output_dir / f"{job.name}.state.json"
-
     if quota <= 0:
         return None
 
-    signature = make_signature(
+    (
+        data_path,
+        state_path,
+        state,
+        exists,
+    ) = prepare_job(
         job,
+        quota,
+        output_dir,
         revision,
     )
 
-    # --------------------------------------------------------
-    # Explicit overwrite
-    # --------------------------------------------------------
+    signature = make_signature(job, revision)
 
-    if args.overwrite:
+    source_rows = int(state["source_rows"])
+    records = int(state["records"])
+    bytes_done = int(state["bytes"])
 
-        output_path.unlink(missing_ok=True)
-        state_path.unlink(missing_ok=True)
-
-    # --------------------------------------------------------
-    # Orphan recovery
-    # --------------------------------------------------------
-
-    recover_orphan_files(
-        output_path,
-        state_path,
+    old_target = int(
+        state.get("target_bytes", quota)
     )
 
+    exhausted = bool(
+        state.get("exhausted", False)
+    )
+
+    limit_reached = bool(
+        state.get("limit_reached", False)
+    )
+
+    actual_size = (
+        data_path.stat().st_size
+        if exists else 0
+    )
+
+    extra_bytes = actual_size - bytes_done
+
     # --------------------------------------------------------
-    # Resume variables
+    # Progress plan
     # --------------------------------------------------------
 
-    source_rows = 0
-    records = 0
-    bytes_done = 0
+    remaining = max(
+        0,
+        quota - bytes_done,
+    )
 
-    exhausted = False
-    limit_reached = False
-    old_target = quota
+    print(
+        f"[PLAN] {job.name:30s} "
+        f"{bytes_done / GB:.3f} / "
+        f"{quota / GB:.3f} GB "
+        f"| remaining={remaining / GB:.3f} GB "
+        f"| rows={source_rows:,}",
+        flush=True,
+    )
+
+    def result(is_exhausted):
+
+        return {
+            "name": job.name,
+            "target_bytes": quota,
+            "downloaded_bytes": bytes_done,
+            "records": records,
+            "source_rows": source_rows,
+            "exhausted": is_exhausted,
+        }
 
     # --------------------------------------------------------
-    # Existing files
+    # Dry run: no file modification
     # --------------------------------------------------------
 
-    if output_path.exists():
+    if args.dry_run:
 
-        try:
-
-            state = load_state(state_path)
-
-            valid_signature = all(
-                state.get(key) == value
-                for key, value in signature.items()
-            )
-
-            if not valid_signature:
-
-                print(
-                    f"[RECOVERY] Old download settings detected: "
-                    f"{job.name}"
-                )
-
-                backup_pair(
-                    output_path,
-                    state_path,
-                    suffix="stale",
-                )
-
-            else:
-
-                source_rows = int(
-                    state["source_rows"]
-                )
-
-                records = int(
-                    state["records"]
-                )
-
-                bytes_done = int(
-                    state["bytes"]
-                )
-
-                exhausted = bool(
-                    state.get("exhausted", False)
-                )
-
-                limit_reached = bool(
-                    state.get("limit_reached", False)
-                )
-
-                old_target = int(
-                    state.get("target_bytes", quota)
-                )
-
-                actual_size = output_path.stat().st_size
-
-                if actual_size < bytes_done:
-
-                    print(
-                        "[RECOVERY] File shorter than checkpoint."
-                    )
-
-                    backup_pair(
-                        output_path,
-                        state_path,
-                        suffix="corrupt",
-                    )
-
-                    source_rows = 0
-                    records = 0
-                    bytes_done = 0
-                    exhausted = False
-                    limit_reached = False
-
-                elif bytes_done > quota:
-
-                    raise RuntimeError(
-                        f"{job.name}: existing file exceeds "
-                        "the requested quota."
-                    )
-
-                else:
-
-                    # Remove uncommitted bytes after the last
-                    # valid checkpoint.
-                    with open(output_path, "r+b") as f:
-                        f.truncate(bytes_done)
-
-                    print(
-                        f"[RESUME] {job.name}: "
-                        f"{bytes_done / GB:.3f} GB, "
-                        f"{records:,} records, "
-                        f"{source_rows:,} source rows"
-                    )
-
-        except (ValueError, KeyError, json.JSONDecodeError):
+        if extra_bytes > 0:
 
             print(
-                f"[RECOVERY] Invalid state: {job.name}"
+                f"[CHECK] {job.name}: "
+                f"{extra_bytes} bytes exist beyond "
+                "the last checkpoint."
             )
 
-            backup_pair(
-                output_path,
-                state_path,
-                suffix="invalid",
-            )
-
-            source_rows = 0
-            records = 0
-            bytes_done = 0
-            exhausted = False
-            limit_reached = False
+        return result(exhausted)
 
     # --------------------------------------------------------
-    # Create fresh pair
+    # Create new file pair
     # --------------------------------------------------------
 
-    if not output_path.exists():
+    if not exists:
 
-        output_path.touch()
+        with data_path.open("xb"):
+            pass
 
         save_json_atomic(
             state_path,
-            make_state(
-                signature,
-                0,
-                0,
-                0,
-                quota,
-            ),
+            state,
         )
 
-        print(f"[NEW] {job.name}")
+        print(
+            f"[NEW] {job.name}",
+            flush=True,
+        )
 
     # --------------------------------------------------------
-    # Completed checks
+    # Recover uncommitted data
+    # --------------------------------------------------------
+
+    elif extra_bytes > 0:
+
+        # The checkpoint is the committed boundary.
+        with data_path.open("r+b") as f:
+            f.truncate(bytes_done)
+
+        print(
+            f"[RECOVER] {job.name}: "
+            f"discarded {extra_bytes} "
+            "uncommitted tail bytes.",
+            flush=True,
+        )
+
+    # --------------------------------------------------------
+    # Completion checks
     # --------------------------------------------------------
 
     if exhausted:
 
-        print(f"[SKIP] {job.name}: source exhausted")
+        print(
+            f"[SKIP] {job.name}: source exhausted.",
+            flush=True,
+        )
 
-        return {
-            "name": job.name,
-            "target_bytes": quota,
-            "downloaded_bytes": bytes_done,
-            "records": records,
-            "source_rows": source_rows,
-            "exhausted": True,
-        }
+        return result(True)
 
     if bytes_done >= quota:
 
-        print(f"[SKIP] {job.name}: quota reached")
+        print(
+            f"[SKIP] {job.name}: quota reached.",
+            flush=True,
+        )
 
-        return {
-            "name": job.name,
-            "target_bytes": quota,
-            "downloaded_bytes": bytes_done,
-            "records": records,
-            "source_rows": source_rows,
-            "exhausted": False,
-        }
+        return result(False)
 
-    if limit_reached and old_target == quota:
+    # Existing target already ended on a row boundary.
+    # If target is increased, continue normally.
+    if (
+        limit_reached
+        and old_target == quota
+    ):
 
-        print(f"[SKIP] {job.name}: target already reached")
+        print(
+            f"[SKIP] {job.name}: "
+            "same target already reached.",
+            flush=True,
+        )
 
-        return {
-            "name": job.name,
-            "target_bytes": quota,
-            "downloaded_bytes": bytes_done,
-            "records": records,
-            "source_rows": source_rows,
-            "exhausted": False,
-        }
+        return result(False)
 
     # --------------------------------------------------------
     # Load streaming dataset
     # --------------------------------------------------------
 
-    print(f"\n[LOAD] {job.name}")
+    print(
+        f"\n[LOAD] {job.name}",
+        flush=True,
+    )
+
     print(f"  Repo: {job.repo}")
     print(f"  Config: {job.config}")
     print(f"  Split: {job.split}")
     print(f"  Revision: {revision}")
     print(f"  Target: {quota / GB:.3f} GB")
-
-    print(
-        f"[MIRROR] Endpoint: {HF_ENDPOINT}",
-        flush=True,
-    )
+    print(f"  Endpoint: {HF_ENDPOINT}")
 
     print(
         "[STREAM] Calling load_dataset...",
@@ -977,16 +993,15 @@ def download_job(
         flush=True,
     )
 
-    # Sequential streaming. No shuffle.
-    print(
-        "[STREAM] Sequential reading enabled.",
-        flush=True,
-    )
+    # --------------------------------------------------------
+    # Sequential reading
+    # --------------------------------------------------------
 
-    if source_rows:
+    if source_rows > 0:
 
         print(
-            f"[STREAM] Replaying {source_rows:,} rows...",
+            f"[RESUME] Skipping "
+            f"{source_rows:,} source rows...",
             flush=True,
         )
 
@@ -995,15 +1010,20 @@ def download_job(
     iterator = iter(ds)
 
     # --------------------------------------------------------
-    # Download loop
+    # Timing and counters
     # --------------------------------------------------------
 
-    start_time = time.time()
+    start_time = time.monotonic()
     start_bytes = bytes_done
     last_report = start_time
 
     stopped_by_size = False
+    end_of_source = False
     skipped_oversize = 0
+
+    # --------------------------------------------------------
+    # Checkpoint
+    # --------------------------------------------------------
 
     def persist(
         f,
@@ -1017,19 +1037,22 @@ def download_job(
         save_json_atomic(
             state_path,
             make_state(
-                signature,
-                source_rows,
-                records,
-                bytes_done,
-                quota,
+                signature=signature,
+                source_rows=source_rows,
+                records=records,
+                bytes_done=bytes_done,
+                target_bytes=quota,
                 exhausted=is_exhausted,
                 limit_reached=is_limit_reached,
             ),
         )
 
-    with open(output_path, "r+b") as f:
+    # --------------------------------------------------------
+    # Open output
+    # --------------------------------------------------------
 
-        f.truncate(bytes_done)
+    with data_path.open("r+b") as f:
+
         f.seek(bytes_done)
 
         try:
@@ -1049,24 +1072,19 @@ def download_job(
 
             except StopIteration:
 
-                print(
-                    "[STREAM] Dataset is empty.",
-                    flush=True,
-                )
+                end_of_source = True
 
                 persist(
                     f,
                     is_exhausted=True,
                 )
 
-                return {
-                    "name": job.name,
-                    "target_bytes": quota,
-                    "downloaded_bytes": bytes_done,
-                    "records": records,
-                    "source_rows": source_rows,
-                    "exhausted": True,
-                }
+                print(
+                    f"[EMPTY] {job.name}: no more rows.",
+                    flush=True,
+                )
+
+                return result(True)
 
             print(
                 "[STREAM] First sample received.",
@@ -1078,6 +1096,10 @@ def download_job(
                 list(first_row.keys()),
                 flush=True,
             )
+
+            # ------------------------------------------------
+            # Stream rows
+            # ------------------------------------------------
 
             for row in chain(
                 (first_row,),
@@ -1106,8 +1128,8 @@ def download_job(
 
                     line_size = len(line)
 
-                    # Skip a single record that cannot fit
-                    # into the entire quota.
+                    # Skip a single document larger than
+                    # the entire capacity.
                     if (
                         bytes_done == 0
                         and line_size > quota
@@ -1117,7 +1139,8 @@ def download_job(
                         skipped_oversize += 1
                         continue
 
-                    # Do not consume a row that does not fit.
+                    # Do not count the row when it
+                    # does not fit in the remaining quota.
                     if bytes_done + line_size > quota:
 
                         stopped_by_size = True
@@ -1134,9 +1157,9 @@ def download_job(
                         stopped_by_size = True
                         break
 
-                # ------------------------------------------------
+                # --------------------------------------------
                 # Periodic checkpoint
-                # ------------------------------------------------
+                # --------------------------------------------
 
                 if (
                     source_rows > 0
@@ -1145,11 +1168,11 @@ def download_job(
 
                     persist(f)
 
-                # ------------------------------------------------
+                # --------------------------------------------
                 # Progress
-                # ------------------------------------------------
+                # --------------------------------------------
 
-                now = time.time()
+                now = time.monotonic()
 
                 if now - last_report >= 5:
 
@@ -1163,47 +1186,47 @@ def download_job(
                     ) / elapsed / (1024 ** 2)
 
                     print(
-                        f"\r"
+                        f"[PROGRESS] {job.name}: "
                         f"{bytes_done / GB:.3f} / "
                         f"{quota / GB:.3f} GB"
                         f" | records={records:,}"
                         f" | source_rows={source_rows:,}"
                         f" | speed={speed:.2f} MiB/s",
-                        end="",
                         flush=True,
                     )
 
                     last_report = now
 
-        except KeyboardInterrupt:
+            else:
+
+                end_of_source = True
+
+        # ----------------------------------------------------
+        # Interrupted / error
+        # ----------------------------------------------------
+
+        except BaseException:
 
             print(
-                "\n[INTERRUPTED] Saving checkpoint...",
+                f"\n[INTERRUPTED] {job.name}: "
+                "saving checkpoint...",
                 flush=True,
             )
 
             persist(f)
             raise
 
-        except Exception:
+        # ----------------------------------------------------
+        # Normal completion
+        # ----------------------------------------------------
 
-            print(
-                "\n[ERROR] Saving checkpoint...",
-                flush=True,
-            )
+        persist(
+            f,
+            is_exhausted=end_of_source,
+            is_limit_reached=stopped_by_size,
+        )
 
-            persist(f)
-            raise
-
-        else:
-
-            persist(
-                f,
-                is_exhausted=not stopped_by_size,
-                is_limit_reached=stopped_by_size,
-            )
-
-    elapsed = time.time() - start_time
+    elapsed = time.monotonic() - start_time
 
     print(
         f"\n[DONE] {job.name}\n"
@@ -1216,55 +1239,75 @@ def download_job(
         flush=True,
     )
 
-    if bytes_done < quota and not stopped_by_size:
+    if end_of_source and bytes_done < quota:
 
         print(
-            f"[WARN] {job.name}: source exhausted "
-            "before reaching target."
+            f"[WARN] {job.name}: "
+            "source exhausted before target.",
+            flush=True,
         )
 
-    return {
-        "name": job.name,
-        "target_bytes": quota,
-        "downloaded_bytes": bytes_done,
-        "records": records,
-        "source_rows": source_rows,
-        "exhausted": not stopped_by_size,
-    }
+    return result(end_of_source)
 
 
 # ============================================================
-# 14. Manifest
+# 19. Manifest
 # ============================================================
 
 def save_manifest(
     output_dir,
     group_quotas,
+    job_quotas,
     results,
 ):
 
+    total_budget = sum(
+        group_quotas.values()
+    )
+
+    actual_target = sum(
+        job_quotas.values()
+    )
+
+    reserved = total_budget - actual_target
+
     manifest = {
-
         "source": HF_ENDPOINT,
-
         "unit": "decimal GB",
 
+        "description": (
+            "MiniRain UltraData download plan: "
+            "Python 60%, sh 20%, "
+            "CMD 20% reserved in Code budget."
+        ),
+
         "group_quotas": {
-            key: value / GB
-            for key, value in group_quotas.items()
+            k: v / GB
+            for k, v in group_quotas.items()
+        },
+
+        "job_quotas": {
+            k: v / GB
+            for k, v in job_quotas.items()
+        },
+
+        "code_ratios": {
+            "py": 0.60,
+            "sh": 0.20,
+            "cmd_reserved": 0.20,
         },
 
         "revisions": DATASET_REVISIONS,
 
         "results": results,
 
-        "total_target_bytes": sum(
-            group_quotas.values()
-        ),
+        "total_budget_bytes": total_budget,
+        "total_target_bytes": actual_target,
+        "reserved_bytes": reserved,
 
         "total_saved_bytes": sum(
-            item["downloaded_bytes"]
-            for item in results
+            x["downloaded_bytes"]
+            for x in results
         ),
 
         "updated_at": time.strftime(
@@ -1272,50 +1315,71 @@ def save_manifest(
         ),
     }
 
+    # Do not overwrite the original manifest.json.
     save_json_atomic(
-        output_dir / "manifest.json",
+        output_dir / "manifest_py_sh.json",
         manifest,
     )
 
 
 # ============================================================
-# 15. CLI
+# 20. CLI
 # ============================================================
 
 def parse_args():
 
     parser = argparse.ArgumentParser(
-        description="MiniRain-Vision HF-Mirror Downloader"
+        description=(
+            "MiniRain-Vision UltraData Downloader "
+            "(Python + Shell)"
+        )
     )
 
     parser.add_argument(
         "--total-gb",
         type=float,
+        default=80.0,
+        help="Total budget including reserved CMD.",
+    )
+
+    parser.add_argument(
+        "--l2-gb",
+        type=float,
         default=None,
     )
 
-    parser.add_argument("--l2-gb", type=float)
-    parser.add_argument("--l3-gb", type=float)
-    parser.add_argument("--code-gb", type=float)
-    parser.add_argument("--math-gb", type=float)
+    parser.add_argument(
+        "--l3-gb",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--code-gb",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--math-gb",
+        type=float,
+        default=None,
+    )
 
     parser.add_argument(
         "--out",
         type=str,
         default=None,
-        help="Output directory",
-    )
-
-    parser.add_argument(
-        "--code-languages",
-        type=str,
-        default="py,cpp,cs,go,java,js,php,r,rb,rust,sh",
+        help=(
+            "Output directory. Default: "
+            "ultradata beside this script."
+        ),
     )
 
     parser.add_argument(
         "--code-l2-ratio",
         type=float,
-        default=0.5,
+        default=0.50,
     )
 
     parser.add_argument(
@@ -1349,30 +1413,29 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--overwrite",
+        "--dry-run",
         action="store_true",
+        help="Show download plan without writing files.",
     )
 
     return parser.parse_args()
 
 
 # ============================================================
-# 16. Main
+# 21. Validation
 # ============================================================
 
-def main():
-
-    args = parse_args()
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
+def validate_args(args):
 
     if args.save_every_rows <= 0:
-        raise ValueError("--save-every-rows must be positive")
+        raise ValueError(
+            "--save-every-rows must be positive."
+        )
 
     if args.min_chars < 0:
-        raise ValueError("--min-chars cannot be negative")
+        raise ValueError(
+            "--min-chars cannot be negative."
+        )
 
     for name, value in [
         ("l2_zh_ratio", args.l2_zh_ratio),
@@ -1383,11 +1446,33 @@ def main():
 
         if not 0 <= value <= 1:
             raise ValueError(
-                f"{name} must be between 0 and 1"
+                f"{name} must be between 0 and 1."
             )
 
+    if abs(
+        sum(CODE_LANG_WEIGHTS.values())
+        + CMD_RESERVED_RATIO
+        - 1.0
+    ) > 1e-9:
+
+        raise ValueError(
+            "Code weights plus CMD reservation "
+            "must sum to 1."
+        )
+
+
+# ============================================================
+# 22. Main
+# ============================================================
+
+def main():
+
+    args = parse_args()
+
+    validate_args(args)
+
     # --------------------------------------------------------
-    # Jobs and capacity
+    # Build download jobs
     # --------------------------------------------------------
 
     jobs = build_jobs(args)
@@ -1397,10 +1482,11 @@ def main():
     job_quotas = allocate_job_quotas(
         jobs,
         group_quotas,
+        args,
     )
 
     # --------------------------------------------------------
-    # Output
+    # Output directory
     # --------------------------------------------------------
 
     output_dir = (
@@ -1409,53 +1495,92 @@ def main():
         else DEFAULT_OUTPUT_DIR
     )
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+    if args.dry_run:
+
+        if not output_dir.is_dir():
+            raise FileNotFoundError(
+                f"Dataset directory not found: {output_dir}"
+            )
+
+    else:
+
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    # --------------------------------------------------------
+    # Capacity
+    # --------------------------------------------------------
+
+    total_budget = sum(
+        group_quotas.values()
     )
 
-    # --------------------------------------------------------
-    # Revisions
-    # --------------------------------------------------------
+    actual_target = sum(
+        job_quotas.values()
+    )
 
-    revisions = DATASET_REVISIONS
+    reserved = total_budget - actual_target
 
     # --------------------------------------------------------
     # Print configuration
     # --------------------------------------------------------
 
-    total_target = sum(group_quotas.values())
-
     print("\n" + "=" * 65)
     print("MiniRain-Vision UltraData Downloader")
     print("=" * 65)
 
-    print(f"[MIRROR] Endpoint: {HF_ENDPOINT}")
-    print("[MIRROR] Authentication: disabled (public datasets)")
-    print("[STREAM] Sequential reading: enabled")
-    print("[STREAM] Shuffle: disabled")
+    print(f"[MIRROR] {HF_ENDPOINT}")
+    print("[AUTH] Public datasets, no HF token")
+    print("[STREAM] Sequential reading")
+    print(f"[OUTPUT] {output_dir}")
+    print(f"[DRY RUN] {args.dry_run}")
 
-    print("\n[REVISION] Using pinned versions")
+    print("\n[REVISION]")
 
-    for repo, sha in revisions.items():
+    for repo, sha in DATASET_REVISIONS.items():
         print(f"  {repo}: {sha}")
 
-    print("\n[CAPACITY]")
+    print("\n[GROUP CAPACITY]")
 
     for group, quota in group_quotas.items():
 
         print(
-            f"{group:8s}: {quota / GB:10.3f} GB"
+            f"  {group:8s}: "
+            f"{quota / GB:10.3f} GB"
         )
 
-    print("-" * 65)
+    print("\n[CODE PLAN]")
+
+    code_bytes = group_quotas.get("code", 0)
+
+    for lang, ratio in CODE_LANG_WEIGHTS.items():
+
+        print(
+            f"  {lang:8s}: "
+            f"{code_bytes * ratio / GB:.3f} GB"
+        )
+
     print(
-        f"{'TOTAL':8s}: "
-        f"{total_target / GB:10.3f} GB"
+        f"  {'CMD':8s}: "
+        f"{code_bytes * CMD_RESERVED_RATIO / GB:.3f} GB"
+        " (reserved)"
     )
 
-    print(f"Output: {output_dir}")
-    print(f"Checkpoint interval: {args.save_every_rows} rows")
+    print("\n[TOTAL]")
+
+    print(
+        f"  Budget:   {total_budget / GB:.3f} GB"
+    )
+
+    print(
+        f"  Download: {actual_target / GB:.3f} GB"
+    )
+
+    print(
+        f"  Reserved: {reserved / GB:.3f} GB"
+    )
 
     print("=" * 65)
 
@@ -1481,25 +1606,28 @@ def main():
                 job=job,
                 quota=quota,
                 output_dir=output_dir,
-                revision=revisions[job.repo],
+                revision=DATASET_REVISIONS[job.repo],
                 args=args,
             )
 
             if result is not None:
                 results.append(result)
 
-            # Save manifest after each job.
-            save_manifest(
-                output_dir,
-                group_quotas,
-                results,
-            )
+            if not args.dry_run:
+
+                save_manifest(
+                    output_dir,
+                    group_quotas,
+                    job_quotas,
+                    results,
+                )
 
     except KeyboardInterrupt:
 
-        print("\n[STOPPED] Checkpoints saved.")
         print(
-            "Run the same command again to resume."
+            "\n[STOPPED] Checkpoint saved. "
+            "Run again to resume.",
+            flush=True,
         )
 
         return
@@ -1507,11 +1635,14 @@ def main():
     except Exception as exc:
 
         print(
-            f"\n[FAILED] {type(exc).__name__}: {exc}"
+            f"\n[FAILED] "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
         )
 
         print(
-            "Existing data and checkpoints are preserved."
+            "Existing checkpoint files are preserved.",
+            flush=True,
         )
 
         raise
@@ -1521,27 +1652,49 @@ def main():
     # --------------------------------------------------------
 
     actual = sum(
-        item["downloaded_bytes"]
-        for item in results
+        x["downloaded_bytes"]
+        for x in results
     )
 
     print("\n" + "=" * 65)
     print("DOWNLOAD SUMMARY")
     print("=" * 65)
 
-    for item in results:
+    for result in results:
 
         print(
-            f"{item['name']:35s}"
-            f"{item['downloaded_bytes'] / GB:9.3f} GB"
+            f"{result['name']:35s}"
+            f"{result['downloaded_bytes'] / GB:9.3f} GB"
         )
 
     print("-" * 65)
-    print(f"Target: {total_target / GB:.3f} GB")
-    print(f"Saved:  {actual / GB:.3f} GB")
-    print(f"Output: {output_dir}")
+
+    print(
+        f"Budget:   {total_budget / GB:.3f} GB"
+    )
+
+    print(
+        f"Target:   {actual_target / GB:.3f} GB"
+    )
+
+    print(
+        f"Saved:    {actual / GB:.3f} GB"
+    )
+
+    print(
+        f"Reserved: {reserved / GB:.3f} GB"
+    )
+
+    print(
+        f"Output:   {output_dir}"
+    )
+
     print("=" * 65)
 
+
+# ============================================================
+# 23. Entry point
+# ============================================================
 
 if __name__ == "__main__":
     main()
