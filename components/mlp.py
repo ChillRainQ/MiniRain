@@ -100,8 +100,18 @@ class FastWeightProgrammer(nn.Module):
     def clear(self):
         self._alpha_cache = None
 
-
 class SwiGLU(MyMLP):
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
+        super().__init__()
+        self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+
+    def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
+                batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class SwiGLUWithFWP(MyMLP):
     def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
