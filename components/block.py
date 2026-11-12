@@ -194,7 +194,9 @@ class BlockAttnResBlock(nn.Module):
         self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
-        self.attn = MoTGroupQueryAttention(AttentionArgs(config))
+        # 模态专属 QKVO 只在 MoT（type_id=3）时构建，否则复用单套投影，避免纯文本模型白付双份注意力
+        self.attn = (MoTGroupQueryAttention if getattr(config, "type_id", 1) == 3
+                     else GroupQueryAttention)(AttentionArgs(config))
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
@@ -228,7 +230,8 @@ class BlockAttnResBlock(nn.Module):
         past_hidden_states, partial_block = self._flush(past_hidden_states, partial_block)
         attn_out, past_key_value = self.attn(self.input_layernorm(attn_input),
                                              position_embeddings, past_key_value,
-                                             use_cache, attention_mask, image_bidirectional_mask)
+                                             use_cache, attention_mask, image_bidirectional_mask,
+                                             modality_mask=modality_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
         # 当前 1=图像统一走 mlp_v；2/3 为后续视觉子模态预留，届时在此按 id 分派
