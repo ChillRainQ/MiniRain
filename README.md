@@ -14,9 +14,9 @@ MiniRain-Vision 是一个从零实现的轻量级视觉语言模型（VLM）。�
 |------|------|----------|
 | **输入融合** | 文本/图像统一序列 | patch 嵌入 in-place 覆盖 `image_pad` 占位，无独立视觉塔 |
 | **2D RoPE** | 位置编码 | 图像 (行,列) 双轴，文本 (t,t) 退化 1D，支持 YaRN 插值 |
-| **MoT-GQA** | 注意力 | QKVO 按模态分 expert，注意力全局共享，纯文本零开销 |
+| **MoT-GQA** | 注意力（可选） | Q/K/V/O 按模态分 expert，注意力全局共享，纯文本零开销；已实现，主干暂未接入，`type_id=3` 时仅 MLP 走 MoT |
 | **BlockAttnRes** | 跨块信息聚合 | 可学习加权历史块尾 + 当前输入，替代恒等残差 |
-| **Mask** | 注意力约束 | 文本因果 | 图像段内双向 | 跨段隔离 |
+| **Mask** | 注意力约束 | 文本因果 \| 图像段内双向 \| 图与图之间因果可见 |
 | **MLP** | 非线性变换 | SwiGLU（dense）或 LosslessMoE（无辅助损失 MoE） |
 
 ### 单流多模态序列
@@ -34,15 +34,17 @@ loss 只落在文本 + EOS 上，图像段全部为上下文。
 - 图像 patch(i,j) 的位置编码为 `(base+i, base+j)`，行/列各占 head_dim 的一半
 - 文本位置退化为 `(t, t)`，即标准 1D RoPE
 - 换行符位于 `(base+i, base+C)`，宽图按 `max(R,C)` 推进游标，避免列坐标与后续文本碰撞
-- 频率表支持 YaRN 插值（`inference_rope_scaling=True` 启用）
+- 文本 1D 频率表支持 YaRN 插值（`inference_rope_scaling=True` 启用）；图像 2D 表不做插值
 
 ### MoT 注意力（Mixture-of-Transformers）
 
 Q/K/V/O 四个投影按模态解耦为文本/图像两套 expert，注意力计算全局共享。纯文本输入时 `modality_mask=None`，全体直接走文本 expert，**零额外开销退化为普通 GQA**。
 
+> 现状：`MoTGroupQueryAttention` 已实现并通过单元测试，但 `BlockAttnResBlock` 目前硬编码 `GroupQueryAttention`，模型主干尚未接入。`use_mot=True`（`type_id=3`）实际生效的只有 `MoTFFN`。
+
 ### 图像双向注意力
 
-注意力 mask = `因果 | 同图段`：文本保持因果，同一张图内的 patch 之间双向可见，padding 只屏蔽 key 维。
+注意力 mask = `因果 | 同图段`：文本保持因果，同一张图内的 patch 之间双向可见，padding 只屏蔽 key 维。不同图段之间不做隔离——排在后面的图能因果地看到前面的图。
 
 ### 块注意力残差（BlockAttnRes）
 
@@ -52,14 +54,14 @@ Q/K/V/O 四个投影按模态解耦为文本/图像两套 expert，注意力计�
 
 - GroupQueryAttention（GQA）+ QK-RMSNorm
 - SwiGLU（dense）或 LosslessMoE（`use_moe=True`，无辅助损失的偏置均衡路由 + 共享专家）
-- RMSNorm、Flash Attention（`scaled_dot_product_attention`）
+- RMSNorm、Flash Attention（`scaled_dot_product_attention`；带图像双向 mask 时退化为显式 mask 路径）
 - KV cache 增量解码，generate 内置视觉结构 token 采样屏蔽
 
 ## 目录结构
 
 ```
 architectures/   rain.py(模型主体) / config.py(RainConfig)
-components/      attention.py(MoT-GQA) / block.py(残差块) / mlp.py(SwiGLU/MoE) / norm.py
+components/      attention.py(GQA / MoT-GQA) / block.py(残差块) / mlp.py(SwiGLU/MoE) / norm.py
 dataset/         collator.py(VLMCollator 序列拼装+位置编号) / datasets.py
 tokenizers/      BPE tokenizer(含 <|vision_start|> 等视觉 token)
 train/           train_pre.py / train_sft.py / train_grpo.py / train_util.py
@@ -91,4 +93,3 @@ batch = collator([{"image": img_tensor, "text": "描述这张图"}])
 # 生成
 gen = model.generate(inputs=ids, max_new_tokens=64, do_sample=False)
 ```
-

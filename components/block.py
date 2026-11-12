@@ -5,7 +5,7 @@ from transformers import PreTrainedConfig
 from components.mlp import SwiGLU, LosslessMoE, MoTFFN
 from components.mlp import MLPArgs
 from components.norm import NormArgs
-from components.attention import AttentionArgs
+from components.attention import AttentionArgs, MoTGroupQueryAttention
 from components.attention import GroupQueryAttention
 import torch.nn as nn
 
@@ -111,7 +111,7 @@ class MiniRainBlock(nn.Module):
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
-                                  bias=False), config=config)
+                                  bias=False), config=config, fwp=True)
 
 
     def forward(self, hidden_states, position_embeddings,
@@ -142,7 +142,8 @@ class FullAttnResBlock(nn.Module):
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                      intermediate_size=config.intermediate_size, bias=False), config=config)
+                                      intermediate_size=config.intermediate_size, bias=False), config=config,
+                              fwp=True)
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                   intermediate_size=config.intermediate_size, num_experts=config.n_experts)
@@ -193,12 +194,13 @@ class BlockAttnResBlock(nn.Module):
         self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
-        self.attn = GroupQueryAttention(AttentionArgs(config))
+        self.attn = MoTGroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                      intermediate_size=config.intermediate_size, bias=False), config=config)
+                                      intermediate_size=config.intermediate_size, bias=False), config=config,
+                              fwp=True)
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                    intermediate_size=config.intermediate_size, num_experts=config.n_experts)
@@ -229,7 +231,6 @@ class BlockAttnResBlock(nn.Module):
                                              use_cache, attention_mask, image_bidirectional_mask)
         partial_block = partial_block + attn_out if partial_block is not None else attn_out
         mlp_input = self.mlp_res(past_hidden_states, partial_block)
-        # MoTFFN 期望 img_idx（索引），由 VLM 入口统一算一次（避免每层 nonzero）；
         # 当前 1=图像统一走 mlp_v；2/3 为后续视觉子模态预留，届时在此按 id 分派
         if isinstance(self.mlp, MoTFFN):
             if img_idx is None and modality_mask is not None:

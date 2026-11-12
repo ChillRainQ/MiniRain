@@ -281,6 +281,7 @@ class MiniRainVLM(nn.Module):
         position_embeddings = build_position_embeddings(
             positions, is_img_tok,
             self.rope_cos1d, self.rope_sin1d, self.rope_cos2d, self.rope_sin2d)
+        attn_modality_mask = modality_mask if img_idx.numel() > 0 else None
 
         presents, past_hidden_states = [], []
         for layer, past_key_value in zip(self.layers, past_key_values):
@@ -292,7 +293,7 @@ class MiniRainVLM(nn.Module):
                 attention_mask=attention_mask,
                 past_hidden_states=past_hidden_states,
                 image_bidirectional_mask=image_bidirectional_mask,
-                modality_mask=modality_mask,
+                modality_mask=attn_modality_mask,
                 img_idx=img_idx,
                 fwp_context=fwp_context,
                 fwp_accumulate=fwp_accumulate,

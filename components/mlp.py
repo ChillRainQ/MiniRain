@@ -76,29 +76,39 @@ class FastWeightProgrammer(nn.Module):
             self.v[name] = nn.Parameter(torch.empty(rank, in_features))
             nn.init.normal_(self.u[name], std=0.02)
             nn.init.normal_(self.v[name], std=0.02)
-        # 运行时状态不是模型参数，不进 state_dict；首轮创建，多轮累加，新会话清空
-        self._delta_cache = None
+        # 仅缓存每个样本的低秩系数，不进 state_dict；首轮创建，多轮累加，新会话清空
+        self._alpha_cache = None
 
     def forward(self, prompt_context: torch.Tensor):
-        coefficients = self.controller(prompt_context).chunk(3, dim=-1)
-        return tuple(
-            torch.einsum("br,ro,ri->boi", alpha, self.u[name], self.v[name]) * self.update_scale
-            for name, alpha in zip(self.names, coefficients))
+        return self.controller(prompt_context).chunk(3, dim=-1)
 
-    def cache(self, deltas):
-        self._delta_cache = tuple(delta.detach() for delta in deltas)
+    def apply(self, name, x, linear, alpha, batch_idx=None):
+        """y = Wx + scale·Σᵣαᵣuᵣ(vᵣᵀx)，不构造完整 ΔW 或逐 token 权重。"""
+        if batch_idx is not None:
+            alpha = alpha.index_select(0, batch_idx)
+        if x.dim() == 2:
+            projected = torch.einsum("ni,ri->nr", x, self.v[name])
+            update = torch.einsum("nr,ro->no", projected * alpha, self.u[name])
+        else:
+            projected = torch.einsum("bti,ri->btr", x, self.v[name])
+            update = torch.einsum("btr,ro->bto", projected * alpha.unsqueeze(1), self.u[name])
+        return linear(x) + update * self.update_scale
+
+    def cache(self, coefficients):
+        self._alpha_cache = tuple(alpha.detach() for alpha in coefficients)
 
     def clear(self):
-        self._delta_cache = None
+        self._alpha_cache = None
 
 
 class SwiGLU(MyMLP):
-    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None):
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        fwp_rank = int(getattr(config, "fwp_rank", 0))
+        # FWP 默认关闭：需显式传 fwp=True 才创建，开启后 rank 仍由 config.fwp_rank 决定
+        fwp_rank = int(getattr(config, "fwp_rank", 0)) if fwp else 0
         self.fwp = FastWeightProgrammer(
             {"gate": self.gate, "up": self.up, "down": self.down},
             prompt_size=args.hidden_size, rank=fwp_rank,
@@ -106,39 +116,28 @@ class SwiGLU(MyMLP):
             update_scale=float(getattr(config, "fwp_update_scale", 1.0)),
         ) if fwp_rank > 0 else None
 
-    @staticmethod
-    def _updated_linear(x, linear, delta, batch_idx=None):
-        if delta is None:
-            return linear(x)
-        if batch_idx is not None:
-            delta = delta.index_select(0, batch_idx)
-        weight = linear.weight.unsqueeze(0) + delta  # W_eff = W + ΔW，每个样本独立
-        if x.dim() == 2:
-            out = torch.einsum("ni,noi->no", x, weight)
-        else:
-            out = torch.einsum("bti,boi->bto", x, weight)
-        return out if linear.bias is None else out + linear.bias
-
     def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
                 batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
-        deltas = None
+        coefficients = None
         if self.fwp is not None:
             if fwp_context is not None:
-                deltas = self.fwp(fwp_context)
-                if fwp_accumulate and self.fwp._delta_cache is not None:
-                    deltas = tuple(old + new for old, new in zip(self.fwp._delta_cache, deltas))
+                coefficients = self.fwp(fwp_context)
+                if fwp_accumulate and self.fwp._alpha_cache is not None:
+                    coefficients = tuple(old + new for old, new in zip(self.fwp._alpha_cache, coefficients))
                 if not self.training:
-                    self.fwp.cache(deltas)
+                    self.fwp.cache(coefficients)
             else:
-                deltas = self.fwp._delta_cache
-            if deltas is None:
+                coefficients = self.fwp._alpha_cache
+            if coefficients is None:
                 raise RuntimeError("FWP 缺少 prompt 更新：请先执行 prefill 或传入 fwp_context")
-        gate_delta, up_delta, down_delta = deltas if deltas is not None else (None, None, None)
-        if deltas is None and _HAS_LIGER_SWIGLU and x.is_cuda:
+        if coefficients is None and _HAS_LIGER_SWIGLU and x.is_cuda:
             return self.down(LigerSiLUMulFunction.apply(self.gate(x), self.up(x)))
-        gate = self._updated_linear(x, self.gate, gate_delta, batch_idx)
-        up = self._updated_linear(x, self.up, up_delta, batch_idx)
-        return self._updated_linear(F.silu(gate) * up, self.down, down_delta, batch_idx)
+        if coefficients is None:
+            return self.down(F.silu(self.gate(x)) * self.up(x))
+        gate_alpha, up_alpha, down_alpha = coefficients
+        gate = self.fwp.apply("gate", x, self.gate, gate_alpha, batch_idx)
+        up = self.fwp.apply("up", x, self.up, up_alpha, batch_idx)
+        return self.fwp.apply("down", F.silu(gate) * up, self.down, down_alpha, batch_idx)
 
 class LowRankMLP(MyMLP):
     ...
@@ -172,10 +171,10 @@ class MoTFFN(nn.Module):
     def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
-        self.mlp_t = SwiGLU(args, config=config)
+        self.mlp_t = SwiGLU(args, config=config, fwp=True)   # 文本专家显式开启
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
-                                    bias=args.bias), config=config)
+                                    bias=args.bias))  # 视觉专家默认关：FWP 只作用于文本侧
         self.norm_t = TorchRMSNorm(norm_args)
         self.norm_v = TorchRMSNorm(norm_args)
 
@@ -196,9 +195,11 @@ class MoTFFN(nn.Module):
                                (img_idx, self.norm_v, self.mlp_v)):
             if idx.numel() == 0:
                 continue
-            # MoT 将 token 展平后仍需知道其所属样本，才能选择该样本自己的 ΔW
-            batch_idx = torch.div(idx, T, rounding_mode="floor")
-            y = mlp(norm(flat.index_select(0, idx)), fwp_context=fwp_context,
+            # 文本 token 展平后仍按样本选择 α；视觉专家不接收 FWP 上下文
+            is_text = mlp is self.mlp_t
+            batch_idx = torch.div(idx, T, rounding_mode="floor") if is_text else None
+            y = mlp(norm(flat.index_select(0, idx)),
+                    fwp_context=fwp_context if is_text else None,
                     batch_idx=batch_idx, fwp_accumulate=fwp_accumulate)
             if out is None:
                 out = y.new_empty(B * T, D)

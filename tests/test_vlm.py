@@ -205,6 +205,26 @@ model.zero_grad(set_to_none=True)
 print("=" * 60); print("5. generate: prefill/decode/多序列")
 print("=" * 60)
 model.eval()
+# 单样本真实图文交错：图1 → 文本 → 图2 → 文本，覆盖两图注入与后续 decode
+inter_imgs = [torch.rand(3, 32, 32), torch.rand(3, 32, 48)]
+inter_ids, inter_pos, inter_labels, inter_cursor = [BOS], [(0, 0)], [-100], 1
+for inter_img, inter_text in zip(inter_imgs, ("第一段", "第二段")):
+    span_ids, span_pos, span_labels, inter_cursor, _ = col._image_span(inter_img, inter_cursor)
+    inter_ids += span_ids; inter_pos += span_pos; inter_labels += span_labels
+    span_ids, span_pos, span_labels, inter_cursor = col._text_span(inter_text, inter_cursor, learn=False)
+    inter_ids += span_ids; inter_pos += span_pos; inter_labels += span_labels
+inter_ids.append(EOS); inter_pos.append((inter_cursor, inter_cursor)); inter_labels.append(EOS)
+inter_ids = torch.tensor([inter_ids], device=DEVICE)
+inter_pos = torch.tensor([inter_pos], device=DEVICE)
+inter_gen = model.generate(input_ids=inter_ids, positions=inter_pos,
+                           pixel_values=[x.to(DEVICE) for x in inter_imgs],
+                           max_new_tokens=4, do_sample=False, eos_token_id=None)
+check("图文交错(图→文→图→文)完成 prefill + 4步 decode",
+      inter_gen.shape == (1, inter_ids.shape[1] + 4))
+check("图文交错 decode 不产生视觉 token",
+      not any(t in {IMG_START, IMG_END, IMG_PAD, IMG_ROW}
+              for t in inter_gen[0, inter_ids.shape[1]:].tolist()))
+
 prompt = col([{"image": torch.rand(3, 32, 32), "text": "描述:"}])
 gen = model.generate(input_ids=prompt["input_ids"].to(DEVICE),
                      positions=prompt["positions"].to(DEVICE),
