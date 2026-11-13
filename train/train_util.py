@@ -77,22 +77,23 @@ class MuonWithAdamW(optim.Optimizer):
 
 
 def adamw_params_name() -> list[str]:
-    return ['embed', 'lm_head', 'text_norm', 'bias']
+    return ['embed', 'lm_head', 'text_norm', 'bias', 'patch_embed']
 
-def get_muon_params(model) -> list[Tensor]:
+def get_muon_params(model, *, matrix_only=False, exclude_norm=False) -> list[Tensor]:
     """获取适用于 Muon 优化器的参数：隐藏层 ndim >= 2 的权重矩阵。
     修复：embedding 和 lm_head 虽然也是 2D，但必须交给 AdamW（Muon 的要求）。"""
     return [p for n, p in model.named_parameters()
-            if p.requires_grad and p.dim() >= 2
-            and not any(k in n for k in adamw_params_name())]
+            if p.requires_grad and (p.dim() == 2 if matrix_only else p.dim() >= 2)
+            and not any(k in n for k in adamw_params_name())
+            and not (exclude_norm and 'norm' in n.lower())]
 
 
-def get_adamw_params(model) -> list[Tensor]:
+def get_adamw_params(model, *, matrix_only=False, exclude_norm=False) -> list[Tensor]:
     """获取适用于 AdamW 优化器的参数：bias、text_norm scale 等 ndim < 2 的参数，
     以及 embedding / lm_head（修复：这两类从 Muon 划归 AdamW）。"""
-    return [p for n, p in model.named_parameters()
-            if p.requires_grad
-            and (p.dim() < 2 or any(k in n for k in adamw_params_name()))]
+    muon_ids = {id(p) for p in get_muon_params(
+        model, matrix_only=matrix_only, exclude_norm=exclude_norm)}
+    return [p for p in model.parameters() if p.requires_grad and id(p) not in muon_ids]
 
 def swanlab_login():
     api_key = os.environ.get("SWANLAB_API_KEY")
@@ -107,39 +108,47 @@ def save(state_dict, weight_path):
         os.makedirs(dir_name, exist_ok=True)
     torch.save({k: v.half().cpu() for k, v in state_dict.items()}, weight_path)
 
-def get_lr(current_step, total_steps, lr):
+def get_lr(current_step, total_steps, lr, *, warmup_steps=0, min_lr_ratio=0.1):
     """
     余弦退火
     """
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+    if warmup_steps > 0 and current_step <= warmup_steps:
+        return lr * current_step / warmup_steps
+    progress = min(1., max(0., (current_step - warmup_steps) /
+                              max(1, total_steps - warmup_steps)))
+    return lr * (min_lr_ratio + (1 - min_lr_ratio) *
+                 0.5 * (1 + math.cos(math.pi * progress)))
 
-def setup_seed(seed: int):
+def setup_seed(seed: int, *, deterministic=True):
     """
     种子设置
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def init_distributed_mode():
-    if int(os.environ.get("RANK", -1)) == -1:
-        return 0  # 非DDP模式
-
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if int(os.environ.get("WORLD_SIZE", '1')) <= 1:
+        return local_rank
+    if not torch.cuda.is_available():
+        raise RuntimeError('Multi-rank mode expects CUDA')
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
     return local_rank
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
-def Logger(content):
+def Logger(content, *, flush=False):
     if is_main_process():
-        print(content)
+        print(content, flush=flush)
 
 def get_model_params(model, config) :
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -250,10 +259,11 @@ def get_checkpoint(lm_config, weight='full_sft', model=None, muon=None, adam=Non
 
 
 class SkipBatchSampler(Sampler):
-    def __init__(self, sampler, batch_size, skip_batches=0):
+    def __init__(self, sampler, batch_size, skip_batches=0, drop_last=False):
         self.sampler = sampler
         self.batch_size = batch_size
         self.skip_batches = skip_batches
+        self.drop_last = drop_last
 
     def __iter__(self):
         batch = []
@@ -267,11 +277,12 @@ class SkipBatchSampler(Sampler):
                     continue
                 yield batch
                 batch = []
-        if len(batch) > 0 and skipped >= self.skip_batches:
+        if len(batch) > 0 and not self.drop_last and skipped >= self.skip_batches:
             yield batch
 
     def __len__(self):
-        total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        total_batches = (len(self.sampler) // self.batch_size if self.drop_last else
+                         (len(self.sampler) + self.batch_size - 1) // self.batch_size)
         return max(0, total_batches - self.skip_batches)
 
 

@@ -70,18 +70,14 @@ class PretrainDataset(Dataset):
 
 class PretrainBinDataset(Dataset):
 
-    def __init__(
-        self,
-        bin_path,
-        idx_path,
-        max_length=4096,
-        pad_token_id=0,
-    ):
+    def __init__(self, bin_path, idx_path, max_length=4096, pad_token_id=None,
+                 pad_to_max=True, stage="p1"):
         super().__init__()
         self.bin_path = Path(bin_path)
         self.idx_path = Path(idx_path)
         self.max_length = int(max_length)
-        self.pad_token_id = int(pad_token_id)
+        self.pad_to_max = bool(pad_to_max)
+        self.stage = stage
 
         if not self.bin_path.is_file():
             raise FileNotFoundError(
@@ -127,6 +123,30 @@ class PretrainBinDataset(Dataset):
             )
 
         self.num_records = len(self.offsets) - 1
+        lengths = self.offsets[1:] - self.offsets[:-1]
+        if np.any(lengths < 2) or np.any(lengths > self.max_length):
+            raise RuntimeError("BIN contains sequences outside [2, max_length]")
+
+        manifest_path = self.bin_path.parent / "manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf8"))
+            stage_meta = manifest["stages"][self.stage]
+            if (int(stage_meta["records"]) != self.num_records or
+                    int(stage_meta["stored_tokens"]) != len(self.tokens) or
+                    self.max_length > int(manifest["max_length"])):
+                raise RuntimeError("manifest does not match BIN/IDX or max_length")
+            special = manifest["special_tokens"]
+            manifest_pad = int(special["pad_token_id"])
+            if pad_token_id is not None and int(pad_token_id) != manifest_pad:
+                raise ValueError("pad_token_id does not match manifest")
+            self.pad_id = manifest_pad
+            self.bos_id = int(special["bos_token_id"])
+            self.eos_id = int(special["eos_token_id"])
+            self.vocab_size = int(manifest["vocab_size"])
+        else:
+            self.pad_id = 0 if pad_token_id is None else int(pad_token_id)
+            self.bos_id, self.eos_id, self.vocab_size = 1, 2, 16384
+        self.pad_token_id = self.pad_id
 
         print(
             "[PretrainBinDataset]\n"
@@ -166,10 +186,14 @@ class PretrainBinDataset(Dataset):
             )
         ids_np = np.asarray(self.tokens[start:end], dtype=np.int64,).copy()
 
-        input_ids = torch.full((self.max_length,), self.pad_token_id, dtype=torch.long,)
-
-        labels = torch.full((self.max_length,), -100, dtype=torch.long,)
         ids = torch.from_numpy(ids_np)
+        if ids[0].item() != self.bos_id or ids[-1].item() != self.eos_id:
+            raise RuntimeError(f"Bad BOS/EOS at record {index}")
+        if not self.pad_to_max:
+            return ids
+
+        input_ids = torch.full((self.max_length,), self.pad_token_id, dtype=torch.long,)
+        labels = torch.full((self.max_length,), -100, dtype=torch.long,)
         input_ids[:length] = ids
         labels[:length] = ids
         return input_ids, labels
@@ -178,11 +202,24 @@ class PretrainBinDataset(Dataset):
         return int(self.offsets[index + 1] - self.offsets[index])
 
     def close(self):
-        if hasattr(self.tokens, "_mmap"):
-            self.tokens._mmap.close()
+        for name in ("tokens", "offsets"):
+            array = getattr(self, name, None)
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+                array._mmap = None
 
-        if hasattr(self.offsets, "_mmap"):
-            self.offsets._mmap.close()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
     
     
 class SFTDataset(Dataset):
@@ -285,13 +322,3 @@ class RLAIFDataset(Dataset):
             'prompt': prompt,
             'answer': ""
         }
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    

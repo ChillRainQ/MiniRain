@@ -8,7 +8,7 @@ CLI = "cli"
 COMPONENTS = "components"
 TRAIN = "train"
 DATASET = "dataset"
-TRAIN_OUTPUT_DIR = "outputs"
+TRAIN_OUTPUT_DIR = "exp"
 TOKENIZER_DIR = "minirain_tokenizer"
 TOKENIZER_PATH = os.path.join(PROJECT_ROOT_DIR, TOKENIZER_DIR)
 MODEL_CODE_DIR_AND_FILE = [os.path.join(PROJECT_ROOT_DIR, ARCHITECTURES),
@@ -16,4 +16,8 @@ MODEL_CODE_DIR_AND_FILE = [os.path.join(PROJECT_ROOT_DIR, ARCHITECTURES),
                   os.path.join(PROJECT_ROOT_DIR, COMPONENTS),
                   os.path.join(PROJECT_ROOT_DIR, TRAIN),
                   os.path.join(PROJECT_ROOT_DIR, DATASET),
-                os.path.join(PROJECT_ROOT_DIR, "project.py")]
+                os.path.join(PROJECT_ROOT_DIR, "project.py"),
+                os.path.join(PROJECT_ROOT_DIR, "losses"),
+                os.path.join(PROJECT_ROOT_DIR, "scripts"),
+                os.path.join(PROJECT_ROOT_DIR, "pyproject.toml"),
+                os.path.join(PROJECT_ROOT_DIR, "uv.lock")]

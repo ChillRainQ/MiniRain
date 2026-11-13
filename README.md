@@ -93,3 +93,58 @@ batch = collator([{"image": img_tensor, "text": "描述这张图"}])
 # 生成
 gen = model.generate(inputs=ids, max_new_tokens=64, do_sample=False)
 ```
+
+## P1 预训练
+
+P1 使用预处理后的 `data/pretrain_bins/p1_text.bin` 与 `p1_text.idx`。默认实验目录为
+`exp/pretrain_1024_20/p1`（默认实验名由 hidden-size 和 layers 决定），其中包含
+`train.jsonl`、可精确续训的 `latest.pt` 和最终部署权重。
+模型初始化时会先从 `init/ConvStem.pt` 加载 `student` 蒸馏权重并严格校验，然后冻结视觉
+stem 和视觉专家；默认蒸馏权重对应 `hidden_size=1024`。
+
+```powershell
+python train/pretrain_p1.py --dry-run
+python train/pretrain_p1.py --auto-resume
+```
+
+使用独立实验名时，产物会写入对应子目录：
+
+```powershell
+python train/pretrain_p1.py --exp-name pretrainxxxx --auto-resume
+```
+
+实验启动时调用 `train/ckpt.py` 的 `save_exp` 保存模型、训练、数据处理代码和依赖配置。
+快照在实验根目录；阶段产物在 `p1/`。已有完整快照在续训时不会被当前代码覆盖：
+
+```text
+exp/pretrainxxxx/
+  architectures/  components/  losses/  train/  dataset/  cli/  scripts/
+  project.py  pyproject.toml  uv.lock  run_config.json
+  p1/
+    step_00001000.pt ... latest.pt
+    p1_final_weights.pth
+    train.jsonl  metrics.csv  training_report.html
+    summary.json
+```
+
+`--output-dir` 指定实验根目录，脚本自动在其下创建 `p1/`。
+旧布局的断点可用 `--resume exp/旧实验/latest.pt` 指定；历史指标需放到新阶段目录才能延续。
+
+检查点默认每 1000 个优化器 step 保存一次，可用 `--save-every 500` 调整。
+实验目录保留最近 5 个 `step_XXXXXXXX.pt` 完整断点，超过数量自动删除最旧的编号断点，
+另外维护一份 `latest.pt` 供 `--auto-resume` 使用；训练结束时也保存一次。
+最终部署权重 `p1_final_weights.pth` 不参与轮换。
+
+训练指标自动保存到同一实验的 `p1/` 目录，不需要外部平台：
+
+- `train.jsonl`：每个优化器 step 的原始指标，逐行刷新。
+- `metrics.csv`：可用于自行分析的表格。
+- `training_report.html`：直接用浏览器打开的离线曲线，无网络/CDN 依赖。
+- `summary.json`：运行状态、最近指标和最低训练 loss。
+- 实验根目录 `run_config.json`：本次启动参数、模型配置、设备、PyTorch 版本及参数量。
+
+记录 loss、step/epoch、AdamW/Muon 学习率、裁剪前梯度范数、AMP scale、有效预测 token
+数量、吞吐量、单步/累计耗时、预计剩余时间以及 rank 0 当前/单步峰值显存。
+CSV、摘要和 HTML 在保存检查点及训练完成时刷新；`--log-every` 仅控制终端输出。
+续训时保留断点及之前的记录，原 JSONL 会先备份为 `train.before-resume-*.jsonl`；
+在同一目录启动全新训练也会备份原记录。ETA 基于本次启动的平均单步耗时，不含检查点开销。

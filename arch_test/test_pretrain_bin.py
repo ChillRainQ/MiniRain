@@ -61,3 +61,4 @@ for i in [0, 1, 100, len(dataset) - 1]:
 
 print("=" * 60)
 print("PASS")
+dataset.close()
