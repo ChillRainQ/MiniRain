@@ -9,6 +9,11 @@ model_type: dict[int, str] = {
 class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
                  use_moe=False, use_mot=False, use_bounce=False,  **kwargs):
+        # 兼容早期配置：旧版只序列化 type_id，没有持久化 use_mot/use_moe。
+        # 必须在 super().__init__ 前读取，否则重新加载 MoT 配置会静默退化成 Dense。
+        saved_type_id = int(kwargs.get("type_id", 0) or 0)
+        use_moe = bool(use_moe or saved_type_id == 2)
+        use_mot = bool(use_mot or (saved_type_id == 3 and not use_moe))
         super().__init__(**kwargs)
         self.type_id = 0
         if use_moe:
@@ -36,6 +41,7 @@ class RainConfig(PretrainedConfig):
         self.intermediate_size: int = int(kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64))
         # MOE config
         self.use_moe = use_moe
+        self.use_mot = use_mot
         self.m: int = int(kwargs.get("m", 8))
         self.norm_topk_prob: bool = bool(kwargs.get("norm_topk_prob", True))
         self.n_experts: int = 0 if not use_moe else kwargs.get("n_experts", 4) * self.m
@@ -74,6 +80,8 @@ class RainConfig(PretrainedConfig):
         self.img_start_token = int(kwargs.get("img_start_token", 9))
         self.img_end_token = int(kwargs.get("img_end_token", 10))
         self.img_row_token = int(kwargs.get("img_row_token", 27))
+        self.vision_pad_token = int(kwargs.get("vision_pad_token", 11))
+        self.video_pad_token = int(kwargs.get("video_pad_token", 13))
 
 
 

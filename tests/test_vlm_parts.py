@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from unittest.mock import patch
 
 from _device import add_device_args, list_gpus, resolve_device
 from architectures.config import RainConfig
@@ -185,7 +186,7 @@ check("≥2 候选时 query 有梯度", res.attn_res_query.grad.abs().sum() > 0)
 def loop_ref(m, hist, cur):
     return m.forward_loop(hist, cur)
 
-# 逐候选循环与堆叠求和的反向顺序不同，半精度下允许 ulp 级差异；堆叠两版应逐位相同
+# 新实现把 softmax 提升到 float32；旧实现保留低精度，因此半精度只要求数值接近。
 TOL = {torch.float32: 1e-6, torch.bfloat16: 2e-2, torch.float16: 2e-3}
 N_LIST = (1, 2, 3, 7, 20)
 for dt in (torch.float32, torch.bfloat16, torch.float16):
@@ -194,18 +195,19 @@ for dt in (torch.float32, torch.bfloat16, torch.float16):
     with torch.no_grad():
         # 非零 query，否则零初始化会让 alpha 恒为均值、掩盖实现差异
         m.attn_res_query.copy_(torch.randn(D, device=DEVICE).to(dt) * 0.02)
-    exact, worst, worst_n = True, 0.0, None
+    worst_old, worst, worst_n = 0.0, 0.0, None
     for N in N_LIST:
         hs = [torch.randn(2, 5, D, device=DEVICE, dtype=dt) for _ in range(N)]
         cur = torch.randn(2, 5, D, device=DEVICE, dtype=dt)
         with torch.no_grad():
             a, b, c = m(hs, cur), m.forward_old(hs, cur), loop_ref(m, hs, cur)
-        exact &= torch.equal(a, b)
+        worst_old = max(worst_old, (a.float() - b.float()).abs().max().item())
         d = (a.float() - c.float()).abs().max().item()
         if d > worst:
             worst, worst_n = d, N
     tag = str(dt).replace("torch.", "")
-    check(f"{tag}: forward 与 forward_old 逐位一致 (N∈{N_LIST})", exact)
+    check(f"{tag}: forward 与 forward_old 数值接近 (N∈{N_LIST})",
+          worst_old <= TOL[dt], f"max diff {worst_old:.2e}, tol {TOL[dt]:.0e}")
     check(f"{tag}: forward 与逐候选循环等价", worst <= TOL[dt],
           f"max diff {worst:.2e} @N={worst_n}, tol {TOL[dt]:.0e}")
 
@@ -317,6 +319,16 @@ check("bias 更新方向: 总量守恒(增减抵消)", moe.router.expert_bias.su
       f"sum={moe.router.expert_bias.sum():.4f}")
 moe.eval()
 
+# 分布式训练必须归约专家计数和 token 总数，再在所有 rank 上得到相同 bias。
+moe_dist = LosslessMoE(dim=D, intermediate_size=64, num_experts=4,
+                       top_k=2, aux_scale=0.01).to(DEVICE).train()
+with patch("components.mlp.dist.is_available", return_value=True), \
+     patch("components.mlp.dist.is_initialized", return_value=True), \
+     patch("components.mlp.dist.all_reduce", side_effect=lambda t, op=None: t.mul_(2)) as all_reduce:
+    _ = moe_dist(torch.randn(2, 3, D, device=DEVICE))
+check("MoE DDP 汇总专家计数与 token 总数", all_reduce.call_count == 2,
+      f"all_reduce calls={all_reduce.call_count}")
+
 # ============================================================
 print("=" * 60)
 print("8. BlockAttnResBlock 接线")
@@ -347,6 +359,22 @@ check("use_moe → type_id=2 → LosslessMoE", cfg_moe.type_id == 2 and isinstan
 print("=" * 60)
 print("9. MiniRainVLM 结构")
 print("=" * 60)
+mot_cfg = RainConfig(hidden_size=D, n_hidden_layers=2, n_attn_heads=NH,
+                     n_key_value_heads=NKV, use_mot=True)
+mot_roundtrip = RainConfig(**mot_cfg.to_dict())
+check("MoT 配置序列化往返不退化", mot_roundtrip.type_id == 3 and mot_roundtrip.use_mot)
+check("视觉生成屏蔽 token 全部来自 config",
+      MiniRainVForCausalLM._vision_token_ids(RainConfig(
+          img_start_token=30, img_end_token=31, img_patch_token=32,
+          img_row_token=33, vision_pad_token=34, video_pad_token=35))
+      == (30, 31, 32, 33, 34, 35))
+try:
+    MiniRainVForCausalLM(RainConfig(hidden_size=120, n_hidden_layers=1,
+                                   n_attn_heads=4, n_key_value_heads=2, head_dim=30))
+    bad_head_dim_rejected = False
+except ValueError as exc:
+    bad_head_dim_rejected = "head_dim" in str(exc)
+check("2D RoPE 拒绝不能被 4 整除的 head_dim", bad_head_dim_rejected)
 check("层数 == n_hidden_layers 且全为 BlockAttnResBlock",
       len(vlm.layers) == cfg.n_hidden_layers and all(isinstance(l, BlockAttnResBlock) for l in vlm.layers))
 cfg_bs4 = RainConfig(hidden_size=D, n_hidden_layers=6, n_attn_heads=NH, n_key_value_heads=NKV, block_size=4)

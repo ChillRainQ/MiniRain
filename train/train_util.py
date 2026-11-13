@@ -95,7 +95,10 @@ def get_adamw_params(model) -> list[Tensor]:
             and (p.dim() < 2 or any(k in n for k in adamw_params_name()))]
 
 def swanlab_login():
-    swanlab.login(api_key="sghsimiyP151FAEhi4kzS", save=True)
+    api_key = os.environ.get("SWANLAB_API_KEY")
+    if not api_key:
+        raise RuntimeError("未设置 SWANLAB_API_KEY；请通过环境变量提供 SwanLab 凭据")
+    swanlab.login(api_key=api_key, save=True)
 
 def save(state_dict, weight_path):
     # 修复：保存前确保目录存在（否则 ../ready/ 等未创建目录会直接崩）

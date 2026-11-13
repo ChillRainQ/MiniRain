@@ -14,7 +14,7 @@ MiniRain-Vision 是一个从零实现的轻量级视觉语言模型（VLM）。�
 |------|------|----------|
 | **输入融合** | 文本/图像统一序列 | patch 嵌入 in-place 覆盖 `image_pad` 占位，无独立视觉塔 |
 | **2D RoPE** | 位置编码 | 图像 (行,列) 双轴，文本 (t,t) 退化 1D，支持 YaRN 插值 |
-| **MoT-GQA** | 注意力（可选） | Q/K/V/O 按模态分 expert，注意力全局共享，纯文本零开销；已实现，主干暂未接入，`type_id=3` 时仅 MLP 走 MoT |
+| **MoT-GQA** | 注意力（可选） | Q/K/V/O 按模态分 expert，注意力全局共享，纯文本零额外路由开销；`use_mot=True` 时注意力与 MLP 均接入 MoT |
 | **BlockAttnRes** | 跨块信息聚合 | 可学习加权历史块尾 + 当前输入，替代恒等残差 |
 | **Mask** | 注意力约束 | 文本因果 \| 图像段内双向 \| 图与图之间因果可见 |
 | **MLP** | 非线性变换 | SwiGLU（dense）或 LosslessMoE（无辅助损失 MoE） |
@@ -40,7 +40,7 @@ loss 只落在文本 + EOS 上，图像段全部为上下文。
 
 Q/K/V/O 四个投影按模态解耦为文本/图像两套 expert，注意力计算全局共享。纯文本输入时 `modality_mask=None`，全体直接走文本 expert，**零额外开销退化为普通 GQA**。
 
-> 现状：`MoTGroupQueryAttention` 已实现并通过单元测试，但 `BlockAttnResBlock` 目前硬编码 `GroupQueryAttention`，模型主干尚未接入。`use_mot=True`（`type_id=3`）实际生效的只有 `MoTFFN`。
+`BlockAttnResBlock` 会在 `use_mot=True`（`type_id=3`）时选择 `MoTGroupQueryAttention` 和 `MoTFFN`；普通 Dense/MoE 配置仍使用共享的 GQA 投影。
 
 ### 图像双向注意力
 

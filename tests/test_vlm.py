@@ -78,6 +78,24 @@ eos_pos, prev_pos = pos_s[-1], pos_s[-2]
 check("截断后 EOS 位置连续无空洞", eos_pos == (prev_pos[0] + 1, prev_pos[1] + 1),
       f"prev={prev_pos}, eos={eos_pos}")
 
+# 1.5 token ID 由 config/tokenizer 驱动，不依赖模块级默认常量
+custom_cfg = RainConfig(img_start_token=40, img_end_token=41, img_patch_token=42,
+                        img_row_token=43, bos_token_id=30, eos_token_id=31,
+                        pad_token_id=32)
+custom_col = VLMCollator(tok, custom_cfg)
+custom = custom_col([{"image": torch.rand(3, 16, 16), "text": "测试"},
+                     {"image": None, "text": "较长文本"}])
+custom_ids = custom["input_ids"][0].tolist()
+check("Collator 使用 config 的视觉/BOS/EOS token",
+      custom_ids[0] == 30 and 40 in custom_ids and 41 in custom_ids
+      and 42 in custom_ids and 43 in custom_ids and 31 in custom_ids)
+check("Collator 使用配置的 PAD token", (custom["input_ids"] == 32).any().item())
+
+# ConvStem 的四次 stride=2 使用向上取整：17×17 应产生 2×2 patch。
+odd_ids, _, _, _ = col.encode_sample(torch.rand(3, 17, 17), "奇数尺寸")
+check("17x17 图片占位数匹配 ConvStem 的 2x2 输出",
+      odd_ids.count(IMG_PAD) == 4, f"got {odd_ids.count(IMG_PAD)}")
+
 print("=" * 60); print("2b. 模态路由 (MoT-GQA idxs / GQA 兼容)")
 print("=" * 60)
 cfg = RainConfig(hidden_size=256, n_hidden_layers=2, n_attn_heads=4, n_key_value_heads=2)
@@ -124,10 +142,8 @@ if is_mot:
     check("MoT 纯文本: 图像索引为空", idxs_txt[1].numel() == 0)
     check("MoT 纯文本: 文本索引覆盖全序列", idxs_txt[0].numel() == txt_ids.numel())
 else:
-    # 普通 GQA: 模态解耦由 MoTFFN 承担。GQA 的 modality_mask 参数是
-    # image_bidirectional_mask 的别名（可见性 mask），与 VLM 的模态指示语义冲突，
-    # 因此 block 必须按注意力类型分派、绝不把 modality_mask 传进 GQA。
-    # 回归守护：spy block 内 attn 调用，确认 modality_mask 未泄漏进 GQA。
+    # 普通 GQA 接收统一的 block 调用签名，但 QKVO 投影会忽略 modality_mask。
+    # 回归守护：确认传入的模态索引仍正确，避免 block 与 MoT 分支产生两套餐约。
     received = []
     orig_fwd = attn0.forward
     def spy(*a, **kw):
@@ -139,8 +155,8 @@ else:
               attention_mask=mix["attention_mask"].to(DEVICE),
               pixel_values=[x.to(DEVICE) for x in mix["pixel_values"]])
     attn0.forward = orig_fwd
-    check("GQA: block 未把 modality_mask 传入注意力（防语义劫持）",
-          len(received) > 0 and all(m is None or m == "ABSENT" for m in received),
+    check("GQA: block 传入统一 modality_mask（GQA 投影忽略）",
+          len(received) > 0 and torch.equal(received[0], mm_mix),
           f"received={received}")
     check("GQA: modality_mask 图像 token 计数正确",
           mm_mix.sum().item() == len([t for t in mix_ids[0].tolist() if t in (IMG_START, IMG_END, IMG_PAD, IMG_ROW)]))
@@ -266,16 +282,55 @@ check("decode 位置: 首 token == max+1 且逐样本独立", seen_pos[1] == exp
 
 # num_return_sequences>1 且 batch>1: 图像必须与序列一一对齐
 pixel_tags = [torch.zeros(3, 32, 32, device=DEVICE), torch.ones(3, 32, 32, device=DEVICE)]
-seen_pv, orig_model_fwd = [], model.forward
+tagged_ids = ids_b.clone()
+tagged_ids[1, 0] = tagged_ids[1, 0] + 1
+seen_pv, seen_ids, orig_model_fwd = [], [], model.forward
 def stub_forward(input_ids, pixel_values=None, **kw):
     seen_pv.append([float(p.flatten()[0]) for p in (pixel_values or [])])
+    seen_ids.append(input_ids[:, 0].tolist())
     return SimpleNamespace(logits=torch.zeros(input_ids.shape[0], 1, cfg.vocab_size, device=DEVICE),
                           past_key_values=None)
 model.forward = stub_forward
-_ = model.generate(input_ids=ids_b, positions=pos_b, attention_mask=am_b, pixel_values=pixel_tags,
+_ = model.generate(input_ids=tagged_ids, positions=pos_b, attention_mask=am_b, pixel_values=pixel_tags,
                    max_new_tokens=1, num_return_sequences=2, do_sample=False, eos_token_id=None)
 model.forward = orig_model_fwd
 check("nrs=2+batch=2: 图像顺序 [p0,p0,p1,p1]", seen_pv[0] == [0.0, 0.0, 1.0, 1.0], f"got {seen_pv[0]}")
+expected_ids = [int(tagged_ids[0, 0]), int(tagged_ids[0, 0]),
+                int(tagged_ids[1, 0]), int(tagged_ids[1, 0])]
+check("nrs=2+batch=2: 序列与图像采用相同 repeat_interleave 顺序",
+      seen_ids[0] == expected_ids, f"got {seen_ids[0]} exp {expected_ids}")
+
+# 右填充 batch 的首个生成 token，应与该样本单独生成一致。
+right_padded = col([{"image": None, "text": "短"},
+                    {"image": None, "text": "这是明显更长的一条提示"}])
+short_only = col([{"image": None, "text": "短"}])
+model.eval()
+batched_gen = model.generate(
+    input_ids=right_padded["input_ids"].to(DEVICE),
+    positions=right_padded["positions"].to(DEVICE),
+    attention_mask=right_padded["attention_mask"].to(DEVICE),
+    max_new_tokens=1, do_sample=False, eos_token_id=None)
+single_gen = model.generate(
+    input_ids=short_only["input_ids"].to(DEVICE),
+    positions=short_only["positions"].to(DEVICE),
+    attention_mask=short_only["attention_mask"].to(DEVICE),
+    max_new_tokens=1, do_sample=False, eos_token_id=None)
+check("右填充 batch: 短样本首 token 与单独生成一致",
+      batched_gen[0, -1].item() == single_gen[0, -1].item(),
+      f"batch={batched_gen[0, -1].item()} single={single_gen[0, -1].item()}")
+
+# 已有文本 KV 后追加一张新图，mask 必须覆盖 [历史 KV | 当前图像段]。
+with torch.no_grad():
+    cached = model(input_ids=torch.tensor([[BOS, 20]], device=DEVICE),
+                   attention_mask=torch.ones(1, 2, dtype=torch.long, device=DEVICE),
+                   use_cache=True)
+    image_ids = torch.tensor([[IMG_START, IMG_PAD, IMG_ROW, IMG_END]], device=DEVICE)
+    image_pos = torch.tensor([[[2, 2], [3, 3], [3, 4], [4, 4]]], device=DEVICE)
+    continued = model(input_ids=image_ids, pixel_values=[torch.rand(3, 16, 16, device=DEVICE)],
+                      positions=image_pos,
+                      attention_mask=torch.ones(1, 6, dtype=torch.long, device=DEVICE),
+                      past_key_values=cached.past_key_values, use_cache=True)
+check("KV Cache 后追加新图片", continued.past_key_values[0][0].shape[1] == 6)
 
 # use_cache=False + positions: 显式报错而不是形状崩溃
 try:

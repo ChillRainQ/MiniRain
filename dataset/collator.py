@@ -12,6 +12,7 @@ IMG_PAD   = 12   # <|image_pad|>，patch 占位
 IMG_ROW   = 27   # <|buffer1|> 当作换行符（定了别的就改这里）
 PAD, BOS, EOS = 0, 1, 2
 TOK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tokenizers')
+_CONFIG_ROW_TOKEN = object()
 
 class VLMCollator:
     """
@@ -25,13 +26,24 @@ class VLMCollator:
       - 换行:      行=base+i, 列=base+C（该行末尾，列出界一格）
       - 图后文本:  从 base+max(R,C)+1 继续（max 防止宽图列坐标与文本碰撞）
     """
-    def __init__(self, tokenizer, config: RainConfig = None, max_len=2048, img_row_id=IMG_ROW):
+    def __init__(self, tokenizer, config: RainConfig = None, max_len=2048,
+                 img_row_id=_CONFIG_ROW_TOKEN):
         self.tokenizer = tokenizer
-        # config 是唯一事实源：patch_size 必须与模型 ConvStem 的 16× 降采样一致
+        # 模型相关 token 与 patch_size 统一从 config 读取，避免自定义 tokenizer/config 错配。
         self.config = config or RainConfig()
         self.patch_size = self.config.patch_size
         self.max_len = max_len
-        self.img_row_id = img_row_id   # 设为 None 则不用换行符
+        self.img_start_id = self.config.img_start_token
+        self.img_end_id = self.config.img_end_token
+        self.img_pad_id = self.config.img_patch_token
+        self.img_row_id = (self.config.img_row_token
+                           if img_row_id is _CONFIG_ROW_TOKEN else img_row_id)
+        self.bos_id = self.config.bos_token_id
+        self.eos_id = self.config.eos_token_id
+        tokenizer_pad = getattr(tokenizer, "pad_token_id", None)
+        config_pad = getattr(self.config, "pad_token_id", None)
+        self.pad_id = int(config_pad if config_pad is not None
+                          else tokenizer_pad if tokenizer_pad is not None else PAD)
 
     # ------------------------------------------------------------------
     def _text_span(self, text, cursor, learn):
@@ -46,20 +58,23 @@ class VLMCollator:
         返回 (ids, pos, labels, 新cursor, 坑数)。
         新cursor按 max(R,C) 前进：宽图(C>R)时列坐标占到了 base+C，
         若只按 R 前进，后续文本的 (t,t) 会撞进图像的列坐标区间。"""
-        C = img.shape[-1] // self.patch_size
-        R = img.shape[-2] // self.patch_size
-        ids, pos, labels = [IMG_START], [(cursor, cursor)], [-100]
+        if img.ndim != 3 or img.shape[0] != 3 or img.shape[-2] <= 0 or img.shape[-1] <= 0:
+            raise ValueError(f"image 应为有效的 [3,H,W] Tensor，当前形状为 {tuple(img.shape)}")
+        # ConvStem 的 stride=2、padding=1 会逐层向上取整，最终尺寸为 ceil(H/16)×ceil(W/16)。
+        C = (img.shape[-1] + self.patch_size - 1) // self.patch_size
+        R = (img.shape[-2] + self.patch_size - 1) // self.patch_size
+        ids, pos, labels = [self.img_start_id], [(cursor, cursor)], [-100]
         base = cursor + 1                        # patch 坐标起点
         for i in range(R):
             for j in range(C):
-                ids.append(IMG_PAD)
+                ids.append(self.img_pad_id)
                 pos.append((base + i, base + j)) # patch(i,j) → 行+i, 列+j
                 labels.append(-100)
             if self.img_row_id is not None:
                 ids.append(self.img_row_id)
                 pos.append((base + i, base + C)) # 换行：行不变，列出界一格
                 labels.append(-100)
-        ids.append(IMG_END)
+        ids.append(self.img_end_id)
         pos.append((base + R, base + R))
         labels.append(-100)
         return ids, pos, labels, base + max(R, C) + 1, R * C
@@ -67,7 +82,7 @@ class VLMCollator:
     # ------------------------------------------------------------------
     def encode_sample(self, image, text):
         """拼一条样本：BOS [图像段] 文本 EOS"""
-        ids, pos, labels = [BOS], [(0, 0)], [-100]
+        ids, pos, labels = [self.bos_id], [(0, 0)], [-100]
         cursor, pixel_values = 1, []
         img_len = 0
         if image is not None:
@@ -77,7 +92,7 @@ class VLMCollator:
             img_len = len(i_ids)
         t_ids, t_pos, t_labels, cursor = self._text_span(text, cursor, learn=True)
         ids += t_ids; pos += t_pos; labels += t_labels
-        ids.append(EOS); pos.append((cursor, cursor)); labels.append(EOS)
+        ids.append(self.eos_id); pos.append((cursor, cursor)); labels.append(self.eos_id)
 
         # 截断保护：图像段完整性优先，超长只砍文本尾部，绝不在图像段中间下刀
         if len(ids) > self.max_len:
@@ -85,10 +100,10 @@ class VLMCollator:
             assert head_len + 1 < self.max_len, \
                 f"图像段({head_len})+EOS 已超出 max_len={self.max_len}，图太大或 max_len 太小"
             keep_text = self.max_len - head_len - 1         # 留给文本的额度
-            ids    = ids[:head_len] + ids[head_len:head_len + keep_text] + [EOS]
+            ids    = ids[:head_len] + ids[head_len:head_len + keep_text] + [self.eos_id]
             end_r, end_c = pos[head_len + keep_text - 1]    # 保留文本末尾位置
             pos    = pos[:head_len] + pos[head_len:head_len + keep_text] + [(end_r + 1, end_c + 1)]
-            labels = labels[:head_len] + labels[head_len:head_len + keep_text] + [EOS]
+            labels = labels[:head_len] + labels[head_len:head_len + keep_text] + [self.eos_id]
         return ids, pos, labels, pixel_values
 
     # ------------------------------------------------------------------
@@ -100,7 +115,7 @@ class VLMCollator:
         pixel_values = []
         for ids, pos, lab, imgs in batch:
             pad_n = max_len - len(ids)
-            input_ids.append(ids + [PAD] * pad_n)
+            input_ids.append(ids + [self.pad_id] * pad_n)
             positions.append(pos + [(0, 0)] * pad_n)      # padding 位置无所谓，被 mask 挡掉
             labels.append(lab + [-100] * pad_n)
             attn_mask.append([1] * len(ids) + [0] * pad_n)

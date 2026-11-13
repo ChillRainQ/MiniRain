@@ -116,10 +116,6 @@ def build_position_embeddings(positions, modality_mask, cos1d, sin1d, cos2d, sin
     return torch.where(is_img, cos_i, cos_t), torch.where(is_img, sin_i, sin_t)
 
 
-# config 未暴露、但同样属于视觉占位的 token：11=<|vision_pad|>，13=<|video_pad|>
-EXTRA_VISION_TOKENS = (11, 13)
-
-
 class VisionTokenBanLogitsProcessor(LogitsProcessor):
     """屏蔽视觉占位/边界 token，避免文本生成串进图像 token（HF generate 用）。"""
 
@@ -137,6 +133,19 @@ class MiniRainVLM(nn.Module):
 
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
+        if config.head_dim <= 0 or config.head_dim % 4 != 0:
+            raise ValueError(
+                "MiniRainVLM 的 2D RoPE 要求 head_dim 为正且能被 4 整除，"
+                f"当前 head_dim={config.head_dim}"
+            )
+        vision_ids = (config.img_start_token, config.img_end_token,
+                      config.img_patch_token, config.img_row_token,
+                      config.vision_pad_token, config.video_pad_token)
+        invalid_ids = [i for i in vision_ids if i < 0 or i >= config.vocab_size]
+        if invalid_ids:
+            raise ValueError(
+                f"视觉 token id 必须位于 [0, {config.vocab_size})，非法值: {invalid_ids}"
+            )
         self.config = config
         self.model_type = self.config.type
         self.vocab_size, self.n_hidden_layers = self.config.vocab_size, self.config.n_hidden_layers
@@ -202,7 +211,8 @@ class MiniRainVLM(nn.Module):
 
         return inputs_embeds
 
-    def _build_image_bidirectional_mask(self, is_img, is_start, attention_mask, dtype):
+    def _build_image_bidirectional_mask(self, is_img, is_start, attention_mask, dtype,
+                                        past_len=0):
         device, seq_len = is_img.device, is_img.shape[1]
         # 段号：每遇到一个 <|vision_start|> 递增，同一张图的 token 段号相同
         seg = torch.cumsum(is_start.long(), dim=1)  # [B, S]
@@ -210,7 +220,18 @@ class MiniRainVLM(nn.Module):
                    (seg.unsqueeze(2) == seg.unsqueeze(1))  # 同段才双向
         causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
         allow = causal.unsqueeze(0) | same_img
+        if past_len:
+            # 当前 query 可以因果地看到全部历史 KV；图像段内的双向放行只作用于本轮 token。
+            history = torch.ones(is_img.shape[0], seq_len, past_len,
+                                 dtype=torch.bool, device=device)
+            allow = torch.cat([history, allow], dim=-1)
         if attention_mask is not None:
+            expected = past_len + seq_len
+            if attention_mask.shape != (is_img.shape[0], expected):
+                raise ValueError(
+                    "attention_mask 应覆盖历史和当前 token，当前形状为 "
+                    f"{tuple(attention_mask.shape)}，期望为 {(is_img.shape[0], expected)}"
+                )
             allow = allow & attention_mask[:, None, :].bool()  # 只屏蔽 key 维（见下）
         mask = torch.where(allow, torch.zeros((), dtype=dtype, device=device),
                            torch.full((), float("-inf"), dtype=dtype, device=device))
@@ -276,7 +297,8 @@ class MiniRainVLM(nn.Module):
         image_bidirectional_mask = None
         if pixel_values is not None:
             image_bidirectional_mask = self._build_image_bidirectional_mask(
-                is_img_tok, input_ids == self.img_start, attention_mask, hidden_states.dtype)
+                is_img_tok, input_ids == self.img_start, attention_mask,
+                hidden_states.dtype, past_len=start_pos)
 
         if positions is None:  # 纯文本路径：行=列=下标
             pos = torch.arange(start_pos, start_pos + seq_length, device=input_ids.device)
@@ -346,6 +368,28 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
 
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
                                          past_key_values=past_key_values, hidden_states=hidden_states)
+
+    @staticmethod
+    def _left_pad_for_generation(input_ids, attention_mask, positions=None):
+        """把右填充 batch 稳定转换为左填充，避免从 PAD 位置取首个生成 logits。"""
+        if attention_mask is None or input_ids.shape[0] <= 1:
+            return input_ids, attention_mask, positions
+        ids = input_ids.clone()
+        mask = attention_mask.clone()
+        pos = positions.clone() if positions is not None else None
+        for b in range(input_ids.shape[0]):
+            valid = attention_mask[b].bool()
+            # 只处理标准的右填充（111000）；左填充或内部有洞的 mask 保持原样。
+            monotonic = bool((valid[:-1].to(torch.int8) >= valid[1:].to(torch.int8)).all())
+            if not (bool(valid[0]) and not bool(valid[-1]) and monotonic):
+                continue
+            order = torch.cat([(~valid).nonzero(as_tuple=True)[0],
+                               valid.nonzero(as_tuple=True)[0]])
+            ids[b] = input_ids[b].index_select(0, order)
+            mask[b] = attention_mask[b].index_select(0, order)
+            if pos is not None:
+                pos[b] = positions[b].index_select(0, order)
+        return ids, mask, pos
     # def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
     #             past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
     #     hidden_states, past_key_values, aux_loss = self.model(
@@ -371,12 +415,24 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         fwp_accumulate = past_key_values is not None
         if past_key_values is None:
             self.model.reset_fwp()
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
-        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
-        if positions is not None: positions = positions.repeat(num_return_sequences, 1, 1)
+        input_ids = kwargs.pop("input_ids", inputs)
+        if past_key_values is None:
+            input_ids, attention_mask, positions = self._left_pad_for_generation(
+                input_ids, attention_mask, positions)
+        input_ids = input_ids.repeat_interleave(num_return_sequences, dim=0)
+        attention_mask = (attention_mask.repeat_interleave(num_return_sequences, dim=0)
+                          if attention_mask is not None else None)
+        if positions is not None:
+            positions = positions.repeat_interleave(num_return_sequences, dim=0)
         if pixel_values is not None and num_return_sequences > 1:
-            # 与 input_ids.repeat 对齐：每条样本连续复制 nrs 份（list*nrs 是整批循环，会导致图错配）
+            # 与 repeat_interleave 对齐：每条样本连续复制 nrs 份。
             pixel_values = [p for p in pixel_values for _ in range(num_return_sequences)]
+        if past_key_values is not None and num_return_sequences > 1:
+            past_key_values = [
+                tuple(x.repeat_interleave(num_return_sequences, dim=0) for x in layer)
+                if layer is not None else None
+                for layer in past_key_values
+            ]
         fwp_prefill = True
         if not use_cache and positions is not None:
             raise ValueError("use_cache=False 时 positions 需随序列增长，暂不支持带图 prompt；请改用 use_cache=True")
@@ -404,8 +460,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
             # 禁止生成视觉占位/边界 token（含换行 img_row），防止输出污染
-            logits[:, [self.config.img_start_token, self.config.img_end_token, 11,
-                       self.config.img_patch_token, 13, self.config.img_row_token]] = -float('inf')
+            logits[:, list(self._vision_token_ids(self.config))] = -float('inf')
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
@@ -436,7 +491,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
     @staticmethod
     def _vision_token_ids(config):
         return (config.img_start_token, config.img_end_token, config.img_patch_token,
-                config.img_row_token) + EXTRA_VISION_TOKENS
+                config.img_row_token, config.vision_pad_token, config.video_pad_token)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None,
                                       positions=None, pixel_values=None, **kwargs):
@@ -479,6 +534,9 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         if kwargs.get("past_key_values") is None:
             self.model.reset_fwp()
         input_ids = kwargs.pop("input_ids", inputs)
+        if kwargs.get("past_key_values") is None:
+            input_ids, attention_mask, positions = self._left_pad_for_generation(
+                input_ids, attention_mask, positions)
         if type(kwargs.get("past_key_values")) is list:
             kwargs["past_key_values"] = _LegacyKVCache(kwargs["past_key_values"])
         if pixel_values is not None and num_return_sequences > 1:

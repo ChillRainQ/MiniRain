@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from transformers import PreTrainedConfig
 
 from architectures.config import RainConfig
@@ -359,9 +360,13 @@ class LosslessMoE(nn.Module):
                 expert_mask = torch.zeros(num_tokens, self.num_experts, device=x.device)
                 expert_mask.scatter_(1, expert_idx, 1.0)
                 c_i = expert_mask.sum(dim=0)
-            c = c_i.new_tensor((self.top_k * num_tokens) / self.num_experts)
-            e_i = c - c_i
-            self.router.expert_bias = self.router.expert_bias + self.aux_scale * torch.sign(e_i)
+                total_tokens = c_i.new_tensor(float(num_tokens))
+                if dist.is_available() and dist.is_initialized():
+                    # 所有 rank 必须依据全局 token 分布更新同一份 bias；局部更新会让路由漂移。
+                    dist.all_reduce(c_i, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+                target = self.top_k * total_tokens / self.num_experts
+                self.router.expert_bias.add_(self.aux_scale * torch.sign(target - c_i))
         aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         return output, router_logits, aux_loss
 
