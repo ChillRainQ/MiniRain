@@ -1,44 +1,50 @@
 
 #!/usr/bin/env python3
 """
-MiniRain Windows Code Dataset Downloader
+MiniRain Windows CMD / PowerShell Downloader
 
 Dataset:
     bigcode/the-stack
 
-Downloads:
-    1. Batchfile (CMD): ALL available records
-    2. PowerShell: 1.6 GB by default
+Endpoint:
+    https://hf-mirror.com
+
+Download:
+    Batchfile   : ALL records (unlimited)
+    PowerShell  : 1.6 GB by default
+
+Output:
+    data/ultradata/windows_batchfile.jsonl
+    data/ultradata/windows_powershell.jsonl
 
 Features:
-    - Hugging Face authentication
+    - HF-Mirror
+    - Hugging Face token authentication
     - Streaming
-    - Resume from checkpoints
-    - Atomic state updates
-    - Download progress and speed
+    - Checkpoint resume
+    - Atomic state saving
+    - Progress tracking
     - No shuffle
-    - Independent JSONL files
-    - No fixed limit for Batchfile
+    - Safe quota expansion
+    - Dry run
 
-Default directory:
-    data/ultradata/
+Requires:
+    pip install -U datasets huggingface_hub pyarrow
 """
 
 # ============================================================
-# 1. Environment (before HF imports)
+# 1. Environment
 # ============================================================
 
 import os
 
-# Gated BigCode data: use the official HF endpoint.
-os.environ["HF_ENDPOINT"] = "https://huggingface.co"
+# Must be configured before importing HF libraries.
+HF_ENDPOINT = "https://hf-mirror.com"
 
+os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
-
-# Read HF_TOKEN from environment, or use the token
-# saved by `hf auth login`.
-# Never hardcode credentials in the script.
 
 
 # ============================================================
@@ -48,15 +54,15 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 import argparse
 import json
 import time
-
 from dataclasses import dataclass
 from pathlib import Path
 
 from datasets import load_dataset
+from huggingface_hub import get_token
 
 
 # ============================================================
-# 3. Configuration
+# 3. Global configuration
 # ============================================================
 
 GB = 1_000_000_000
@@ -66,10 +72,16 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "ultradata"
 
 REPO = "bigcode/the-stack"
 
-# Keep the repository revision fixed within each
-# checkpoint. By default use main; existing checkpoints
-# must match the supplied --revision.
+# Optional direct token.
+# Prefer HF_TOKEN environment variable or hf auth login.
+#
+# Do not commit a real token to Git.
+HF_TOKEN = None
 
+
+# ============================================================
+# 4. Job definition
+# ============================================================
 
 @dataclass(frozen=True)
 class Job:
@@ -79,14 +91,53 @@ class Job:
 
 
 # ============================================================
-# 4. Atomic JSON
+# 5. Authentication
 # ============================================================
 
-def save_json_atomic(path, data):
+def get_auth_token():
 
-    tmp = path.with_name(path.name + ".tmp")
+    token = (
+        HF_TOKEN
+        or os.getenv("HF_TOKEN")
+        or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or get_token()
+    )
 
-    with tmp.open("w", encoding="utf-8") as f:
+    if not token:
+        raise RuntimeError(
+            "Hugging Face token not found.\n"
+            "Set HF_TOKEN or run 'hf auth login'.\n"
+            "The Stack requires approved access."
+        )
+
+    print(
+        "[AUTH] Hugging Face token found.",
+        flush=True,
+    )
+
+    print(
+        "[AUTH] Using token with HF-Mirror.",
+        flush=True,
+    )
+
+    return token
+
+
+# ============================================================
+# 6. Atomic state saving
+# ============================================================
+
+def atomic_json(path, data):
+
+    temp_path = path.with_name(
+        path.name + ".tmp"
+    )
+
+    with temp_path.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
         json.dump(
             data,
             f,
@@ -98,17 +149,20 @@ def save_json_atomic(path, data):
         f.flush()
         os.fsync(f.fileno())
 
-    os.replace(tmp, path)
+    os.replace(temp_path, path)
 
 
-def load_json(path):
+def read_json(path):
 
-    with path.open("r", encoding="utf-8") as f:
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
         return json.load(f)
 
 
 # ============================================================
-# 5. State
+# 7. Checkpoint signature
 # ============================================================
 
 def signature(job, revision):
@@ -129,15 +183,20 @@ def make_state(
     rows,
     records,
     bytes_done,
-    completed,
+    completed=False,
+    completion_reason=None,
 ):
 
     return {
         **signature(job, revision),
+
         "rows": rows,
         "records": records,
         "bytes": bytes_done,
+
         "completed": completed,
+        "completion_reason": completion_reason,
+
         "updated_at": time.strftime(
             "%Y-%m-%d %H:%M:%S"
         ),
@@ -145,7 +204,7 @@ def make_state(
 
 
 # ============================================================
-# 6. Record conversion
+# 8. Text extraction and record encoding
 # ============================================================
 
 def encode_record(row, job):
@@ -171,33 +230,37 @@ def encode_record(row, job):
         "alphanum_fraction",
     )
 
+    metadata = {
+        key: row[key]
+        for key in metadata_keys
+        if row.get(key) is not None
+    }
+
     record = {
         "text": content,
         "dataset": REPO,
         "language": job.language,
-        "metadata": {
-            key: row[key]
-            for key in metadata_keys
-            if row.get(key) is not None
-        },
+        "metadata": metadata,
     }
 
-    return (
-        json.dumps(
-            record,
-            ensure_ascii=False,
-            default=str,
-        ) + "\n"
-    ).encode("utf-8")
+    line = json.dumps(
+        record,
+        ensure_ascii=False,
+        default=str,
+    ) + "\n"
+
+    return line.encode("utf-8")
 
 
 # ============================================================
-# 7. Prepare existing download
+# 9. Prepare existing files
 # ============================================================
 
 def prepare(job, output_dir, revision):
 
-    data_path = output_dir / f"{job.name}.jsonl"
+    data_path = (
+        output_dir / f"{job.name}.jsonl"
+    )
 
     state_path = (
         output_dir / f"{job.name}.state.json"
@@ -209,8 +272,9 @@ def prepare(job, output_dir, revision):
     if data_exists != state_exists:
 
         raise RuntimeError(
-            f"{job.name}: JSONL and state file mismatch. "
-            "Refusing unsafe resume."
+            f"{job.name}: JSONL/state mismatch.\n"
+            "Both files are required for resuming.\n"
+            "Existing files will not be overwritten."
         )
 
     if not data_exists:
@@ -221,57 +285,80 @@ def prepare(job, output_dir, revision):
             rows=0,
             records=0,
             bytes_done=0,
-            completed=False,
         )
 
-        return data_path, state_path, state, False
+        return (
+            data_path,
+            state_path,
+            state,
+            False,
+        )
 
-    state = load_json(state_path)
+    state = read_json(state_path)
 
-    expected = signature(job, revision)
+    expected = signature(
+        job,
+        revision,
+    )
 
-    for key, value in expected.items():
+    for key, expected_value in expected.items():
 
-        if state.get(key) != value:
+        actual_value = state.get(key)
+
+        if actual_value != expected_value:
 
             raise RuntimeError(
-                f"{job.name}: checkpoint mismatch: {key}\n"
-                f"Current: {state.get(key)!r}\n"
-                f"Expected: {value!r}\n"
-                "Existing files were not modified."
+                f"{job.name}: checkpoint mismatch.\n"
+                f"Field: {key}\n"
+                f"Actual: {actual_value!r}\n"
+                f"Expected: {expected_value!r}\n"
+                "Refusing unsafe resume."
             )
 
-    for key in ("rows", "records", "bytes"):
+    for key in (
+        "rows",
+        "records",
+        "bytes",
+    ):
 
         if key not in state:
-
             raise RuntimeError(
-                f"{job.name}: missing state field {key}"
+                f"{job.name}: missing state field: {key}"
             )
 
         if int(state[key]) < 0:
-
             raise RuntimeError(
-                f"{job.name}: invalid state field {key}"
+                f"{job.name}: invalid state field: {key}"
             )
 
-    actual_bytes = data_path.stat().st_size
-    recorded_bytes = int(state["bytes"])
+    actual_size = data_path.stat().st_size
+    saved_size = int(state["bytes"])
 
-    if actual_bytes < recorded_bytes:
+    if actual_size < saved_size:
 
         raise RuntimeError(
-            f"{job.name}: JSONL smaller than checkpoint."
+            f"{job.name}: JSONL shorter than checkpoint."
         )
 
-    return data_path, state_path, state, True
+    return (
+        data_path,
+        state_path,
+        state,
+        True,
+    )
 
 
 # ============================================================
-# 8. Download
+# 10. Download one job
 # ============================================================
 
-def download(job, output_dir, revision, args):
+def download_job(
+    job,
+    output_dir,
+    revision,
+    token,
+    args,
+):
 
     (
         data_path,
@@ -292,6 +379,10 @@ def download(job, output_dir, revision, args):
         state.get("completed", False)
     )
 
+    completion_reason = state.get(
+        "completion_reason"
+    )
+
     actual_size = (
         data_path.stat().st_size
         if exists else 0
@@ -305,8 +396,7 @@ def download(job, output_dir, revision, args):
         else f"{job.limit_bytes / GB:.3f} GB"
     )
 
-    print()
-    print("=" * 65)
+    print("\n" + "=" * 65)
     print(f"[JOB] {job.name}")
     print(f"[LANGUAGE] {job.language}")
     print(f"[TARGET] {target_text}")
@@ -314,67 +404,94 @@ def download(job, output_dir, revision, args):
     print(f"[ROWS] {rows:,}")
     print("=" * 65, flush=True)
 
-    if job.limit_bytes is not None:
-        if bytes_done > job.limit_bytes:
-            raise RuntimeError(
-                f"{job.name}: existing saved data "
-                "exceeds target. Refusing to shrink."
-            )
+    # Never shrink existing data.
+    if (
+        job.limit_bytes is not None
+        and bytes_done > job.limit_bytes
+    ):
 
-    if args.dry_run:
+        raise RuntimeError(
+            f"{job.name}: existing data exceeds "
+            "the new target. Refusing to shrink."
+        )
 
-        if extra_bytes:
-            print(
-                f"[CHECK] {extra_bytes} extra bytes "
-                "after checkpoint."
-            )
+    def result(reason=None):
 
         return {
             "name": job.name,
+            "language": job.language,
+            "target_bytes": job.limit_bytes,
             "bytes": bytes_done,
             "rows": rows,
-            "completed": completed,
+            "records": records,
+            "completion_reason": reason,
         }
+
+    # --------------------------------------------------------
+    # Dry run
+    # --------------------------------------------------------
+
+    if args.dry_run:
+
+        if extra_bytes > 0:
+            print(
+                f"[CHECK] {extra_bytes} bytes beyond "
+                "the last checkpoint."
+            )
+
+        print(
+            f"[CHECK] Completion reason: "
+            f"{completion_reason}"
+        )
+
+        return result(completion_reason)
+
+    # --------------------------------------------------------
+    # Initialize files
+    # --------------------------------------------------------
 
     if not exists:
 
         with data_path.open("xb"):
             pass
 
-        save_json_atomic(
+        atomic_json(
             state_path,
             state,
         )
 
-        print(f"[NEW] {job.name}", flush=True)
+        print(
+            f"[NEW] {job.name}",
+            flush=True,
+        )
 
     elif extra_bytes > 0:
 
-        # Remove only the uncommitted bytes
-        # written after the last checkpoint.
+        # Only remove bytes beyond the committed checkpoint.
         with data_path.open("r+b") as f:
             f.truncate(bytes_done)
 
         print(
-            f"[RECOVER] Removed {extra_bytes} "
-            "uncommitted bytes.",
+            f"[RECOVERY] Truncated "
+            f"{extra_bytes} uncommitted bytes.",
             flush=True,
         )
 
-    if completed:
+    # --------------------------------------------------------
+    # Completion checks
+    # --------------------------------------------------------
+
+    # A fully exhausted dataset cannot be extended.
+    if completion_reason == "source_exhausted":
 
         print(
-            f"[SKIP] {job.name}: completed.",
+            f"[SKIP] {job.name}: source exhausted.",
             flush=True,
         )
 
-        return {
-            "name": job.name,
-            "bytes": bytes_done,
-            "rows": rows,
-            "completed": True,
-        }
+        return result(completion_reason)
 
+    # Existing data is at the current target.
     if (
         job.limit_bytes is not None
         and bytes_done >= job.limit_bytes
@@ -385,19 +502,59 @@ def download(job, output_dir, revision, args):
             flush=True,
         )
 
-        return {
-            "name": job.name,
-            "bytes": bytes_done,
-            "rows": rows,
-            "completed": True,
-        }
+        return result("quota_reached")
+
+    # A completed quota may be expanded later.
+    if completion_reason == "quota_reached":
+
+        print(
+            f"[RESUME] Expanding previous quota.",
+            flush=True,
+        )
+
+    # Backwards compatibility with the earlier script:
+    # old states only had a "completed" boolean.
+    if (
+        completed
+        and completion_reason is None
+    ):
+
+        # For a capped job, the old completed flag may
+        # mean that its quota was reached.
+        # Allow continuing when the new quota is larger.
+        if job.limit_bytes is not None:
+
+            print(
+                "[RESUME] Legacy completed state; "
+                "checking for additional quota.",
+                flush=True,
+            )
+
+        else:
+
+            raise RuntimeError(
+                f"{job.name}: old state marks completed "
+                "without recording the reason.\n"
+                "Cannot safely distinguish quota "
+                "completion from source exhaustion."
+            )
 
     # --------------------------------------------------------
-    # Load dataset
+    # Connect to HF-Mirror
     # --------------------------------------------------------
 
     print(
-        f"[LOAD] {REPO} / data/{job.language}",
+        f"[MIRROR] {HF_ENDPOINT}",
+        flush=True,
+    )
+
+    print(
+        f"[LOAD] {REPO}/data/{job.language}",
+        flush=True,
+    )
+
+    print(
+        "[STREAM] Calling load_dataset...",
         flush=True,
     )
 
@@ -407,22 +564,29 @@ def download(job, output_dir, revision, args):
         split="train",
         streaming=True,
         revision=revision,
-        token=True,
+        token=token,
     )
 
     print(
-        f"[LOAD] Features: {ds.features}",
+        "[STREAM] load_dataset returned.",
+        flush=True,
+    )
+
+    print(
+        "[STREAM] Features:",
+        ds.features,
         flush=True,
     )
 
     # --------------------------------------------------------
-    # Resume
+    # Sequential resume
     # --------------------------------------------------------
 
     if rows > 0:
 
         print(
-            f"[RESUME] Skipping {rows:,} source rows...",
+            f"[RESUME] Skipping {rows:,} "
+            "source rows...",
             flush=True,
         )
 
@@ -439,12 +603,19 @@ def download(job, output_dir, revision, args):
     source_exhausted = False
     quota_reached = False
 
-    def checkpoint(f, is_completed=False):
+    # --------------------------------------------------------
+    # Checkpoint function
+    # --------------------------------------------------------
 
-        f.flush()
-        os.fsync(f.fileno())
+    def checkpoint(
+        file,
+        reason=None,
+    ):
 
-        save_json_atomic(
+        file.flush()
+        os.fsync(file.fileno())
+
+        atomic_json(
             state_path,
             make_state(
                 job=job,
@@ -452,12 +623,13 @@ def download(job, output_dir, revision, args):
                 rows=rows,
                 records=records,
                 bytes_done=bytes_done,
-                completed=is_completed,
+                completed=(reason is not None),
+                completion_reason=reason,
             ),
         )
 
     # --------------------------------------------------------
-    # Stream
+    # Stream data
     # --------------------------------------------------------
 
     with data_path.open("r+b") as f:
@@ -467,7 +639,7 @@ def download(job, output_dir, revision, args):
         try:
 
             print(
-                "[STREAM] Waiting for first data...",
+                "[STREAM] Waiting for first sample...",
                 flush=True,
             )
 
@@ -476,27 +648,33 @@ def download(job, output_dir, revision, args):
             for row in ds:
 
                 if not first_received:
+
                     print(
                         "[STREAM] First sample received.",
                         flush=True,
                     )
+
                     print(
                         "[STREAM] Keys:",
                         list(row.keys()),
                         flush=True,
                     )
+
                     first_received = True
 
-                raw = encode_record(row, job)
+                raw = encode_record(
+                    row,
+                    job,
+                )
 
                 if raw is not None:
 
-                    # For capped datasets, stop before
-                    # exceeding the maximum byte size.
+                    # Stop before exceeding a capped quota.
+                    # Do not count the uncommitted row.
                     if (
                         job.limit_bytes is not None
                         and bytes_done + len(raw)
-                            > job.limit_bytes
+                        > job.limit_bytes
                     ):
 
                         quota_reached = True
@@ -510,10 +688,14 @@ def download(job, output_dir, revision, args):
                 rows += 1
 
                 # --------------------------------------------
-                # Checkpoint
+                # Periodic checkpoint
                 # --------------------------------------------
 
-                if rows % args.save_every_rows == 0:
+                if (
+                    rows > 0
+                    and rows % args.save_every_rows == 0
+                ):
+
                     checkpoint(f)
 
                 # --------------------------------------------
@@ -530,17 +712,15 @@ def download(job, output_dir, revision, args):
                     )
 
                     speed = (
-                        (bytes_done - start_bytes)
-                        / elapsed
-                        / (1024 ** 2)
-                    )
+                        bytes_done - start_bytes
+                    ) / elapsed / (1024 ** 2)
 
                     print(
-                        f"[PROGRESS] {job.name} "
-                        f"| {bytes_done / GB:.3f} GB "
-                        f"| rows={rows:,} "
-                        f"| records={records:,} "
-                        f"| speed={speed:.2f} MiB/s",
+                        f"[PROGRESS] {job.name}"
+                        f" | {bytes_done / GB:.3f} GB"
+                        f" | rows={rows:,}"
+                        f" | records={records:,}"
+                        f" | speed={speed:.2f} MiB/s",
                         flush=True,
                     )
 
@@ -556,56 +736,57 @@ def download(job, output_dir, revision, args):
 
             else:
 
+                # Loop ended naturally.
                 source_exhausted = True
 
         except BaseException:
 
             print(
-                "[INTERRUPTED] Saving checkpoint...",
+                "\n[INTERRUPTED] Saving checkpoint...",
                 flush=True,
             )
 
-            checkpoint(f, is_completed=False)
+            checkpoint(f)
             raise
+
+        # ----------------------------------------------------
+        # Final checkpoint
+        # ----------------------------------------------------
+
+        if source_exhausted:
+            reason = "source_exhausted"
+
+        elif quota_reached:
+            reason = "quota_reached"
+
+        else:
+            reason = None
 
         checkpoint(
             f,
-            is_completed=(
-                source_exhausted or quota_reached
-            ),
+            reason=reason,
         )
 
     # --------------------------------------------------------
-    # Done
+    # Summary for this job
     # --------------------------------------------------------
 
     elapsed = time.monotonic() - start_time
 
-    print()
+    print("\n" + "-" * 65)
     print(f"[DONE] {job.name}")
     print(f"  Saved: {bytes_done / GB:.3f} GB")
     print(f"  Records: {records:,}")
     print(f"  Source rows: {rows:,}")
     print(f"  Elapsed: {elapsed:.1f}s")
-    print(
-        f"  Source exhausted: {source_exhausted}",
-        flush=True,
-    )
+    print(f"  Completion: {reason}")
+    print("-" * 65, flush=True)
 
-    return {
-        "name": job.name,
-        "bytes": bytes_done,
-        "rows": rows,
-        "records": records,
-        "completed": (
-            source_exhausted or quota_reached
-        ),
-        "source_exhausted": source_exhausted,
-    }
+    return result(reason)
 
 
 # ============================================================
-# 9. CLI
+# 11. CLI
 # ============================================================
 
 def parse_args():
@@ -613,7 +794,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Download Windows Batchfile and "
-            "PowerShell from BigCode The Stack."
+            "PowerShell from BigCode using HF-Mirror."
         )
     )
 
@@ -621,6 +802,7 @@ def parse_args():
         "--out",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
+        help="Default: data/ultradata/",
     )
 
     parser.add_argument(
@@ -628,8 +810,8 @@ def parse_args():
         type=float,
         default=1.6,
         help=(
-            "Maximum PowerShell JSONL size. "
-            "Use 0 for unlimited."
+            "PowerShell output size in decimal GB. "
+            "Use 0 to download all records."
         ),
     )
 
@@ -654,7 +836,40 @@ def parse_args():
 
 
 # ============================================================
-# 10. Main
+# 12. Manifest
+# ============================================================
+
+def write_manifest(
+    output_dir,
+    revision,
+    results,
+):
+
+    manifest = {
+        "dataset": REPO,
+        "endpoint": HF_ENDPOINT,
+        "revision": revision,
+        "unit": "decimal GB",
+        "results": results,
+
+        "total_saved_bytes": sum(
+            item["bytes"]
+            for item in results
+        ),
+
+        "updated_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    }
+
+    atomic_json(
+        output_dir / "manifest_windows.json",
+        manifest,
+    )
+
+
+# ============================================================
+# 13. Main
 # ============================================================
 
 def main():
@@ -671,16 +886,18 @@ def main():
             "--save-every-rows must be positive."
         )
 
-    output_dir = args.out.expanduser().resolve()
+    output_dir = (
+        args.out.expanduser().resolve()
+    )
 
-    # Dry run must not create directories.
     if args.dry_run:
 
         if not output_dir.is_dir():
-
             raise FileNotFoundError(
                 f"Directory not found: {output_dir}"
             )
+
+        token = None
 
     else:
 
@@ -689,8 +906,11 @@ def main():
             exist_ok=True,
         )
 
-    # CMD: unlimited
-    # PowerShell: 1.6GB by default
+        token = get_auth_token()
+
+    # --------------------------------------------------------
+    # Jobs
+    # --------------------------------------------------------
 
     powershell_limit = (
         None
@@ -711,23 +931,34 @@ def main():
         ),
     ]
 
+    # --------------------------------------------------------
+    # Configuration summary
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 65)
+    print("MiniRain Windows Dataset Downloader")
     print("=" * 65)
-    print("MiniRain Windows Code Downloader")
-    print("=" * 65)
-    print(f"[REPO] {REPO}")
-    print(f"[ENDPOINT] {os.environ['HF_ENDPOINT']}")
+
+    print(f"[DATASET] {REPO}")
+    print(f"[MIRROR] {HF_ENDPOINT}")
     print(f"[OUTPUT] {output_dir}")
-    print("[CMD] Full dataset")
-    print(
-        "[PowerShell] "
-        + (
-            "Full dataset"
-            if powershell_limit is None
-            else f"{args.powershell_gb:.3f} GB"
+    print(f"[REVISION] {args.revision}")
+
+    print("[CMD] Unlimited / full dataset")
+
+    if powershell_limit is None:
+        print("[PowerShell] Unlimited / full dataset")
+    else:
+        print(
+            f"[PowerShell] {args.powershell_gb:.3f} GB"
         )
-    )
+
     print(f"[DRY RUN] {args.dry_run}")
     print("=" * 65)
+
+    # --------------------------------------------------------
+    # Download
+    # --------------------------------------------------------
 
     results = []
 
@@ -735,41 +966,40 @@ def main():
 
         for job in jobs:
 
-            result = download(
-                job,
-                output_dir,
-                args.revision,
-                args,
+            result = download_job(
+                job=job,
+                output_dir=output_dir,
+                revision=args.revision,
+                token=token,
+                args=args,
             )
 
             results.append(result)
 
             if not args.dry_run:
 
-                save_json_atomic(
-                    output_dir / "manifest_windows.json",
-                    {
-                        "dataset": REPO,
-                        "revision": args.revision,
-                        "results": results,
-                        "updated_at": time.strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                    },
+                write_manifest(
+                    output_dir,
+                    args.revision,
+                    results,
                 )
 
     except KeyboardInterrupt:
 
         print(
             "\n[STOPPED] Checkpoints saved. "
-            "Run again to resume."
+            "Run again to resume.",
+            flush=True,
         )
 
         return
 
-    print()
-    print("=" * 65)
-    print("WINDOWS DATA DOWNLOAD SUMMARY")
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 65)
+    print("WINDOWS DOWNLOAD SUMMARY")
     print("=" * 65)
 
     for result in results:
@@ -779,6 +1009,18 @@ def main():
             f"{result['bytes'] / GB:9.3f} GB"
         )
 
+    print("-" * 65)
+
+    total = sum(
+        result["bytes"]
+        for result in results
+    )
+
+    print(
+        f"Total saved: {total / GB:.3f} GB"
+    )
+
+    print(f"Output: {output_dir}")
     print("=" * 65)
 
 
