@@ -93,11 +93,11 @@ SPECIALS = [
     "</tool_response>",        # 24
     "<think>",                 # 25
     "</think>",                # 26
-    "<|buffer1|>",             # 27
-    "<|buffer2|>",             # 28
-    "<|buffer3|>",             # 29
-    "<|buffer4|>",             # 30
-    "<|buffer5|>",             # 31
+    "<|img_row|>",             # 27
+    "<|cpu_call|>",             # 28
+    "<|/cpu_call|>",             # 29
+    "<|cpu_response|>",             # 30
+    "<|/cpu_response|>",             # 31
     "<|buffer6|>",             # 32
     "<|buffer7|>",             # 33
     "<|buffer8|>",             # 34
