@@ -1,8 +1,11 @@
-from torch.utils.data import Dataset
 from datasets import load_dataset, Features, Sequence, Value
-import torch
 import json
 import random
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
     """
@@ -61,6 +64,125 @@ class PretrainDataset(Dataset):
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
+
+
+
+
+class PretrainBinDataset(Dataset):
+
+    def __init__(
+        self,
+        bin_path,
+        idx_path,
+        max_length=4096,
+        pad_token_id=0,
+    ):
+        super().__init__()
+        self.bin_path = Path(bin_path)
+        self.idx_path = Path(idx_path)
+        self.max_length = int(max_length)
+        self.pad_token_id = int(pad_token_id)
+
+        if not self.bin_path.is_file():
+            raise FileNotFoundError(
+                f"BIN not found: {self.bin_path}"
+            )
+
+        if not self.idx_path.is_file():
+            raise FileNotFoundError(
+                f"IDX not found: {self.idx_path}"
+            )
+
+        if self.max_length <= 0:
+            raise ValueError(
+                "max_length must be positive"
+            )
+        self.tokens = np.memmap(self.bin_path, dtype="<u2", mode="r",)
+        self.offsets = np.memmap(self.idx_path, dtype="<u8", mode="r",)
+
+        if len(self.offsets) < 2:
+            raise RuntimeError(
+                "IDX must contain at least 2 offsets"
+            )
+
+        if int(self.offsets[0]) != 0:
+            raise RuntimeError(
+                f"IDX first offset must be 0, "
+                f"got {self.offsets[0]}"
+            )
+
+        if int(self.offsets[-1]) != len(self.tokens):
+            raise RuntimeError(
+                "BIN / IDX size mismatch:\n"
+                f"last offset = {int(self.offsets[-1]):,}\n"
+                f"bin tokens  = {len(self.tokens):,}"
+            )
+
+        # 防止损坏 idx
+        if np.any(
+            self.offsets[1:] < self.offsets[:-1]
+        ):
+            raise RuntimeError(
+                "IDX offsets are not monotonically increasing"
+            )
+
+        self.num_records = len(self.offsets) - 1
+
+        print(
+            "[PretrainBinDataset]\n"
+            f"  BIN        : {self.bin_path}\n"
+            f"  IDX        : {self.idx_path}\n"
+            f"  Records    : {self.num_records:,}\n"
+            f"  Tokens     : {len(self.tokens):,}\n"
+            f"  Max length : {self.max_length:,}\n"
+            f"  BIN size   : "
+            f"{self.bin_path.stat().st_size / 1e9:.3f} GB"
+        )
+
+    def __len__(self):
+        return self.num_records
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.num_records
+
+        if index < 0 or index >= self.num_records:
+            raise IndexError(index)
+
+        start = int(self.offsets[index])
+        end = int(self.offsets[index + 1])
+        length = end - start
+
+        if length <= 0:
+            raise RuntimeError(
+                f"Empty record: index={index}"
+            )
+        if length > self.max_length:
+            raise RuntimeError(
+                f"Compiled sample exceeds max_length: "
+                f"index={index}, "
+                f"length={length}, "
+                f"max_length={self.max_length}"
+            )
+        ids_np = np.asarray(self.tokens[start:end], dtype=np.int64,).copy()
+
+        input_ids = torch.full((self.max_length,), self.pad_token_id, dtype=torch.long,)
+
+        labels = torch.full((self.max_length,), -100, dtype=torch.long,)
+        ids = torch.from_numpy(ids_np)
+        input_ids[:length] = ids
+        labels[:length] = ids
+        return input_ids, labels
+
+    def get_length(self, index):
+        return int(self.offsets[index + 1] - self.offsets[index])
+
+    def close(self):
+        if hasattr(self.tokens, "_mmap"):
+            self.tokens._mmap.close()
+
+        if hasattr(self.offsets, "_mmap"):
+            self.offsets._mmap.close()
     
     
 class SFTDataset(Dataset):
