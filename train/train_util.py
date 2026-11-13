@@ -150,6 +150,33 @@ def Logger(content, *, flush=False):
     if is_main_process():
         print(content, flush=flush)
 
+
+def format_duration(seconds):
+    if seconds is None:
+        return '--:--:--'
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+
+def format_training_progress(metrics, total_steps, total_epochs):
+    """Human-readable progress; raw full-precision metrics remain in JSONL."""
+    step = metrics['step']
+    fraction = min(1., max(0., step / max(1, total_steps)))
+    filled = int(fraction * 20)
+    bar = '=' * filled + '-' * (20 - filled)
+    muon_lr = metrics.get('muon_lr')
+    lr_text = f"lr={metrics['lr']:.3e}"
+    if muon_lr is not None:
+        lr_text += f' muon_lr={muon_lr:.3e}'
+    return (f"[P1] [{bar}] {fraction:6.2%} | step {step:,}/{total_steps:,} | "
+            f"epoch {metrics['epoch'] + 1}/{total_epochs} | loss={metrics['loss']:.4f} | "
+            f"{lr_text} | {metrics['tokens_per_sec']:,.0f} tok/s | "
+            f"{metrics['step_seconds']:.2f} s/step | "
+            f"elapsed {format_duration(metrics['elapsed_seconds'])} | "
+            f"ETA {format_duration(metrics['eta_seconds'])}")
+
 def get_model_params(model, config) :
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))

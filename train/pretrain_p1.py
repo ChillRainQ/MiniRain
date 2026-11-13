@@ -25,7 +25,8 @@ import project
 from train.ckpt import load_ckpt_path, save_rolling_ckpt, save_exp, save_state_dict
 from train.metrics import TrainingMetrics
 from train.train_util import (setup_seed, init_distributed_mode, Logger, get_lr,
-                              get_muon_params, get_adamw_params, SkipBatchSampler)
+                              get_muon_params, get_adamw_params, SkipBatchSampler,
+                              format_training_progress)
 
 
 def parse_args():
@@ -58,7 +59,8 @@ def parse_args():
     p.add_argument('--num-workers', type=int, default=4)
     p.add_argument('--pad-multiple', type=int, default=64)
     p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--log-every', type=int, default=10)
+    p.add_argument('--log-every', type=int, default=8,
+                   help='Print progress every N optimizer steps; metrics are saved every step')
     p.add_argument('--save-every', type=int, default=1000,
                    help='Checkpoint interval in optimizer steps; keep 5 numbered checkpoints plus latest.pt')
     p.add_argument('--resume', type=Path, default=None, help='Full training checkpoint')
@@ -522,7 +524,7 @@ def main():
                                               if device.type == 'cuda' else None)}
                 log.log(item)
                 if global_step % args.log_every == 0 or global_step == 1 or global_step == max_steps:
-                    Logger(json.dumps(item, ensure_ascii=False), flush=True)
+                    Logger(format_training_progress(item, max_steps, args.epochs), flush=True)
             at_epoch_end = batch_pos == batches_per_epoch
             need_save = (global_step % args.save_every == 0 or
                          global_step == max_steps or
@@ -539,6 +541,7 @@ def main():
                     optimizer_states = None
                 e_next, b_next = (epoch+1, 0) if at_epoch_end else (epoch, batch_pos)
                 if rank == 0:
+                    Logger(f'[Checkpoint] Saving step {global_step:,}...', flush=True)
                     save_rolling_ckpt(
                         args.output_dir, keep=5, model=raw,
                         epoch=e_next, step=global_step, scaler=scaler,
@@ -550,6 +553,7 @@ def main():
                                            batches_per_epoch=batches_per_epoch, max_steps=max_steps),
                     )
                     log.export()
+                    Logger(f'[Checkpoint] Saved: {args.output_dir / "latest.pt"}', flush=True)
                 if distributed:
                     dist.barrier()
         next_batch = 0
