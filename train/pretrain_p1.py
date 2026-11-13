@@ -8,6 +8,39 @@ import sys
 import time
 from pathlib import Path
 
+
+def configure_gpus():
+    """Set visibility before importing torch; launch one worker per selected GPU."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--gpus', default=None)
+    selected, _ = parser.parse_known_args()
+    if selected.gpus is None:
+        return
+    value = selected.gpus.strip().lower()
+    if value == 'cpu':
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        return
+    ids = value.split(',')
+    if (not ids or any(not item.isdecimal() for item in ids) or
+            len(set(map(int, ids))) != len(ids)):
+        parser.error('--gpus must be GPU indices such as 0 or 0,1, or cpu')
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(int(item)) for item in ids)
+    if len(ids) > 1 and int(os.environ.get('WORLD_SIZE', '1')) == 1:
+        if sys.platform == 'win32':
+            parser.error('Multi-GPU training uses NCCL and requires Linux/WSL')
+        import subprocess
+        command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                   '--nnodes=1', f'--nproc_per_node={len(ids)}',
+                   str(Path(__file__).resolve()), *sys.argv[1:]]
+        raise SystemExit(subprocess.call(command))
+
+
+if __name__ == '__main__':
+    # --help must remain available without starting distributed workers.
+    if '-h' not in sys.argv and '--help' not in sys.argv:
+        configure_gpus()
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,6 +64,8 @@ from train.train_util import (setup_seed, init_distributed_mode, Logger, get_lr,
 
 def parse_args():
     p = argparse.ArgumentParser(description='MiniRain-Vision P1 pretraining')
+    p.add_argument('--gpus', type=str, default=None,
+                   help='GPU indices: 0 or 0,1 (auto-launch DDP on Linux/WSL); cpu forces CPU; default: auto')
     p.add_argument('--data-dir', type=Path, default=ROOT / 'data/pretrain_bins')
     p.add_argument('--convstem-ckpt', type=Path, default=ROOT / 'init/ConvStem.pt',
                    help='Distilled ConvStem checkpoint loaded before freezing vision')
@@ -253,6 +288,14 @@ def cpu_state(value):
 
 def main():
     args = parse_args()
+    if args.gpus is not None and args.gpus.strip().lower() != 'cpu':
+        if not torch.cuda.is_available():
+            raise RuntimeError(f'--gpus {args.gpus} requested CUDA, but no selected CUDA GPU is available')
+        selected_count = len(args.gpus.split(','))
+        if torch.cuda.device_count() < selected_count:
+            raise RuntimeError('Some requested GPU indices are unavailable')
+        if int(os.environ.get('WORLD_SIZE', '1')) > selected_count:
+            raise RuntimeError('Distributed worker count exceeds the number of selected GPUs')
     local_rank = init_distributed_mode()
     distributed = int(os.environ.get('WORLD_SIZE', '1')) > 1
     rank = dist.get_rank() if distributed else 0
@@ -264,6 +307,9 @@ def main():
     experiment_dir = experiment_dir.resolve()
     args.output_dir = experiment_dir / 'p1'
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+    if rank == 0:
+        Logger(f'[Device] {device}; CUDA_VISIBLE_DEVICES='
+               f'{os.environ.get("CUDA_VISIBLE_DEVICES", "all")}', flush=True)
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
