@@ -106,6 +106,8 @@ def parse_args():
     p.add_argument('--auto-resume', action='store_true',
                    help='Resume from <output-dir>/latest.pt when it exists')
     p.add_argument('--compile', action='store_true', help='Enable torch.compile (optional)')
+    p.add_argument('--compile-recompile-limit', type=int, default=64,
+                   help='Dynamo per-code compilation cache limit; multiple block/history variants share it')
     p.add_argument('--full-attn-res', action='store_true')
     p.add_argument('--block-attn-res', action='store_true')
     p.add_argument('--dry-run', action='store_true', help='Check dataset + model without training')
@@ -116,6 +118,8 @@ def parse_args():
         p.error('invalid batch/accum/epochs/max-seq-len')
     if a.pad_multiple < 1 or a.log_every < 1 or a.save_every < 1 or a.loss_chunks < 1:
         p.error('invalid padding/log/save interval')
+    if a.compile_recompile_limit < 1:
+        p.error('compile-recompile-limit must be positive')
     if not 0.0 <= a.muon_momentum < 1.0:
         p.error('muon-momentum must be in [0, 1)')
     if (a.lr <= 0 or a.muon_lr_factor <= 0 or a.weight_decay < 0 or
@@ -387,6 +391,12 @@ def main():
         torch.cuda.manual_seed(args.seed + rank)
 
     if args.compile:
+        import torch._dynamo.config as dynamo_config
+        # Repeated Block.forward code has different FlushBlock types and
+        # history lengths. The default limit of 8 is insufficient for 20 layers.
+        dynamo_config.recompile_limit = args.compile_recompile_limit
+        Logger(f'[Compile] backend=inductor; recompile_limit={args.compile_recompile_limit}; '
+               'lazy compilation starts on first forward/backward; loss runs eager', flush=True)
         model = torch.compile(model)
     # DDP only sees trainable params; frozen vision branch is intentionally absent.
     if distributed:
