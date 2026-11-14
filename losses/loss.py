@@ -19,9 +19,11 @@ class _ChunkedCE(torch.autograd.Function):
         t = target.reshape(-1)
         chunks = torch.chunk(torch.arange(h.shape[0], device=h.device), num_chunks)
         total_loss, total_cnt = 0.0, 0
-        with torch.no_grad():
+        # Autograd backward does not inherit the caller's autocast context.
+        # Explicit FP32 recomputation supports BF16 activations + FP32 weights.
+        with torch.no_grad(), torch.autocast(device_type=h.device.type, enabled=False):
             for idx in chunks:
-                logits = F.linear(h[idx], weight).float()      # [C, V]
+                logits = F.linear(h[idx].float(), weight.float())  # [C, V]
                 loss = F.cross_entropy(logits, t[idx], ignore_index=-100, reduction="sum")
                 total_loss += loss.item()
                 total_cnt += (t[idx] != -100).sum().item()
@@ -29,25 +31,25 @@ class _ChunkedCE(torch.autograd.Function):
         ctx.chunks = chunks
         ctx.denominator = max(total_cnt, 1)
         ctx.hidden_shape = hidden.shape
-        return hidden.new_tensor(total_loss / ctx.denominator)
+        return hidden.new_tensor(total_loss / ctx.denominator, dtype=torch.float32)
 
     @staticmethod
     def backward(ctx, grad_out):
         weight, h, t = ctx.saved_tensors
-        grad_h = torch.zeros_like(h)
-        grad_w = torch.zeros_like(weight)
-        scale = grad_out / ctx.denominator
+        grad_h = torch.zeros_like(h, dtype=torch.float32)
+        grad_w = torch.zeros_like(weight, dtype=torch.float32)
+        scale = grad_out.float() / ctx.denominator
         for idx in ctx.chunks:
-            with torch.enable_grad():
-                hc = h[idx].detach().requires_grad_(True)
-                wc = weight.detach().requires_grad_(True)
-                logits = F.linear(hc, wc).float()
+            with torch.enable_grad(), torch.autocast(device_type=h.device.type, enabled=False):
+                hc = h[idx].detach().float().requires_grad_(True)
+                wc = weight.detach().float().requires_grad_(True)
+                logits = F.linear(hc, wc)
                 loss = F.cross_entropy(logits, t[idx], ignore_index=-100, reduction="sum")
                 gh, gw = torch.autograd.grad(loss, (hc, wc))
-            grad_h[idx] = gh.to(h.dtype)
-            grad_w += gw.to(weight.dtype)
-        grad_h = (grad_h * scale).reshape(ctx.hidden_shape)
-        return grad_w * scale, grad_h, None, None
+            grad_h[idx] = gh
+            grad_w += gw
+        grad_h = (grad_h * scale).to(h.dtype).reshape(ctx.hidden_shape)
+        return (grad_w * scale).to(weight.dtype), grad_h, None, None
 
 
 class ChunkedCrossEntropy(nn.Module):
