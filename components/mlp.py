@@ -12,10 +12,8 @@ from components.norm import RMSNorm, NormArgs, TorchRMSNorm
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
     _HAS_LIGER_SWIGLU = True
-    print("Using Liger SwiGLU")
 except ImportError:
     _HAS_LIGER_SWIGLU = False
-    print("Using Eager SwiGLU")
 
 @dataclass
 class MLPArgs:
@@ -151,7 +149,10 @@ class SwiGLUWithFWP(SwiGLU):
                 coefficients = self.fwp._alpha_cache
             if coefficients is None:
                 raise RuntimeError("FWP 缺少 prompt 更新：请先执行 prefill 或传入 fwp_context")
-        if coefficients is None and _HAS_LIGER_SWIGLU and x.is_cuda:
+        # Some Liger/Triton versions fail mutation analysis under torch.compile
+        # (e.g. constexpr gate_multiplier.to()). Let Inductor fuse native ops.
+        if (coefficients is None and _HAS_LIGER_SWIGLU and x.is_cuda
+                and not torch.compiler.is_compiling()):
             return self.down(LigerSiLUMulFunction.apply(self.gate(x), self.up(x)))
         if coefficients is None:
             return self.down(F.silu(self.gate(x)) * self.up(x))
@@ -192,19 +193,18 @@ class MoTFFN(nn.Module):
     def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
-        # 文本专家 opt-in：fwp_rank=0 时退化为普通 SwiGLU
-        self.mlp_t = SwiGLUWithFWP(args, config=config, fwp=True)
+        # MoT 文本/视觉专家均使用普通 SwiGLU，不接入 FWP。
+        self.mlp_t = SwiGLU(args)
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),
-                                    bias=args.bias))  # 视觉专家默认关：FWP 只作用于文本侧
+                                    bias=args.bias))
         self.norm_t = TorchRMSNorm(norm_args)
         self.norm_v = TorchRMSNorm(norm_args)
 
-    def forward(self, x, img_idx=None, fwp_context=None, fwp_accumulate=False):
+    def forward(self, x, img_idx=None):
         # 纯文本快速路径（decode 常态）：无图像 token 时直接走文本专家，省掉 nonzero/分拣
         if img_idx is None or img_idx.numel() == 0:
-            return self.mlp_t(self.norm_t(x), fwp_context=fwp_context,
-                              fwp_accumulate=fwp_accumulate)
+            return self.mlp_t(self.norm_t(x))
 
         B, T, D = x.shape
         flat = x.reshape(-1, D)
@@ -217,12 +217,7 @@ class MoTFFN(nn.Module):
                                (img_idx, self.norm_v, self.mlp_v)):
             if idx.numel() == 0:
                 continue
-            # 文本 token 展平后仍按样本选择 α；视觉专家不接收 FWP 上下文
-            is_text = mlp is self.mlp_t
-            batch_idx = torch.div(idx, T, rounding_mode="floor") if is_text else None
-            y = mlp(norm(flat.index_select(0, idx)),
-                    fwp_context=fwp_context if is_text else None,
-                    batch_idx=batch_idx, fwp_accumulate=fwp_accumulate)
+            y = mlp(norm(flat.index_select(0, idx)))
             if out is None:
                 out = y.new_empty(B * T, D)
             out.index_copy_(0, idx, y)

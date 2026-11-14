@@ -347,6 +347,14 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                                    backend=getattr(config, 'loss_backend', 'auto'))
         self.post_init()
 
+    @torch.compiler.disable
+    def _compute_training_loss(self, hidden, labels):
+        # Liger is already a fused kernel; keep its Python chunking, .item()
+        # calls and custom backward outside Dynamo tracing.
+        h = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
+        y = labels[..., 1:].reshape(-1)
+        return self.loss_fn(self.lm_head.weight, h, y)
+
     def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
                 past_key_values=None, use_cache=False, logits_to_keep=0, labels=None,
                 prompt_mask=None, fwp_prefill=None, fwp_accumulate=False, **kwargs):
@@ -363,9 +371,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             logits = self.lm_head(hidden_states[:, slice_indices, :])
         else:
             # shift 作用在 hidden/labels 上（不是 logits），对齐原版 CE 的语义
-            h = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))  # [B*(T-1), H]
-            y = labels[..., 1:].reshape(-1)  # [B*(T-1)]，图像段/pad 已是 -100
-            loss = self.loss_fn(self.lm_head.weight, h, y)
+            loss = self._compute_training_loss(hidden_states, labels)
 
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits,
                                          past_key_values=past_key_values, hidden_states=hidden_states)

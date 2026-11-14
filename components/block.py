@@ -238,8 +238,7 @@ class BlockAttnResBlock(nn.Module):
         if isinstance(self.mlp, MoTFFN):
             if img_idx is None and modality_mask is not None:
                 img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0]
-            mlp_out = self.mlp(mlp_input, img_idx=img_idx, fwp_context=fwp_context,
-                               fwp_accumulate=fwp_accumulate)
+            mlp_out = self.mlp(mlp_input, img_idx=img_idx)
         elif isinstance(self.mlp, SwiGLU):
             mlp_out = self.mlp(self.post_attn_layernorm(mlp_input), fwp_context=fwp_context,
                                fwp_accumulate=fwp_accumulate)
