@@ -92,6 +92,8 @@ def parse_args():
     p.add_argument('--dtype', choices=['bf16', 'fp16', 'fp32'], default='bf16')
     p.add_argument('--num-workers', type=int, default=4)
     p.add_argument('--pad-multiple', type=int, default=64)
+    p.add_argument('--padding', choices=['fixed', 'dynamic'], default='fixed',
+                   help='fixed: pad all batches to max-seq-len; dynamic: pad to batch maximum')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--log-every', type=int, default=8,
                    help='Print progress every N optimizer steps; metrics are saved every step')
@@ -125,12 +127,14 @@ def parse_args():
 
 
 class Collate:
-    def __init__(self, pad_id, max_length, multiple):
+    def __init__(self, pad_id, max_length, multiple, padding='fixed'):
         self.pad_id, self.max_length, self.multiple = pad_id, max_length, multiple
+        self.padding = padding
 
     def __call__(self, items):
         longest = max(len(x) for x in items)
-        width = min(self.max_length, math.ceil(longest / self.multiple) * self.multiple)
+        width = (self.max_length if self.padding == 'fixed' else
+                 min(self.max_length, math.ceil(longest / self.multiple) * self.multiple))
         # Keep at least 2 positions for shifted LM loss.
         x = torch.full((len(items), width), self.pad_id, dtype=torch.long)
         y = torch.full((len(items), width), -100, dtype=torch.long)
@@ -343,7 +347,7 @@ def main():
         pad_to_max=False,
         stage='p1',
     )
-    collate = Collate(data.pad_id, args.max_seq_len, args.pad_multiple)
+    collate = Collate(data.pad_id, args.max_seq_len, args.pad_multiple, args.padding)
     # Fixed model initialization seed across all ranks.
     torch.manual_seed(args.seed)
     if device.type == 'cuda':
@@ -426,6 +430,8 @@ def main():
         if ck.get('data_geometry') != geometry:
             raise ValueError('Exact resume requires unchanged dataset and training length')
         old_args = ck.get('args', {})
+        if old_args.get('padding', 'dynamic') != args.padding:
+            raise ValueError('Cannot exact-resume with changed padding; use the original mode or a new experiment')
         exact_keys = (
             'hidden_size', 'layers', 'vision_ffn_scale', 'block_size',
             'full_attn_res', 'block_attn_res', 'batch_size', 'grad_accum',
