@@ -343,7 +343,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings:
             self.model.embed.weight = self.lm_head.weight
-        self.loss_fn = get_loss_fn()
+        self.loss_fn = get_loss_fn(num_chunks=getattr(config, 'loss_chunks', 4),
+                                   backend=getattr(config, 'loss_backend', 'auto'))
         self.post_init()
 
     def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,

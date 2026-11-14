@@ -60,9 +60,13 @@ class ChunkedCrossEntropy(nn.Module):
         return _ChunkedCE.apply(weight, hidden, target, self.num_chunks)
 
 
-def get_loss_fn(num_chunks: int = 4):
-    if _HAS_LIGER:
+def get_loss_fn(num_chunks: int = 4, backend: str = 'auto'):
+    if backend not in ('auto', 'liger', 'chunked'):
+        raise ValueError(f'Unknown loss backend: {backend}')
+    if backend == 'liger' and not _HAS_LIGER:
+        raise RuntimeError('Liger loss requested but liger-kernel is not installed')
+    if backend != 'chunked' and _HAS_LIGER:
         print("[loss] 使用 Liger Fused Linear CE")
         return LigerFusedLinearCrossEntropyLoss()
-    print(f"[loss] 无 Liger，使用分块 CE（{num_chunks} 块）")
+    print(f"[loss] 使用 PyTorch 分块 CE（{num_chunks} 块，backend={backend}）")
     return ChunkedCrossEntropy(num_chunks)

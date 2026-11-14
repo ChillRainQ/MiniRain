@@ -56,6 +56,7 @@ from dataset.datasets import PretrainBinDataset
 import project
 from train.ckpt import load_ckpt_path, save_rolling_ckpt, save_exp, save_state_dict
 from train.metrics import TrainingMetrics
+from train.numerics import diagnose_loss
 from train.train_util import (setup_seed, init_distributed_mode, Logger, get_lr,
                               get_muon_params, get_adamw_params, SkipBatchSampler,
                               format_training_progress)
@@ -90,6 +91,8 @@ def parse_args():
     p.add_argument('--grad-clip', type=float, default=1.0)
     p.add_argument('--optimizer', choices=['muon_adamw', 'adamw'], default='muon_adamw')
     p.add_argument('--dtype', choices=['bf16', 'fp16', 'fp32'], default='bf16')
+    p.add_argument('--loss-backend', choices=['auto', 'liger', 'chunked'], default='auto')
+    p.add_argument('--loss-chunks', type=int, default=32)
     p.add_argument('--num-workers', type=int, default=4)
     p.add_argument('--pad-multiple', type=int, default=64)
     p.add_argument('--padding', choices=['fixed', 'dynamic'], default='fixed',
@@ -111,7 +114,7 @@ def parse_args():
     a = p.parse_args()
     if a.batch_size <= 0 or a.grad_accum <= 0 or a.epochs <= 0 or a.max_seq_len < 3:
         p.error('invalid batch/accum/epochs/max-seq-len')
-    if a.pad_multiple < 1 or a.log_every < 1 or a.save_every < 1:
+    if a.pad_multiple < 1 or a.log_every < 1 or a.save_every < 1 or a.loss_chunks < 1:
         p.error('invalid padding/log/save interval')
     if not 0.0 <= a.muon_momentum < 1.0:
         p.error('muon-momentum must be in [0, 1)')
@@ -359,6 +362,7 @@ def main():
                         vision_ffn_scale=args.vision_ffn_scale, block_size=args.block_size,
                         full_attn_res=args.full_attn_res,
                         block_attn_res=args.block_attn_res,
+                        loss_backend=args.loss_backend, loss_chunks=args.loss_chunks,
                         use_bounce=False)
     model = MiniRainVForCausalLM(config).to(device)
     distilled_step = load_distilled_convstem(model, args.convstem_ckpt)
@@ -430,6 +434,8 @@ def main():
         if ck.get('data_geometry') != geometry:
             raise ValueError('Exact resume requires unchanged dataset and training length')
         old_args = ck.get('args', {})
+        if old_args.get('loss_backend', 'auto') != args.loss_backend:
+            raise ValueError('Cannot exact-resume with changed loss backend; use a new experiment')
         if old_args.get('padding', 'dynamic') != args.padding:
             raise ValueError('Cannot exact-resume with changed padding; use the original mode or a new experiment')
         exact_keys = (
@@ -525,9 +531,27 @@ def main():
                 with sync:
                     with amp:
                         out = model(ids, labels=labels, attention_mask=mask, use_cache=False)
-                        if out.loss is None or not torch.isfinite(out.loss).all():
-                            raise RuntimeError(f'Nonfinite/None loss at step {global_step}')
                         aux = getattr(out, 'aux_loss', None)
+                        invalid_loss = (out.loss is None or not torch.isfinite(out.loss).all() or
+                                        (aux is not None and not torch.isfinite(aux).all()))
+                        failed = torch.tensor(int(invalid_loss), device=device)
+                        if distributed:
+                            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+                        if failed.item():
+                            from train.ckpt import save_ckpt
+                            diagnostic = diagnose_loss(raw, out, ids, labels)
+                            diagnostic.update(step=global_step, micro_batch=j, rank=rank,
+                                              batch_pos=batch_pos, compiled=args.compile,
+                                              loss_backend=args.loss_backend)
+                            path = args.output_dir / f'nonfinite_step_{global_step:08d}_rank{rank}.pt'
+                            save_ckpt(path, step=global_step, diagnostic=diagnostic,
+                                      input_ids=ids.detach().cpu(), labels=labels.detach().cpu(),
+                                      attention_mask=mask.detach().cpu())
+                            print('[Numerics] ' + json.dumps(diagnostic, ensure_ascii=False), flush=True)
+                            if log is not None:
+                                log.export(status='failed_nonfinite')
+                                log.close()
+                            raise RuntimeError(f'Nonfinite/None loss at step {global_step}; diagnostic: {path}')
                         total = out.loss + (aux if aux is not None else 0.)
                         local_loss_sum += float(total.detach()) * valid
                         # Accumulate token sums, then normalize after DDP has
