@@ -10,22 +10,21 @@ from pathlib import Path
 
 
 def configure_gpus():
-    """Set visibility before importing torch; launch one worker per selected GPU."""
+    """Use direct CUDA indices, without visibility remapping."""
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    parser.add_argument('--gpus', default=None)
+    parser.add_argument('--gpu', '--gpus', dest='gpus', default=None)
     selected, _ = parser.parse_known_args()
     if selected.gpus is None:
         return
     value = selected.gpus.strip().lower()
     if value == 'cpu':
-        os.environ['CUDA_VISIBLE_DEVICES'] = ''
         return
     ids = value.split(',')
     if (not ids or any(not item.isdecimal() for item in ids) or
             len(set(map(int, ids))) != len(ids)):
         parser.error('--gpus must be GPU indices such as 0 or 0,1, or cpu')
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(int(item)) for item in ids)
+    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
     if len(ids) > 1 and int(os.environ.get('WORLD_SIZE', '1')) == 1:
         if sys.platform == 'win32':
             parser.error('Multi-GPU training uses NCCL and requires Linux/WSL')
@@ -64,8 +63,8 @@ from train.train_util import (setup_seed, init_distributed_mode, Logger, get_lr,
 
 def parse_args():
     p = argparse.ArgumentParser(description='MiniRain-Vision P1 pretraining')
-    p.add_argument('--gpus', type=str, default=None,
-                   help='GPU indices: 0 or 0,1 (auto-launch DDP on Linux/WSL); cpu forces CPU; default: auto')
+    p.add_argument('--gpu', '--gpus', dest='gpus', type=str, default=None,
+                   help='Direct CUDA index, e.g. 1 selects cuda:1; 0,1 launches DDP; cpu forces CPU')
     p.add_argument('--data-dir', type=Path, default=ROOT / 'data/pretrain_bins')
     p.add_argument('--convstem-ckpt', type=Path, default=ROOT / 'init/ConvStem.pt',
                    help='Distilled ConvStem checkpoint loaded before freezing vision')
@@ -286,17 +285,33 @@ def cpu_state(value):
     return value
 
 
+def select_device(gpus):
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    if gpus is not None and gpus.strip().lower() == 'cpu':
+        if world > 1:
+            raise ValueError('CPU mode does not support the NCCL distributed path')
+        return torch.device('cpu')
+    if gpus is not None:
+        ids = [int(item) for item in gpus.split(',')]
+        if len(set(ids)) != len(ids) or any(index < 0 for index in ids):
+            raise ValueError('GPU indices must be distinct nonnegative integers')
+        if not torch.cuda.is_available():
+            raise RuntimeError(f'--gpu {gpus} requested CUDA, but CUDA is unavailable')
+        if max(ids) >= torch.cuda.device_count():
+            raise RuntimeError(f'Requested GPU {max(ids)}, but only {torch.cuda.device_count()} devices are available')
+        if world > len(ids) or local_rank >= len(ids):
+            raise RuntimeError('Distributed worker count exceeds the number of selected GPUs')
+        return torch.device(f'cuda:{ids[local_rank]}')
+    return torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+
 def main():
     args = parse_args()
-    if args.gpus is not None and args.gpus.strip().lower() != 'cpu':
-        if not torch.cuda.is_available():
-            raise RuntimeError(f'--gpus {args.gpus} requested CUDA, but no selected CUDA GPU is available')
-        selected_count = len(args.gpus.split(','))
-        if torch.cuda.device_count() < selected_count:
-            raise RuntimeError('Some requested GPU indices are unavailable')
-        if int(os.environ.get('WORLD_SIZE', '1')) > selected_count:
-            raise RuntimeError('Distributed worker count exceeds the number of selected GPUs')
-    local_rank = init_distributed_mode()
+    device = select_device(args.gpus)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device.index)
+    local_rank = init_distributed_mode(device_index=device.index)
     distributed = int(os.environ.get('WORLD_SIZE', '1')) > 1
     rank = dist.get_rank() if distributed else 0
     world = dist.get_world_size() if distributed else 1
@@ -306,10 +321,11 @@ def main():
         experiment_dir = ROOT / experiment_dir
     experiment_dir = experiment_dir.resolve()
     args.output_dir = experiment_dir / 'p1'
-    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     if rank == 0:
-        Logger(f'[Device] {device}; CUDA_VISIBLE_DEVICES='
-               f'{os.environ.get("CUDA_VISIBLE_DEVICES", "all")}', flush=True)
+        Logger(f'[Device] selected={device}; current='
+               f'{torch.cuda.current_device() if device.type == "cuda" else "cpu"}; '
+               f'name={torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"}; '
+               f'CUDA_VISIBLE_DEVICES={os.environ.get("CUDA_VISIBLE_DEVICES", "unset")}', flush=True)
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
@@ -366,7 +382,7 @@ def main():
         model = torch.compile(model)
     # DDP only sees trainable params; frozen vision branch is intentionally absent.
     if distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=args.ddp_find_unused)
+        model = DDP(model, device_ids=[device.index], find_unused_parameters=args.ddp_find_unused)
 
     raw = model.module if distributed else model
     raw = getattr(raw, '_orig_mod', raw)

@@ -133,13 +133,13 @@ def setup_seed(seed: int, *, deterministic=True):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def init_distributed_mode():
+def init_distributed_mode(device_index=None):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if int(os.environ.get("WORLD_SIZE", '1')) <= 1:
         return local_rank
     if not torch.cuda.is_available():
         raise RuntimeError('Multi-rank mode expects CUDA')
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank if device_index is None else device_index)
     dist.init_process_group(backend="nccl")
     return local_rank
 
