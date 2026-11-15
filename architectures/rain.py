@@ -2,7 +2,7 @@
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
-from components.block import MiniRainBlock, BlockAttnResBlock, FlushBlockAttnResBlock
+from components.block import BlockAttnResBlock, FlushBlockAttnResBlock
 from components.norm import NormArgs, TorchRMSNorm
 from components.norm import RMSNorm
 from architectures.config import RainConfig
