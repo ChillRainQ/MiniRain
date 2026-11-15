@@ -222,10 +222,10 @@ class BlockAttnResBlock(nn.Module):
                               args=MLPArgs(hidden_size=config.hidden_size,
                                            intermediate_size=config.intermediate_size, bias=False),
                               norm_args=NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps), config=config)
+            self.post_attn_layernorm = None
         elif config.type_id == 4:
             self.mlp = AdaptiveSwiGLU(MLPArgs(hidden_size=config.hidden_size,
                                              intermediate_size=config.intermediate_size, bias=False), config=config)
-            self.post_attn_layernorm = None
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)
 
