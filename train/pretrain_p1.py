@@ -348,8 +348,8 @@ def main():
     if distributed:
         dist.barrier()
     data = PretrainBinDataset(
-        bin_path=args.data_dir / 'p1_text.bin',
-        idx_path=args.data_dir / 'p1_text.idx',
+        bin_path=args.data_dir / 'p1_text_packed.bin',
+        idx_path=args.data_dir / 'p1_text_packed.idx',
         max_length=args.max_seq_len,
         pad_to_max=False,
         stage='p1',
