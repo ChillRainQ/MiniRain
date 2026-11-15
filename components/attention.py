@@ -1,4 +1,5 @@
 import inspect
+from typing import NamedTuple
 
 from transformers import PreTrainedConfig
 
@@ -9,6 +10,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fla.layers import GatedDeltaNet as FLAGatedDeltaNet
+from fla.models.utils import Cache
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -523,3 +526,46 @@ class MoTAttention(nn.Module):
 
         # 重新拼回完整序列顺序
         return self._merge_modalities(expert_outputs, modality_masks)
+
+
+class GatedDeltaNetAttention(nn.Module):
+    def __init__(self, args: AttentionArgs):
+        super().__init__()
+        config = args.config
+
+        self.gdn = FLAGatedDeltaNet(
+            hidden_size=config.hidden_size,
+            num_heads=config.n_attn_heads,
+            head_dim=config.head_dim,
+            expand_v=1.0,
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            mode="chunk",
+            norm_eps=config.rms_norm_eps,
+            layer_idx=0,
+        )
+
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        # GDN 不使用 RoPE，保留参数只是兼容现有 Block。
+        if use_cache and past_key_value is None:
+            past_key_value = Cache()
+
+        # FLA 接收 padding mask，不接收因果注意力矩阵。
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, -x.shape[1]:]
+
+        output, _, cache = self.gdn(
+            hidden_states=x,
+            attention_mask=attention_mask,
+            past_key_values=past_key_value,
+            use_cache=use_cache,
+        )
+        return output, cache if use_cache else None

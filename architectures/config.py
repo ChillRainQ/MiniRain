@@ -4,11 +4,12 @@ model_type: dict[int, str] = {
     1 : "DENSE",
     2 : "MOE",
     3 : "MOT",
+    4 : "DENSE-ADAPTIVE",
 }
 
 class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
-                 use_moe=False, use_mot=False, use_bounce=False,  **kwargs):
+                 use_moe=False, use_mot=False, use_adaptive=False,  **kwargs):
         # 兼容早期配置：旧版只序列化 type_id，没有持久化 use_mot/use_moe。
         # 必须在 super().__init__ 前读取，否则重新加载 MoT 配置会静默退化成 Dense。
         saved_type_id = int(kwargs.get("type_id", 0) or 0)
@@ -21,6 +22,8 @@ class RainConfig(PretrainedConfig):
 
         elif use_mot:
             self.type_id = 3
+        elif use_adaptive:
+            self.type_id = 4
         else:
             self.type_id = 1
         # self.model_type_: str = str(kwargs.get("model_type", ""))
@@ -42,6 +45,7 @@ class RainConfig(PretrainedConfig):
         # MOE config
         self.use_moe = use_moe
         self.use_mot = use_mot
+        self.use_adaptive = use_adaptive
         self.m: int = int(kwargs.get("m", 8))
         self.norm_topk_prob: bool = bool(kwargs.get("norm_topk_prob", True))
         self.n_experts: int = 0 if not use_moe else kwargs.get("n_experts", 4) * self.m
@@ -58,14 +62,14 @@ class RainConfig(PretrainedConfig):
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
-            "factor": 16,
-            "original_max_position_embeddings": 2048,
+            "factor": 8,
+            "original_max_position_embeddings": 4096,
             "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None
         # attn_res
-        self.full_attn_res = bool(kwargs.get("full_attn_res", False))
-        self.block_attn_res = bool(kwargs.get("block_attn_res", False))
+        # self.full_attn_res = bool(kwargs.get("full_attn_res", False))
+        # self.block_attn_res = bool(kwargs.get("block_attn_res", False))
         self.block_size = int(kwargs.get("block_size", 0))
         # 聚合段梯度检查点：反向重算 norm/加权和，省掉 stack 缓冲的持有（长上下文训练省显存）
         self.attn_res_checkpoint = bool(kwargs.get("attn_res_checkpoint", False))

@@ -8,7 +8,6 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from architectures.config import RainConfig
 from components.block import BlockAttnResBlock, FlushBlockAttnResBlock
 from components.cv import ConvStem
-from components.mlp import FastWeightProgrammer
 from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
 from losses.loss import get_loss_fn
@@ -22,29 +21,6 @@ class _LegacyKVCache(list):
         return self[0][0].shape[1] if self and self[0] is not None else 0
 
 
-# def precompute_freqs_cis_2d(head_dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict | None = None):
-#     # 每个轴分到 head_dim//2 个维度，对应 head_dim//4 个频率
-#     half = head_dim // 2
-#     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, half, 2).float() / half)), 1.0
-#     if rope_scaling is not None:  # YaRN，按轴内维度 half 计算，与 1D 版同式
-#         orig_max, factor, beta_fast, beta_slow, attn_factor = (
-#             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
-#             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
-#         )
-#         if end / orig_max > 1.0:
-#             inv_dim = lambda b: (half * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-#             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), half // 2 - 1)
-#             ramp = torch.clamp((torch.arange(half // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
-#             freqs = freqs * (1 - ramp + ramp / factor)
-#     t = torch.arange(end)
-#     ang = torch.outer(t, freqs)          # [P, half/2]
-#     return ang.cos() * attn_factor, ang.sin() * attn_factor   # 两张表：按行/列索引查
-#
-# def build_2d_position_embeddings(positions, cos_tab, sin_tab):
-#     rows, cols = positions[..., 0], positions[..., 1]
-#     cos = torch.cat([cos_tab[rows], cos_tab[cols]], dim=-1)
-#     sin = torch.cat([sin_tab[rows], sin_tab[cols]], dim=-1)
-#     return torch.cat([cos, cos], dim=-1), torch.cat([sin, sin], dim=-1)
 
 def precompute_freqs_cis_2d(head_dim: int, end: int = 32 * 1024, rope_base: float = 1e6,
                             rope_scaling: dict | None = None):
@@ -181,11 +157,6 @@ class MiniRainVLM(nn.Module):
         self.register_buffer("rope_cos2d", cos2d, persistent=False)
         self.register_buffer("rope_sin2d", sin2d, persistent=False)
 
-        # FWP 默认关：fwp_rank>0 时必须有模块真正接上，否则会静默失效（SwiGLU 本身不带 FWP）
-        if self.config.fwp_rank > 0 and not any(
-                isinstance(m, FastWeightProgrammer) for m in self.modules()):
-            raise ValueError("fwp_rank>0 但模型里没有任何 FastWeightProgrammer："
-                             "SwiGLU 不内置 FWP，需把文本侧 MLP 换成 SwiGLUWithFWP")
 
     def prepare_inputs_embeds(self, input_ids, pixel_values=None):
         inputs_embeds = self.embed(input_ids)
@@ -237,11 +208,6 @@ class MiniRainVLM(nn.Module):
                            torch.full((), float("-inf"), dtype=dtype, device=device))
         return mask.unsqueeze(1)
 
-    def reset_fwp(self):
-        """清除所有 SwiGLU 的运行时 ΔW；慢权重和 checkpoint 不受影响。"""
-        for module in self.modules():
-            if isinstance(module, FastWeightProgrammer):
-                module.clear()
 
     def forward(self, input_ids, pixel_values=None, positions=None,
                 attention_mask=None, past_key_values=None, use_cache=False,

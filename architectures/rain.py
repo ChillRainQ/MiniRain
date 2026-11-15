@@ -2,8 +2,8 @@
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import GenerationMixin, PreTrainedConfig
 from transformers import PreTrainedModel
-from components.block import MiniRainBlock
-from components.norm import NormArgs
+from components.block import MiniRainBlock, BlockAttnResBlock, FlushBlockAttnResBlock
+from components.norm import NormArgs, TorchRMSNorm
 from components.norm import RMSNorm
 from architectures.config import RainConfig
 import torch.nn.functional as F
@@ -39,8 +39,13 @@ class MiniRainModel(nn.Module):
         self.vocab_size, self.n_hidden_layers = self.config.vocab_size, self.config.n_hidden_layers
         self.embed = nn.Embedding(self.vocab_size, self.config.hidden_size)
         self.dropout = nn.Dropout(self.config.n_dropout)
-        self.layers = nn.ModuleList([MiniRainBlock(i, self.config) for i in range(self.n_hidden_layers)])
-        self.norm = RMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
+        self.layers = nn.ModuleList([
+            (FlushBlockAttnResBlock
+             if (config.block_size >= 2 and i % (config.block_size // 2) == 0)
+             else BlockAttnResBlock)(i, config)
+            for i in range(config.n_hidden_layers)
+        ])
+        self.norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)

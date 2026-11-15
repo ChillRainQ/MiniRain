@@ -1,11 +1,16 @@
+import math
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 import torch.distributed as dist
 from transformers import PreTrainedConfig
+import math
+from typing import Optional
+
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
 
 from architectures.config import RainConfig
 from components.norm import RMSNorm, NormArgs, TorchRMSNorm
@@ -50,120 +55,73 @@ class MLP(MyMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(x)))
 
-
-class FastWeightProgrammer(nn.Module):
-    """学习 prompt 条件的低秩更新规则：ΔW = scale * Σᵣ αᵣ uᵣvᵣᵀ。
-
-    u/v 是可学习的更新基，controller 只生成每个基的混合系数，避免直接回归完整权重。
-    最后一层零初始化使初始 ΔW=0，启用 FWP 不会改变未训练模型的行为。
-    """
-    names = ("gate", "up", "down")
-
-    def __init__(self, linears: dict[str, nn.Linear], prompt_size: int, rank: int,
-                 hidden_size: int, update_scale: float):
-        super().__init__()
-        self.update_scale = update_scale
-        self.controller = nn.Sequential(
-            nn.Linear(prompt_size, hidden_size), nn.SiLU(), nn.Linear(hidden_size, 3 * rank))
-        nn.init.zeros_(self.controller[-1].weight)
-        nn.init.zeros_(self.controller[-1].bias)
-        self.u = nn.ParameterDict()
-        self.v = nn.ParameterDict()
-        for name, linear in linears.items():
-            out_features, in_features = linear.weight.shape
-            self.u[name] = nn.Parameter(torch.empty(rank, out_features))
-            self.v[name] = nn.Parameter(torch.empty(rank, in_features))
-            nn.init.normal_(self.u[name], std=0.02)
-            nn.init.normal_(self.v[name], std=0.02)
-        # 仅缓存每个样本的低秩系数，不进 state_dict；首轮创建，多轮累加，新会话清空
-        self._alpha_cache = None
-
-    def forward(self, prompt_context: torch.Tensor):
-        return self.controller(prompt_context).chunk(3, dim=-1)
-
-    def apply(self, name, x, linear, alpha, batch_idx=None):
-        """y = Wx + scale·Σᵣαᵣuᵣ(vᵣᵀx)，不构造完整 ΔW 或逐 token 权重。"""
-        if batch_idx is not None:
-            alpha = alpha.index_select(0, batch_idx)
-        if x.dim() == 2:
-            projected = torch.einsum("ni,ri->nr", x, self.v[name])
-            update = torch.einsum("nr,ro->no", projected * alpha, self.u[name])
-        else:
-            projected = torch.einsum("bti,ri->btr", x, self.v[name])
-            update = torch.einsum("btr,ro->bto", projected * alpha.unsqueeze(1), self.u[name])
-        return linear(x) + update * self.update_scale
-
-    def cache(self, coefficients):
-        self._alpha_cache = tuple(alpha.detach() for alpha in coefficients)
-
-    def clear(self):
-        self._alpha_cache = None
-
 class SwiGLU(MyMLP):
-    """纯 SwiGLU 快路径：不内置 FWP，self.fwp 恒为 None（FWP 默认关）。
-
-    需要 FWP 用 SwiGLUWithFWP。这里保留 fwp 属性，是为了让“未接入 FWP”可被显式断言，
-    而不是靠 hasattr 判断。
-    """
-
-    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False, **kwargs):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.fwp = None  # 默认关：本类不构建 FWP
 
     def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
                 batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
-class SwiGLUWithFWP(SwiGLU):
-    """opt-in 的 FWP 版本。
+class AdaptiveSwiGLU(MyMLP):
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False,
+                 fast_size: int = 32, initial_lr: float = 1e-1, **kwargs):
+        super().__init__()
+        self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
-    继承 SwiGLU，故 isinstance(m, SwiGLU) 仍成立，block 里的分支无需区分两种类。
-    两层开关：模块级 fwp=True 且 config.fwp_rank > 0，任一不满足即退化为普通 SwiGLU。
-    """
+        self.fast_size = fast_size
+        self.intermediate_size = args.intermediate_size
+        self.hidden_size = args.hidden_size
 
-    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False):
-        super().__init__(args, config, fwp)
-        # FWP 默认关闭：需显式传 fwp=True 才创建，开启后 rank 仍由 config.fwp_rank 决定
-        fwp_rank = int(getattr(config, "fwp_rank", 0)) if fwp else 0
-        self.fwp = FastWeightProgrammer(
-            {"gate": self.gate, "up": self.up, "down": self.down},
-            prompt_size=args.hidden_size, rank=fwp_rank,
-            hidden_size=int(getattr(config, "fwp_hidden_size", 128)),
-            update_scale=float(getattr(config, "fwp_update_scale", 1.0)),
-        ) if fwp_rank > 0 else None
+        self.target = nn.Linear(args.hidden_size, fast_size, bias=False)
+        self.lr_logit = nn.Parameter(torch.tensor(math.log(initial_lr / (1 - initial_lr))))
 
-    def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
-                batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
-        coefficients = None
-        if self.fwp is not None:
-            if fwp_context is not None:
-                coefficients = self.fwp(fwp_context)
-                if fwp_accumulate and self.fwp._alpha_cache is not None:
-                    coefficients = tuple(old + new for old, new in zip(self.fwp._alpha_cache, coefficients))
-                if not self.training:
-                    self.fwp.cache(coefficients)
-            else:
-                coefficients = self.fwp._alpha_cache
-            if coefficients is None:
-                raise RuntimeError("FWP 缺少 prompt 更新：请先执行 prefill 或传入 fwp_context")
-        # Some Liger/Triton versions fail mutation analysis under torch.compile
-        # (e.g. constexpr gate_multiplier.to()). Let Inductor fuse native ops.
-        if (coefficients is None and _HAS_LIGER_SWIGLU and x.is_cuda
-                and not torch.compiler.is_compiling()):
-            return self.down(LigerSiLUMulFunction.apply(self.gate(x), self.up(x)))
-        if coefficients is None:
-            return self.down(F.silu(self.gate(x)) * self.up(x))
-        gate_alpha, up_alpha, down_alpha = coefficients
-        gate = self.fwp.apply("gate", x, self.gate, gate_alpha, batch_idx)
-        up = self.fwp.apply("up", x, self.up, up_alpha, batch_idx)
-        return self.fwp.apply("down", F.silu(gate) * up, self.down, down_alpha, batch_idx)
+    def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
+        # 初始化 state
+        if state is None:
+            state = x.new_zeros(x.shape[0], self.fast_size, self.intermediate_size, dtype=torch.float32)
+        z = F.silu(self.gate(x)) * self.up(x)
+        output = self.down(z)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            delta = z.float() @ state.float().transpose(1, 2)  # [B,T,R]
+        return output + F.pad(delta.to(output.dtype), (0, self.hidden_size - self.fast_size))
 
-class LowRankMLP(MyMLP):
-    ...
- 
+
+    def update_state(self, context: Tensor, state: Tensor | None = None,
+                     attention_mask: Tensor | None = None) -> Tensor:
+        """用当前段内部误差更新 down 增量，供后续段使用；不 detach。"""
+        if state is None:
+            state = context.new_zeros(context.shape[0], self.fast_size,
+                                      self.intermediate_size, dtype=torch.float32)
+        if attention_mask is None:
+            valid = torch.ones(context.shape[:2], device=context.device, dtype=torch.bool)
+        else:
+            valid = attention_mask.to(device=context.device, dtype=torch.bool)
+
+        with torch.autocast(device_type=context.device.type, enabled=False):
+            x = torch.where(valid.unsqueeze(-1), context.float(), 0.0)
+            z = F.silu(F.linear(x, self.gate.weight.float())) * F.linear(x, self.up.weight.float())
+            old = state.float()
+            prediction = F.linear(z, self.down.weight[:self.fast_size].float())
+            prediction = prediction + z @ old.transpose(1, 2)
+            target = torch.tanh(F.linear(x, self.target.weight.float()))
+
+            # L_inner = sum_valid ||prediction - target||² / (2*N)
+            error = (prediction - target) * valid.unsqueeze(-1)
+            count = valid.sum(dim=1).clamp_min(1).view(-1, 1, 1)
+            gradient = error.transpose(1, 2) @ z / count
+            # 按特征能量缩放步长，控制固定特征下的二次目标更新。
+            energy = (z.square().sum(dim=-1) * valid).sum(dim=1).view(-1, 1, 1) / count
+            rate = torch.sigmoid(self.lr_logit.float()) / energy.clamp_min(1.0)
+            updated = old - rate * gradient
+            return torch.where(valid.any(dim=1).view(-1, 1, 1), updated, old)
+
+
 class SiTUGLU(MyMLP):
     def __init__(self, args: MLPArgs):
         super().__init__()
