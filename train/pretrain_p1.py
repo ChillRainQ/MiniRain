@@ -342,8 +342,8 @@ def main():
         torch.set_float32_matmul_precision('high')
     setup_seed(args.seed + rank, deterministic=False)
     if rank == 0:
-        save_exp(args.exp_name, output_dir=experiment_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
+        save_exp(args.exp_name, output_dir=args.output_dir)
         Logger(f'[Experiment] {experiment_dir}; stage directory: {args.output_dir}', flush=True)
     if distributed:
         dist.barrier()
@@ -368,6 +368,13 @@ def main():
                         block_attn_res=args.block_attn_res,
                         loss_backend=args.loss_backend, loss_chunks=args.loss_chunks,
                         use_bounce=False)
+    if rank == 0:
+        # Keep the model definition beside the P1 run configuration and
+        # checkpoints.  This also gives later stages a stable config path:
+        # <experiment_dir>/p1/config.json.
+        config.save_pretrained(args.output_dir)
+    if distributed:
+        dist.barrier()
     model = MiniRainVForCausalLM(config).to(device)
     distilled_step = load_distilled_convstem(model, args.convstem_ckpt)
     frozen = freeze_vision(model)
@@ -488,7 +495,7 @@ def main():
               f'steps/epoch={steps_per_epoch}, total_steps={max_steps}', flush=True)
         log = TrainingMetrics(
             args.output_dir, resume_step=global_step if resume_path is not None else None,
-            config_dir=experiment_dir,
+            config_dir=args.output_dir,
             metadata=dict(stage='p1', args=serialized_args(args), model_config=config.to_dict(),
                           world_size=world, device=str(device), torch_version=str(torch.__version__),
                           trainable_params=sum(p.numel() for p in raw.parameters() if p.requires_grad),
