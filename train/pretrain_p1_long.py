@@ -37,7 +37,10 @@ def configure_gpus():
 
 if __name__ == '__main__':
     # --help must remain available without starting distributed workers.
-    if '-h' not in sys.argv and '--help' not in sys.argv:
+    # Progressive parent process launches one isolated training process per tier.
+    # A single-stage child still uses the original GPU/DDP launcher.
+    if ('--single-stage' in sys.argv and
+            '-h' not in sys.argv and '--help' not in sys.argv):
         configure_gpus()
 
 import numpy as np
@@ -67,30 +70,35 @@ def parse_args():
     p.add_argument('--gpu', '--gpus', dest='gpus', type=str, default=None,
                    help='Direct CUDA index, e.g. 1 selects cuda:1; 0,1 launches DDP; cpu forces CPU')
     p.add_argument('--data-dir', type=Path, default=ROOT / 'data/pretrain_long')
-    p.add_argument('--init-checkpoint', type=Path, required=True,
-                   help='P1 or previous P1-Long checkpoint (.pt or .pth)')
+    p.add_argument('--init-checkpoint', type=Path, default=None,
+                   help='P1 checkpoint for the first stage; automatically found under exp/<name>/p1')
     p.add_argument('--init-config', type=Path, default=None,
                    help='HF config directory or config JSON; only needed for bare .pth weights')
     p.add_argument('--tier', choices=['8k', '16k', '32k'], default='32k')
+    p.add_argument('--single-stage', action='store_true',
+                   help='Run only --tier; default runs 8K -> 16K -> 32K in separate processes')
     p.add_argument('--exp-name', type=str, default='pretrain_002',
                    help='Experiment name under ROOT/exp; default: pretrain_<hidden-size>_<layers>')
     p.add_argument('--output-dir', type=Path, default=None,
-                   help='Override experiment root; P1 outputs go into its p1/ subdirectory')
+                   help='Override experiment root; stages go into p1_long_<tier>/')
     p.add_argument('--hidden-size', type=int, default=1024)
     p.add_argument('--layers', type=int, default=20)
     p.add_argument('--vision-ffn-scale', type=int, default=2)
     p.add_argument('--block-size', type=int, default=4)
     p.add_argument('--max-seq-len', type=int, default=32768)
-    p.add_argument('--batch-size', type=int, default=2, help='Micro batch per GPU')
-    p.add_argument('--grad-accum', type=int, default=8)
+    p.add_argument('--batch-size', type=int, default=1, help='Micro batch per GPU')
+    p.add_argument('--grad-accum', type=int, default=4)
     p.add_argument('--epochs', type=int, default=1)
     p.add_argument('--max-steps', type=int, default=0, help='Optimizer steps; 0 = full epochs')
-    p.add_argument('--lr', type=float, default=1e-4, help='AdamW learning rate for continued pretraining')
+    p.add_argument('--lr', type=float, default=3e-5, help='Single-stage AdamW peak LR')
+    p.add_argument('--lr-8k', type=float, default=3e-5)
+    p.add_argument('--lr-16k', type=float, default=2e-5)
+    p.add_argument('--lr-32k', type=float, default=1e-5)
     p.add_argument('--muon-lr-factor', type=float, default=30.0)
     p.add_argument('--muon-momentum', type=float, default=0.95)
     p.add_argument('--weight-decay', type=float, default=0.1)
-    p.add_argument('--warmup-ratio', type=float, default=0.02)
-    p.add_argument('--min-lr-ratio', type=float, default=0.1)
+    p.add_argument('--warmup-ratio', type=float, default=0.01)
+    p.add_argument('--min-lr-ratio', type=float, default=0.2)
     p.add_argument('--grad-clip', type=float, default=1.0)
     p.add_argument('--optimizer', choices=['muon_adamw', 'adamw'], default='muon_adamw')
     p.add_argument('--dtype', choices=['bf16', 'fp16', 'fp32'], default='bf16')
@@ -129,6 +137,8 @@ def parse_args():
             not 0 <= a.warmup_ratio < 1 or not 0 <= a.min_lr_ratio <= 1 or
             a.grad_clip <= 0 or a.max_steps < 0 or a.num_workers < 0):
         p.error('invalid learning-rate/decay/warmup/clipping/steps/workers configuration')
+    if min(a.lr_8k, a.lr_16k, a.lr_32k) <= 0:
+        p.error('stage learning rates must be positive')
     if a.exp_name in ('.', '..') or Path(a.exp_name).name != a.exp_name:
         p.error('exp-name must be one directory name')
     return a
@@ -418,6 +428,8 @@ def main():
     torch.manual_seed(args.seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed(args.seed)
+    if args.init_checkpoint is None:
+        raise ValueError('Single-stage mode requires --init-checkpoint')
     init_path = args.init_checkpoint if args.init_checkpoint.is_absolute() else ROOT / args.init_checkpoint
     init_config = (ROOT / args.init_config if args.init_config is not None and not args.init_config.is_absolute()
                    else args.init_config)
@@ -435,9 +447,7 @@ def main():
     config.rope_scaling = None
     config.attn_res_checkpoint = True
     model = MiniRainVForCausalLM(config)
-    missing, unexpected = model.load_state_dict(init_state, strict=False)
-    if missing or unexpected:
-        raise ValueError(f'P1 weight mismatch; missing={missing[:12]}, unexpected={unexpected[:12]}')
+    model.load_state_dict(init_state, strict=True)
     del init_state
     model.to(device)
     frozen = freeze_vision(model)
@@ -553,12 +563,31 @@ def main():
     if resume_rng is not None:
         restore_rng(resume_rng)
 
+    # Each stage owns its own reproducible training and HF model configuration.
+    # Existing stage configs are never overwritten during an exact resume.
+    if rank == 0 and resume_path is None:
+        config.save_pretrained(args.output_dir)
+        run_config = serialized_args(args)
+        run_config.update({
+            'stage': f'p1_long_{args.tier}',
+            'source_checkpoint': str(init_path.resolve()),
+            'source_config': str(init_config.resolve()) if init_config is not None else None,
+            'data_bin': str((args.data_dir / f'p1_long_{args.tier}_text.bin').resolve()),
+            'data_idx': str((args.data_dir / f'p1_long_{args.tier}_text.idx').resolve()),
+            'max_position_embeddings': config.max_position_embeddings,
+            'rope_scaling': config.rope_scaling,
+        })
+        (args.output_dir / 'run_config.json').write_text(
+            json.dumps(run_config, indent=2, ensure_ascii=False), encoding='utf-8')
+    if distributed:
+        dist.barrier()
+
     if rank == 0:
         Logger(f'[Run] ranks={world}, micro_B={args.batch_size}, accum={args.grad_accum}, '
               f'steps/epoch={steps_per_epoch}, total_steps={max_steps}', flush=True)
         log = TrainingMetrics(
             args.output_dir, resume_step=global_step if resume_path is not None else None,
-            config_dir=experiment_dir,
+            config_dir=args.output_dir,
             metadata=dict(stage=f'p1_long_{args.tier}', args=serialized_args(args), model_config=config.to_dict(),
                           world_size=world, device=str(device), torch_version=str(torch.__version__),
                           trainable_params=sum(p.numel() for p in raw.parameters() if p.requires_grad),
@@ -744,5 +773,91 @@ def main():
         dist.destroy_process_group()
 
 
+
+def run_progressive():
+    """Reuse the original single-stage trainer in three clean processes."""
+    import subprocess
+
+    args = parse_args()
+    if args.resume is not None:
+        raise ValueError('Use --auto-resume (automatic per-stage) for progressive runs; '
+                         '--resume is only supported with --single-stage')
+    exp = (ROOT / project.TRAIN_OUTPUT_DIR / args.exp_name
+           if args.output_dir is None else args.output_dir)
+    if not exp.is_absolute():
+        exp = ROOT / exp
+    exp = exp.resolve()
+    p1_dir = exp / 'p1'
+
+    if args.init_checkpoint is None:
+        initial_ck = p1_dir / 'p1_final_weights.pth'
+        if not initial_ck.is_file():
+            initial_ck = p1_dir / 'latest.pt'
+        if not initial_ck.is_file():
+            raise FileNotFoundError(f'Cannot find P1 weights under {p1_dir}')
+    else:
+        initial_ck = args.init_checkpoint
+        if not initial_ck.is_absolute():
+            initial_ck = ROOT / initial_ck
+    initial_ck = initial_ck.resolve()
+
+    if args.init_config is not None:
+        initial_cfg = args.init_config
+        if not initial_cfg.is_absolute():
+            initial_cfg = ROOT / initial_cfg
+        initial_cfg = initial_cfg.resolve()
+    else:
+        initial_cfg = p1_dir / 'config.json' if (p1_dir / 'config.json').is_file() else None
+        if initial_cfg is None and (exp / 'config.json').is_file():
+            initial_cfg = exp / 'config.json'
+
+    # The first checkpoint may be a bare state_dict and needs a separately
+    # saved model config. A full .pt checkpoint has an embedded config.
+    for index, (tier, length) in enumerate(
+            [('8k', 8192), ('16k', 16384), ('32k', 32768)]):
+        stage = exp / f'p1_long_{tier}'
+        finished = stage / f'p1_long_{tier}_final_weights.pth'
+        if finished.is_file():
+            print(f'[SKIP] {tier}: {finished}', flush=True)
+            continue
+
+        if index == 0:
+            ck, cfg = initial_ck, initial_cfg
+        else:
+            prev = ('8k', '16k')[index - 1]
+            prev_stage = exp / f'p1_long_{prev}'
+            ck = prev_stage / f'p1_long_{prev}_final_weights.pth'
+            cfg = prev_stage / 'config.json'
+            if not ck.is_file() or not cfg.is_file():
+                raise FileNotFoundError(
+                    f'Previous stage is incomplete: {ck} / {cfg}')
+
+        # Retain all existing options; override only stage-specific arguments.
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            *sys.argv[1:],
+            '--single-stage', '--tier', tier,
+            '--max-seq-len', str(length),
+            '--init-checkpoint', str(ck),
+            '--auto-resume'
+        ]
+        if cfg is not None:
+            cmd += ['--init-config', str(cfg)]
+        stage_lr = {'8k': args.lr_8k, '16k': args.lr_16k, '32k': args.lr_32k}[tier]
+        cmd += ['--lr', str(stage_lr)]
+
+        print(f'[START] {tier}, seq_len={length}, peak_adamw_lr={stage_lr:g}, init={ck}', flush=True)
+        subprocess.run(cmd, cwd=ROOT, check=True)
+        if args.dry_run:
+            print('[DRY RUN] completed first-stage model/data validation only.', flush=True)
+            return
+        if not finished.is_file():
+            raise RuntimeError(f'Stage {tier} exited without final weights: {finished}')
+        print(f'[DONE] {tier}: {finished}', flush=True)
+
+    print('[DONE] All P1-Long stages finished.', flush=True)
+
+
 if __name__ == '__main__':
-    main()
+    main() if '--single-stage' in sys.argv else run_progressive()
+
