@@ -87,13 +87,42 @@ def check_gradients(model):
         raise RuntimeError(f'Missing/nonfinite gradients: {bad[:10]}')
 
 
+def accumulated_step(model, training, batches, optimizer, scaler, grad_clip,
+                     autocast_context, stage=None):
+    """One update: average equal-sized microbatch losses, clip/update once."""
+    if stage is None:
+        stage = lambda name, operation: operation()
+    stage('zero_grad', lambda: model.zero_grad(set_to_none=True))
+    mean_loss = None
+    for ids, mask, labels in batches:
+        def forward():
+            with autocast_context():
+                return training(ids, mask, labels)
+        loss = stage('forward_loss', forward)
+        stage('backward', lambda: scaler.scale(loss / len(batches)).backward())
+        detached = loss.detach() / len(batches)
+        mean_loss = detached if mean_loss is None else mean_loss + detached
+    if optimizer is not None:
+        def clip():
+            scaler.unscale_(optimizer)
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        stage('unscale_clip', clip)
+        def update():
+            scaler.step(optimizer)
+            scaler.update()
+        stage('optimizer', update)
+    return mean_loss
+
+
 def main():
     p = argparse.ArgumentParser(description='MiniRain 纯文本训练性能基准（3 GDN : 1 GQA）')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--dtype', choices=list(DTYPES), default='bf16')
-    p.add_argument('--iters', type=int, default=10)
-    p.add_argument('--warmup', type=int, default=3)
+    p.add_argument('--iters', type=int, default=10, help='计时的完整累积更新步数')
+    p.add_argument('--warmup', type=int, default=3, help='预热的完整累积更新步数')
     p.add_argument('--train-batch', type=int, default=1)
+    p.add_argument('--grad-accum', type=int, default=1, help='每次更新累积的微批次数')
     p.add_argument('--train-seq', type=int, default=4096)
     p.add_argument('--hidden', type=int, default=1024)
     p.add_argument('--layers', type=int, default=24)
@@ -119,8 +148,8 @@ def main():
     args = p.parse_args()
     if args.profile_iters < 0:
         p.error('--profile-iters 须为非负数')
-    if min(args.iters, args.warmup, args.train_batch, args.layers, args.loss_chunks) < 1 or args.train_seq < 2:
-        p.error('iters/warmup/batch/layers/chunks 须为正，seq 至少为 2')
+    if min(args.iters, args.warmup, args.train_batch, args.grad_accum, args.layers, args.loss_chunks) < 1 or args.train_seq < 2:
+        p.error('iters/warmup/batch/grad-accum/layers/chunks 须为正，seq 至少为 2')
     if args.heads < 1 or args.kv_heads < 1 or args.heads % args.kv_heads or args.hidden <= 0 or args.hidden % (2 * args.heads):
         p.error('hidden 须能被 2*heads 整除，heads 须能被 kv-heads 整除，均须为正')
     if args.block_size < 0 or args.block_size % 2 or (args.intermediate_size is not None and args.intermediate_size <= 0):
@@ -158,12 +187,15 @@ def main():
         torch._dynamo.config.recompile_limit = max(64, torch._dynamo.config.recompile_limit)
         training = torch.compile(training, mode=args.mode)
     scaler = torch.amp.GradScaler('cuda', enabled=args.dtype == 'fp16')
-    ids = torch.randint(100, config.vocab_size, (args.train_batch, args.train_seq), device=device)
-    ids[:, 0] = config.bos_token_id
-    mask = torch.ones_like(ids) if args.attention_mask == 'ones' else None
-    labels = ids.clone()
+    batches = []
+    for _ in range(args.grad_accum):
+        ids = torch.randint(100, config.vocab_size, (args.train_batch, args.train_seq), device=device)
+        ids[:, 0] = config.bos_token_id
+        mask = torch.ones_like(ids) if args.attention_mask == 'ones' else None
+        batches.append((ids, mask, ids.clone()))
     if not args.quiet:
         print(f'[bench] MiniRain {args.train_batch}x{args.train_seq}, optimizer={args.optimizer}, '
+              f'accum={args.grad_accum}, effective_batch={args.train_batch * args.grad_accum}, '
               f'loss={args.loss_backend}, mask={args.attention_mask}, compile={args.compile}; warmup={args.warmup}', flush=True)
 
     def step(profile=None):
@@ -176,24 +208,10 @@ def main():
             torch.cuda.synchronize(device)
             profile[name] = profile.get(name, 0.) + (time.perf_counter() - start) * 1000
             return value
-        stage('zero_grad', lambda: model.zero_grad(set_to_none=True))
-        def forward():
-            context = torch.autocast('cuda', dtype=DTYPES[args.dtype]) if args.dtype != 'fp32' else nullcontext()
-            with context:
-                return training(ids, mask, labels)
-        loss = stage('forward_loss', forward)
-        stage('backward', lambda: scaler.scale(loss).backward())
-        if optimizer is not None:
-            def clip():
-                scaler.unscale_(optimizer)
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            stage('unscale_clip', clip)
-            def update():
-                scaler.step(optimizer)
-                scaler.update()
-            stage('optimizer', update)
-        return loss.detach()
+        def autocast_context():
+            return torch.autocast('cuda', dtype=DTYPES[args.dtype]) if args.dtype != 'fp32' else nullcontext()
+        return accumulated_step(model, training, batches, optimizer, scaler,
+                                args.grad_clip, autocast_context, stage)
 
     torch.cuda.synchronize(device)
     start = time.perf_counter()
@@ -225,8 +243,13 @@ def main():
                                             else args.optimizer),
                   device=torch.cuda.get_device_name(device), torch_version=torch.__version__,
                   warmup_seconds=warmup_seconds, milliseconds_per_step=ms,
-                  tokens_per_second=args.train_batch * args.train_seq * 1000 / ms,
-                  predicted_tokens_per_second=args.train_batch * (args.train_seq - 1) * 1000 / ms,
+                  milliseconds_per_microbatch_amortized=ms / args.grad_accum,
+                  effective_batch_size=args.train_batch * args.grad_accum,
+                  input_tokens_per_update=args.train_batch * args.train_seq * args.grad_accum,
+                  measured_microbatches=args.iters * args.grad_accum,
+                  measured_optimizer_updates=args.iters if optimizer is not None else 0,
+                  tokens_per_second=args.train_batch * args.train_seq * args.grad_accum * 1000 / ms,
+                  predicted_tokens_per_second=args.train_batch * (args.train_seq - 1) * args.grad_accum * 1000 / ms,
                   peak_allocated_mib=peak_allocated, peak_reserved_mib=peak_reserved,
                   resident_allocated_mib=torch.cuda.memory_allocated(device) / 2**20,
                   final_loss=loss.item(), gradients_finite=True)
@@ -238,12 +261,14 @@ def main():
         if not torch.isfinite(diagnostic_loss):
             raise RuntimeError('Nonfinite diagnostic loss')
         result['synchronized_phase_ms'] = {name: value / args.profile_iters for name, value in profile.items()}
+        result['profile_unit'] = 'accumulated_update_step'
         print(f'[profile: separate synchronized diagnostic] {result["synchronized_phase_ms"]}')
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     if not args.quiet:
         print(f'MiniRain ({result["parameters"]:,} params), {result["device"]}, {args.dtype}, compile={args.compile}')
         print(f'Warmup/compile: {warmup_seconds:.2f}s (excluded from timing)')
-        print(f'{ms:.2f} ms/step | {result["tokens_per_second"]:,.0f} input tok/s | '
+        print(f'{ms:.2f} ms/update | {ms / args.grad_accum:.2f} ms/micro (amortized) | '
+              f'{result["tokens_per_second"]:,.0f} input tok/s | '
               f'peak allocated={peak_allocated:.1f} MiB | peak reserved={peak_reserved:.1f} MiB | loss={loss.item():.4f}')
     print(f'[result] {path}')
     print(f'[log] {txt_path}')
