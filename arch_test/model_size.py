@@ -42,7 +42,7 @@ def main():
     parser.add_argument('--seq_len', default=4096, type=int, help="FLOPs 估算的完整序列长度")
     parser.add_argument('--json_output', type=Path, default=None)
     parser.add_argument('--num_hidden_layers', default=24, type=int, help="Transformer 层数量")
-    parser.add_argument('--block_size', default=4, type=int, help="残差块大小，以注意力/FFN 子层计数；0 表示不分块")
+    parser.add_argument('--block_size', default=6, type=int, help="残差块大小，以注意力/FFN 子层计数；0 表示不分块")
     args = parser.parse_args()
     if args.n_attn_heads <= 0 or args.n_key_value_heads <= 0 or args.n_attn_heads % args.n_key_value_heads:
         parser.error('注意力头数须为正，且 n_attn_heads 能被 n_key_value_heads 整除')

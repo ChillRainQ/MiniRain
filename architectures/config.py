@@ -67,7 +67,6 @@ class RainConfig(PretrainedConfig):
             "beta_slow": 1,
             "factor": 8,
             "original_max_position_embeddings": 8192,
-            "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None)
         # attn_res
