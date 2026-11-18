@@ -1,118 +1,99 @@
-import os
-import sys
+"""统计 MiniRain 纯文本模型参数量，无需加载权重或 tokenizer。"""
+import argparse
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import project
-import argparse
-from train.train_util import init_model
-
-
-from torch import nn
+import torch
 
 from architectures.config import RainConfig
-from components.attention import MoTAttention, MoTGroupQueryAttention
-from components.mlp import MoTFFN
+from architectures.rain import MiniRainForCausalLM
+from components.attention import GatedDeltaNetAttention, GroupQueryAttention
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniRain Pretraining")
-    parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=16, type=int, help="隐藏层数量")
-    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--use_mot', default=0, type=int, choices=[0, 1], help="是否使用LOOP架构（0=否，1=是）")
-    parser.add_argument('--use_adaptive', default=1, type=int, choices=[0, 1], help="是否使用Adaptive（0=否，1=是）")
-    parser.add_argument('--loop_start', type=int, default=0, help="Loop起始层")
-    parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
-    parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
-    parser.add_argument("--block_size", default=4, type=int, help="块大小")
 
+def estimate_flops(model, seq_len):
+    """Leading logical FLOPs, MAC=2; training ~3x forward, without recomputation.
+
+    Includes all Linear projections (including tied LM head), short convolutions,
+    causal GQA and recurrent-equivalent GDN. Excludes norms, nonlinearities,
+    AttnRes aggregation, CE, optimizer and chunk-kernel/padding overhead.
+    This is an analytical estimate, not a profiler measurement.
+    """
+    linear = 2 * sum(m.weight.numel() for m in model.modules() if isinstance(m, torch.nn.Linear))
+    conv = recurrent = attention = 0
+    for layer in model.model.layers:
+        if isinstance(layer.attn, GatedDeltaNetAttention):
+            gdn = layer.attn.gdn
+            conv += 2 * sum(getattr(gdn, name).weight.numel()
+                            for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'))
+            # State decay + prediction + rank-one update + readout: (1+2+2+2) HKV.
+            recurrent += 7 * gdn.num_heads * gdn.head_k_dim * gdn.head_v_dim
+        elif isinstance(layer.attn, GroupQueryAttention):
+            attention += 2 * model.config.hidden_size * (seq_len + 1)
+    forward = linear + conv + recurrent + attention
+    return dict(linear=linear, short_conv=conv, gdn_recurrent_equivalent=recurrent,
+                causal_gqa=attention, forward_per_token=forward,
+                training_per_token_estimate=3 * forward)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MiniRain 纯文本参数量统计（默认采用 20B token 推荐结构）")
+    parser.add_argument('--hidden_size', default=1024, type=int, help="隐藏层维度")
+    parser.add_argument('--n_attn_heads', default=8, type=int)
+    parser.add_argument('--n_key_value_heads', default=4, type=int)
+    parser.add_argument('--intermediate_size', default=None, type=int, help="默认按当前模型的 pi 倍规则取整")
+    parser.add_argument('--seq_len', default=4096, type=int, help="FLOPs 估算的完整序列长度")
+    parser.add_argument('--json_output', type=Path, default=None)
+    parser.add_argument('--num_hidden_layers', default=24, type=int, help="Transformer 层数量")
+    parser.add_argument('--block_size', default=4, type=int, help="残差块大小，以注意力/FFN 子层计数；0 表示不分块")
     args = parser.parse_args()
+    if args.n_attn_heads <= 0 or args.n_key_value_heads <= 0 or args.n_attn_heads % args.n_key_value_heads:
+        parser.error('注意力头数须为正，且 n_attn_heads 能被 n_key_value_heads 整除')
+    if args.hidden_size <= 0 or args.hidden_size % (2 * args.n_attn_heads):
+        parser.error('--hidden_size 须能被 2 * n_attn_heads 整除（RoPE head_dim 为偶数）')
+    if args.seq_len <= 0 or (args.intermediate_size is not None and args.intermediate_size <= 0):
+        parser.error('序列长度和 FFN 中间维度须为正数')
+    if args.num_hidden_layers <= 0:
+        parser.error('--num_hidden_layers 须为正整数')
+    if args.block_size < 0 or args.block_size % 2:
+        parser.error('--block_size 须为 0 或正偶数')
 
-    config = RainConfig(hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
-                        use_moe=bool(args.use_moe), use_mot=bool(args.use_mot),
-                        use_adaptive=bool(args.use_adaptive),
-                        block_size=args.block_size,
-                        block_attn_res=bool(args.use_block_attn_res),
-                        full_attn_res=bool(args.use_full_attn_res))
+    extra = {} if args.intermediate_size is None else dict(intermediate_size=args.intermediate_size)
+    config = RainConfig(
+        hidden_size=args.hidden_size, n_hidden_layers=args.num_hidden_layers,
+        n_attn_heads=args.n_attn_heads, n_key_value_heads=args.n_key_value_heads,
+        vocab_size=16384, tie_word_embeddings=True,
+        max_position_embeddings=args.seq_len, block_size=args.block_size, **extra)
+    # 参数形状即可确定参数量；meta 避免分配完整权重或占用 GPU。
+    with torch.device('meta'):
+        model = MiniRainForCausalLM(config)
 
-    print(config)
-    model, tokenizer = init_model(config, from_weight=args.from_weight, tokenizer_path=project.TOKENIZER_PATH, model_type='')
-    print(f"Model Type: {model.name}")
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    gqa_layers = config.n_hidden_layers // 4
+    print(f'Model Type: {model.name} ({type(model).__name__})')
+    print(f'Architecture: layers={config.n_hidden_layers}, hidden={config.hidden_size}, '
+          f'FFN={config.intermediate_size}, heads={config.n_attn_heads}, '
+          f'kv_heads={config.n_key_value_heads}, block_size={config.block_size}')
+    print(f'Attention Layers: GDN={config.n_hidden_layers - gqa_layers}, GQA={gqa_layers}')
+    # parameters() 会去重，绑定的 embedding/lm_head 仅计一次。
+    print(f'[ScalingLaw] Model Params: {total / 1e6:.2f}M ({total:,})')
+    print(f'[ScalingLaw] Trainable Params: {trainable / 1e6:.2f}M ({trainable:,})')
+    flops = estimate_flops(model, args.seq_len)
+    print(f'[FLOPs estimate] T={args.seq_len}, forward={flops["forward_per_token"] / 1e9:.4f} GF/token, '
+          f'training~{flops["training_per_token_estimate"] / 1e9:.4f} GF/token (logical, excludes chunk overhead/recompute)')
+    if args.json_output is not None:
+        result = dict(hidden_size=config.hidden_size, num_hidden_layers=config.n_hidden_layers,
+                      n_attn_heads=config.n_attn_heads, n_key_value_heads=config.n_key_value_heads,
+                      intermediate_size=config.intermediate_size, block_size=config.block_size,
+                      seq_len=args.seq_len, parameters=total, trainable_parameters=trainable,
+                      flops=flops)
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    # 模态编号约定：0=文本 1=图像，与 MoTFFN 的 mlp_t/mlp_v、modality_mask 语义一致
-    VISION_EXPERT = 1
 
-    def count_params(module, trainable_only: bool = False):
-        """trainable_only=True 只统计 requires_grad 的参数；默认统计全部（冻结的预训练骨干也算体积）"""
-        if module is None:
-            return 0
-        return sum(p.numel() for p in module.parameters() if p.requires_grad or not trainable_only)
-
-    def pair(module):
-        """返回 (总参数, 可训练参数)"""
-        return count_params(module), count_params(module, trainable_only=True)
-
-    def fmt(total: int, trainable: int) -> str:
-        text = f"{total/1e6:.2f}M"
-        if total != trainable:
-            text += f" (可训练 {trainable/1e6:.2f}M)"
-        return text
-
-    def vision_attn(module):
-        """
-        取注意力里属于视觉专家的参数，返回 (总参数, 可训练参数)。
-        MoTGroupQueryAttention: wq/wk/wv/wo 均为 ModuleList[n_modalities]
-        MoTAttention:          local_experts_wq/wk/wv/wo + 逐模态 norm
-        普通 GQA 各模态共享同一套投影，没有模态专属参数 → (0, 0)
-        """
-        if isinstance(module, MoTGroupQueryAttention):
-            names = ("wq", "wk", "wv", "wo")
-        elif isinstance(module, MoTAttention):
-            names = ("local_experts_wq", "local_experts_wk", "local_experts_wv", "local_experts_wo",
-                     "local_experts_q_normalization", "local_experts_k_normalization",
-                     "local_experts_attention_norm")
-        else:
-            return 0, 0
-        total = trainable = 0
-        for name in names:
-            experts = getattr(module, name, None)  # q/k norm 只在 qk_normalization=True 时存在
-            if not isinstance(experts, nn.ModuleList) or len(experts) <= VISION_EXPERT:
-                continue
-            t, r = pair(experts[VISION_EXPERT])
-            total += t
-            trainable += r
-        return total, trainable
-
-    backbone = model.model
-    # 视觉 stem：兼容新旧命名 patch_embed / patch_embd，也兼容 ConvStem / ViTStem
-    patch_embed = getattr(backbone, "patch_embed", None) or getattr(backbone, "patch_embd", None)
-    layers = getattr(backbone, "layers", [])
-
-    vision_stem = pair(patch_embed)
-    vision_attn_pair = [0, 0]
-    # MoT 架构下视觉 FFN 为每层 MoTFFN.mlp_v；非 MoT/非视觉模型没有独立视觉 FFN
-    vision_ffn = [0, 0]
-    for layer in layers:
-        t, r = vision_attn(getattr(layer, "attn", None))
-        vision_attn_pair[0] += t
-        vision_attn_pair[1] += r
-        mlp = getattr(layer, "mlp", None)
-        if isinstance(mlp, MoTFFN):
-            t, r = pair(mlp.mlp_v)
-            vision_ffn[0] += t
-            vision_ffn[1] += r
-
-    vision_total = (vision_stem[0] + vision_attn_pair[0] + vision_ffn[0],
-                    vision_stem[1] + vision_attn_pair[1] + vision_ffn[1])
-    model_total = pair(model)
-    print(f'[ScalingLaw] Vision Stem Params: {fmt(*vision_stem)}')
-    print(f'[ScalingLaw] Vision Attn Params: {fmt(*vision_attn_pair)}')
-    print(f'[ScalingLaw] Vision FFN  Params: {fmt(*vision_ffn)}')
-    print(f'[ScalingLaw] Vision Total Params: {fmt(*vision_total)}  '
-          f'占比 {vision_total[0] / max(model_total[0], 1) * 100:.1f}%')
-    print(f'[ScalingLaw] Model Params: {fmt(*model_total)}')
+if __name__ == '__main__':
+    main()

@@ -4,7 +4,6 @@
 配置（model_size.py 默认值）：
     model_type='v'  hidden_size=1024  n_hidden_layers=20
     use_mot=True  use_moe=False  vision_ffn_scale=4  block_size=4
-    block_attn_res=False  full_attn_res=False
 
 整个脚本只构建/编译一次模型，所有 section 共用（含参数、compile cache）。
 
@@ -53,8 +52,6 @@ BASE_CFG = dict(
     vision_ffn_scale=4,
     block_size=4,
     model_type="v",
-    block_attn_res=False,
-    full_attn_res=False,
 )
 
 

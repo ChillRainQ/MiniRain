@@ -71,7 +71,9 @@ class TorchRMSNorm(nn.Module):
         self.dim = args.dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (HAS_TRITON and x.is_cuda and not x.requires_grad
+        # The raw Triton kernel has no autograd rule. A frozen input can still
+        # require gradients for this module's trainable scale parameter.
+        if (HAS_TRITON and x.is_cuda and not torch.is_grad_enabled()
                 and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
                 and x.shape[-1] == self.dim
                 and self.weight.is_cuda

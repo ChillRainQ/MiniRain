@@ -9,7 +9,7 @@ model_type: dict[int, str] = {
 
 class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
-                 use_moe=False, use_mot=False, use_adaptive=False,  **kwargs):
+                 use_moe=False, use_mot=False, use_adaptive=False, **kwargs):
         # 兼容早期配置：旧版只序列化 type_id，没有持久化 use_mot/use_moe。
         # 必须在 super().__init__ 前读取，否则重新加载 MoT 配置会静默退化成 Dense。
         saved_type_id = int(kwargs.get("type_id", 0) or 0)
@@ -68,15 +68,9 @@ class RainConfig(PretrainedConfig):
             "type": "yarn"
         } if self.inference_rope_scaling else None
         # attn_res
-        # self.full_attn_res = bool(kwargs.get("full_attn_res", False))
-        # self.block_attn_res = bool(kwargs.get("block_attn_res", False))
         self.block_size = int(kwargs.get("block_size", 0))
         # 聚合段梯度检查点：反向重算 norm/加权和，省掉 stack 缓冲的持有（长上下文训练省显存）
         self.attn_res_checkpoint = bool(kwargs.get("attn_res_checkpoint", False))
-        # FWP：prompt 条件的低秩慢权重更新；0=关闭。覆盖 Dense 与 MoT 文本专家，不含视觉专家/MoE
-        self.fwp_rank = int(kwargs.get("fwp_rank", 0))
-        self.fwp_hidden_size = int(kwargs.get("fwp_hidden_size", 128))
-        self.fwp_update_scale = float(kwargs.get("fwp_update_scale", 1.0))
         self.patch_size = int(kwargs.get("patch_size", 16))
         # vision
         self.vision_ffn_scale: int = int(kwargs.get("vision_ffn_scale", 1))

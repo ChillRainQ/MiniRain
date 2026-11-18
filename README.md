@@ -1,5 +1,7 @@
 # MiniRain-Vision
 
+纯文本版本位于 `architectures/rain.py`：采用每组 **3 层 GDN + 1 层 GQA**、普通 SwiGLU 和 BlockAttnRes；GQA 保留 1D RoPE。除自定义 `generate()` 外，也可调用 `model.generate_hf(**tokenizer(text, return_tensors="pt").to(device), max_new_tokens=128, do_sample=False)` 使用 Transformers 生成流程。结构检查、测试和 20B token 配置建议见 [MINIRAIN_TEXT_REVIEW.md](MINIRAIN_TEXT_REVIEW.md)。
+
 MiniRain-Vision 是一个从零实现的轻量级视觉语言模型（VLM）。其核心 **MiniRainVLM** 采用**单流统一架构**：不使用独立的视觉编码器 + 跨注意力，而是将图像 patch 作为普通 token 直接注入语言模型的同一序列，由一个 Transformer 主干统一处理文本与图像。
 
 ## 模型架构
@@ -62,6 +64,9 @@ Q/K/V/O 四个投影按模态解耦为文本/图像两套 expert，注意力计�
 ### 块注意力残差（BlockAttnRes）
 
 块内（`block_size//2` 层为一组）保留经典残差；块间用可学习聚合替代恒等捷径——每层的 attn/mlp 输入 = 对所有前序块尾（含嵌入输出）与当前输入的加权混合，权重由 `attn_res_query` 打分产生（零初始化时等价于均匀平均）。
+
+末端通过独立的 `final_attn_res` 聚合全部历史块和最后一个块，再执行最终 RMSNorm。
+这是模型内部的结构修复，无需增加训练参数。详见 [修复说明](BLOCK_ATTN_RES_FIX.md)。
 
 ### 其余组件
 

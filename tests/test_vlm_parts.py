@@ -17,7 +17,7 @@ from components.norm import RMSNorm, NormArgs
 from components.attention import (apply_rotary_pos_emb, repeat_kv,
                                   GroupQueryAttention, MoTGroupQueryAttention, AttentionArgs)
 from components.block import BlockAttnRes, BlockAttnResBlock, FlushBlockAttnResBlock
-from components.mlp import SwiGLU, SwiGLUWithFWP, LosslessMoE, MLPArgs, MoTFFN
+from components.mlp import SwiGLU, LosslessMoE, MLPArgs, MoTFFN
 
 _p = argparse.ArgumentParser(description="MiniRainVLM 部件级测试")
 add_device_args(_p)
@@ -225,75 +225,20 @@ sg(xm).sum().backward()
 check("SwiGLU 三个权重都有梯度",
       all(w.grad is not None and w.grad.abs().sum() > 0 for w in [sg.gate.weight, sg.up.weight, sg.down.weight]))
 
-# FWP：prompt -> 混合系数 -> 两次低秩乘积，不物化完整 ΔW
-cfg_fwp = RainConfig(hidden_size=D, fwp_rank=2, fwp_hidden_size=32)
-args_fwp = MLPArgs(hidden_size=D, intermediate_size=64, bias=False)
-check("FWP 默认关：SwiGLU 不内置 FWP", SwiGLU(args_fwp, config=cfg_fwp).fwp is None)
-check("未显式 opt-in 时 SwiGLUWithFWP 也不创建 FWP",
-      SwiGLUWithFWP(args_fwp, config=cfg_fwp).fwp is None)
-check("fwp_rank=0 时 SwiGLUWithFWP 退化为普通 SwiGLU",
-      SwiGLUWithFWP(args_fwp, config=RainConfig(hidden_size=D), fwp=True).fwp is None)
-sg_fwp = SwiGLUWithFWP(args_fwp, config=cfg_fwp, fwp=True).to(DEVICE)
-ctx = torch.randn(2, D, device=DEVICE)
-ref = sg_fwp.down(F.silu(sg_fwp.gate(xm)) * sg_fwp.up(xm))
-check("FWP 零初始化时输出与原 SwiGLU 完全一致", torch.equal(sg_fwp(xm, fwp_context=ctx), ref))
-with torch.no_grad():
-    nn.init.normal_(sg_fwp.fwp.controller[-1].weight, std=0.02)
-alphas = sg_fwp.fwp(ctx)
-check("FWP 三个 α 均为 [B,rank]", all(a.shape == (2, 2) for a in alphas))
-check("不同 prompt 生成不同更新", not torch.equal(alphas[0][0], alphas[0][1]))
-sg_fwp.train()
-out_fwp = sg_fwp(xm, fwp_context=ctx)
-def merged_ref(name, x, linear, alpha):
-    delta = torch.einsum("br,ro,ri->boi", alpha,
-                         sg_fwp.fwp.u[name], sg_fwp.fwp.v[name]) * sg_fwp.fwp.update_scale
-    return torch.einsum("bti,boi->bto", x, linear.weight.unsqueeze(0) + delta)
-g = merged_ref("gate", xm, sg_fwp.gate, alphas[0])
-u = merged_ref("up", xm, sg_fwp.up, alphas[1])
-ref_fwp = merged_ref("down", F.silu(g) * u, sg_fwp.down, alphas[2])
-check("FWP 低秩计算与显式 W+ΔW 等价", torch.allclose(out_fwp, ref_fwp, atol=1e-6))
-out_fwp.square().mean().backward()
-check("FWP controller 可反向学习",
-      sg_fwp.fwp.controller[-1].weight.grad is not None
-      and sg_fwp.fwp.controller[-1].weight.grad.abs().sum() > 0)
-check("FWP 更新基可反向学习",
-      all(p.grad is not None and p.grad.abs().sum() > 0
-          for p in list(sg_fwp.fwp.u.values()) + list(sg_fwp.fwp.v.values())))
-sg_fwp.eval()
-with torch.no_grad():
-    prefill = sg_fwp(xm, fwp_context=ctx)
-    decode = sg_fwp(xm[:, :1])
-    decode_ref = sg_fwp(xm[:, :1], fwp_context=ctx)
-check("FWP decode 复用 prefill 更新", torch.equal(decode, decode_ref))
-check("FWP 运行时 α 不进入 state_dict", not any("alpha_cache" in k for k in sg_fwp.state_dict()))
-sg_fwp.fwp.clear()
-try:
-    sg_fwp(xm[:, :1])
-    cache_guard = False
-except RuntimeError:
-    cache_guard = True
-check("FWP 清空状态后禁止无 prefill decode", cache_guard)
-
-mot_cfg = RainConfig(hidden_size=D, use_mot=True, vision_ffn_scale=2, fwp_rank=2, fwp_hidden_size=32)
 mot = MoTFFN(2, MLPArgs(hidden_size=D, intermediate_size=64, bias=False),
-             NormArgs(dim=D, eps=1e-6), mot_cfg).to(DEVICE).eval()
-with torch.no_grad():
-    nn.init.normal_(mot.mlp_t.fwp.controller[-1].weight, std=0.02)
-check("MoT 视觉专家不创建 FWP", mot.mlp_v.fwp is None)
-x_mot = torch.randn(2, 4, D, device=DEVICE)
-img_idx_mot = torch.tensor([3], device=DEVICE)  # 仅样本 0 的最后一个 token 走图像专家
-ctx_a = torch.randn(2, D, device=DEVICE)
-ctx_b = ctx_a.clone()
-ctx_b[1] = ctx_b[1] + 1.0
-ctx_c = ctx_a.clone()
-ctx_c[0] = ctx_c[0] + 1.0
-with torch.no_grad():
-    mot_a = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_a)
-    mot_b = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_b)
-    mot_c = mot(x_mot, img_idx=img_idx_mot, fwp_context=ctx_c)
-check("MoT FWP 修改样本1不影响样本0", torch.equal(mot_a[0], mot_b[0]))
-check("MoT FWP 文本专家响应自身 prompt", not torch.equal(mot_a[1], mot_b[1]))
-check("MoT 图像专家不受 prompt 更新影响", torch.equal(mot_a[0, -1], mot_c[0, -1]))
+             NormArgs(dim=D, eps=1e-6), RainConfig(hidden_size=D, use_mot=True, vision_ffn_scale=2)).to(DEVICE)
+mixed = torch.randn(2, 5, D, device=DEVICE)
+image_idx = torch.tensor([2, 7], device=DEVICE)
+text_mask = torch.ones(10, dtype=torch.bool, device=DEVICE)
+text_mask[image_idx] = False
+mixed_out = mot(mixed, img_idx=image_idx).reshape(-1, D)
+check("MoT 文本位置使用普通 SwiGLU", torch.allclose(
+    mixed_out[text_mask], mot.mlp_t(mot.norm_t(mixed.reshape(-1, D)[text_mask])), atol=1e-6))
+check("MoT 图像位置使用普通 SwiGLU", torch.allclose(
+    mixed_out[image_idx], mot.mlp_v(mot.norm_v(mixed.reshape(-1, D)[image_idx])), atol=1e-6))
+mixed_out.square().mean().backward()
+check("MoT 两个专家均收到梯度", all(expert.down.weight.grad is not None
+      and expert.down.weight.grad.abs().sum() > 0 for expert in (mot.mlp_t, mot.mlp_v)))
 
 moe = LosslessMoE(dim=D, intermediate_size=64, num_experts=4, top_k=2, num_shared_experts=1, aux_scale=0.01).to(DEVICE).eval()
 with torch.no_grad():
@@ -432,83 +377,6 @@ with torch.no_grad():
 check("state_dict 往返后输出一致", torch.allclose(o.logits, o2.logits, atol=1e-6),
       f"max diff {(o.logits - o2.logits).abs().max():.2e}")
 
-# FWP 整机：显式 prompt 边界、端到端梯度、generate prefill/decode 状态
-cfg_fwp_model = RainConfig(hidden_size=D, n_hidden_layers=2, n_attn_heads=NH,
-                           n_key_value_heads=NKV, block_size=2, fwp_rank=2, fwp_hidden_size=32)
-m_fwp = MiniRainVForCausalLM(cfg_fwp_model).to(DEVICE).train()
-try:
-    m_fwp(input_ids=ids9, labels=lab)
-    prompt_guard = False
-except ValueError as exc:
-    prompt_guard = "prompt_mask" in str(exc)
-check("FWP 训练缺少 prompt_mask 时显式报错", prompt_guard)
-prompt_mask9 = torch.zeros_like(ids9)
-prompt_mask9[:, :4] = 1
-o_fwp = m_fwp(input_ids=ids9, labels=lab, prompt_mask=prompt_mask9)
-o_fwp.loss.backward()
-fwp_controller_params = [p for n, p in m_fwp.named_parameters() if "fwp.controller" in n]
-check("FWP 整机 loss 反向到全部 controller",
-      len(fwp_controller_params) > 0
-      and all(p.grad is not None for p in fwp_controller_params))
-m_fwp.eval()
-with torch.no_grad():
-    for name, param in m_fwp.named_parameters():
-        if name.endswith("fwp.controller.2.weight"):
-            nn.init.normal_(param, std=0.02)
-    generated_fwp = m_fwp.generate_hf(input_ids=ids9, max_new_tokens=2, do_sample=False)
-check("FWP generate_hf 正常生成", generated_fwp.shape == (2, 11))
-fwp_modules = [m for m in m_fwp.model.modules() if m.__class__.__name__ == "FastWeightProgrammer"]
-check("FWP prefill 后每层都有运行时更新", len(fwp_modules) > 0
-      and all(m._alpha_cache is not None for m in fwp_modules))
-with torch.no_grad():
-    turn1 = m_fwp.generate(input_ids=ids9, max_new_tokens=1, do_sample=False, return_kv=True)
-    alpha_turn1 = [d.clone() for d in fwp_modules[0]._alpha_cache]
-    turn2_ids = torch.cat([turn1["generated_ids"], ids9[:, :2]], dim=1)
-    past_len = turn1["past_kv"][0][0].shape[1]
-    turn2_context = m_fwp.model.embed(turn2_ids[:, past_len:]).mean(dim=1)
-    turn2_increment = fwp_modules[0](turn2_context)
-    turn2 = m_fwp.generate(input_ids=turn2_ids, past_key_values=turn1["past_kv"],
-                           max_new_tokens=1, do_sample=False, return_kv=True)
-    alpha_turn2 = [d.clone() for d in fwp_modules[0]._alpha_cache]
-    turn3_ids = torch.cat([turn2["generated_ids"], ids9[:, 2:4]], dim=1)
-    m_fwp.generate_hf(input_ids=turn3_ids, past_key_values=turn2["past_kv"],
-                      max_new_tokens=1, do_sample=False)
-check("FWP 手写 generate 多轮快权 = 旧快权 + 本轮增量",
-      all(torch.allclose(new, old + increment, atol=1e-6)
-          for old, new, increment in zip(alpha_turn1, alpha_turn2, turn2_increment)),
-      f"max diff {max((new - old - increment).abs().max().item() for old, new, increment in zip(alpha_turn1, alpha_turn2, turn2_increment)):.2e}")
-check("FWP generate_hf 带 KV 时根据新增 prompt 更新快权",
-      all(not torch.equal(old, new) for old, new in zip(alpha_turn2, fwp_modules[0]._alpha_cache)))
-m_fwp.model.reset_fwp()
-check("FWP 新生成/reset 清空全部序列状态", all(m._alpha_cache is None for m in fwp_modules))
-
-# 图像 prompt：只更新文本专家，且运行时只缓存低秩系数
-cfg_fwp_mot = RainConfig(hidden_size=D, n_hidden_layers=2, n_attn_heads=NH,
-                         n_key_value_heads=NKV, block_size=2, use_mot=True,
-                         vision_ffn_scale=2, fwp_rank=2, fwp_hidden_size=32)
-m_fwp_mot = MiniRainVForCausalLM(cfg_fwp_mot).to(DEVICE).eval()
-with torch.no_grad():
-    for name, param in m_fwp_mot.named_parameters():
-        if name.endswith("fwp.controller.2.weight"):
-            nn.init.normal_(param, std=0.02)
-    ids_img = ids[:1]
-    pos_img = torch.arange(ids_img.shape[1], device=DEVICE).view(1, -1, 1).expand(-1, -1, 2)
-    img_turn1 = m_fwp_mot.generate(input_ids=ids_img, pixel_values=[img], positions=pos_img,
-                                   max_new_tokens=1, do_sample=False, return_kv=True)
-mot_fwps = [layer.mlp.mlp_t.fwp for layer in m_fwp_mot.model.layers]
-check("FWP 图像 prefill 只更新文本专家",
-      all(fwp._alpha_cache is not None for fwp in mot_fwps)
-      and all(layer.mlp.mlp_v.fwp is None for layer in m_fwp_mot.model.layers))
-check("FWP 运行时缓存仅为 [B,rank] 系数",
-      all(alpha.shape == (1, cfg_fwp_mot.fwp_rank)
-          for fwp in mot_fwps for alpha in fwp._alpha_cache))
-with torch.no_grad():
-    text_before = [d.clone() for d in mot_fwps[0]._alpha_cache]
-    img_turn2_ids = torch.cat([img_turn1["generated_ids"], ids9[:1, :2]], dim=1)
-    m_fwp_mot.generate(input_ids=img_turn2_ids, past_key_values=img_turn1["past_kv"],
-                       max_new_tokens=1, do_sample=False)
-check("FWP 图像会话的后续文本轮累加文本专家快权",
-      all(not torch.equal(old, new) for old, new in zip(text_before, mot_fwps[0]._alpha_cache)))
 # MoE 整机
 m_moe = MiniRainVForCausalLM(cfg_moe).to(DEVICE).eval()
 with torch.no_grad():
@@ -557,7 +425,14 @@ def count_history(block_size, n_layers=20):
     exp_attn = [0] * n_layers if step == 0 else [(l + step - 1) // step for l in range(n_layers)]
     exp_mlp = [0] * n_layers if step == 0 else [l // step + 1 for l in range(n_layers)]
     n_flush = 0 if step == 0 else sum(l % step == 0 for l in range(n_layers))
-    attn_hist, mlp_hist = hist_counts[0::2], hist_counts[1::2]
+    # The final readout is an additional call after the decoder layers.
+    layer_counts = hist_counts[:2 * n_layers]
+    attn_hist, mlp_hist = layer_counts[0::2], layer_counts[1::2]
+    if m.model.final_attn_res is not None:
+        check(f"block_size={block_size}: 最终聚合历史条数正确",
+              len(hist_counts) == 2 * n_layers + 1 and hist_counts[-1] == n_flush)
+    else:
+        check(f"block_size={block_size}: 普通残差不额外聚合", len(hist_counts) == 2 * n_layers)
     del m
     return attn_hist, mlp_hist, exp_attn, exp_mlp, n_flush
 

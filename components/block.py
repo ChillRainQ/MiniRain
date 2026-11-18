@@ -109,7 +109,9 @@ class BlockAttnResMiniRainBlock(nn.Module):
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
-                                         bias=False), config=config, fwp=True)
+                                         bias=False))
+        self.attn_res = BlockAttnRes(config)
+        self.mlp_res = BlockAttnRes(config)
     def _flush(self, past_hidden_states, partial_block):
         """普通层：历史不变，partial_block 原样往后传。"""
         return past_hidden_states, partial_block
@@ -118,7 +120,7 @@ class BlockAttnResMiniRainBlock(nn.Module):
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
                 past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None,
-                img_idx=None, fwp_context=None, fwp_accumulate=False):
+                img_idx=None):
         partial_block = hidden_states
         attn_input = self.attn_res(past_hidden_states, partial_block)
         # flush 决策在 trace 时按子类解析，不产生 layer_id guard
@@ -153,8 +155,7 @@ class FullAttnResBlock(nn.Module):
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                             intermediate_size=config.intermediate_size, bias=False), config=config,
-                                     fwp=True)
+                                             intermediate_size=config.intermediate_size, bias=False))
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                   intermediate_size=config.intermediate_size, num_experts=config.n_experts)
@@ -163,8 +164,7 @@ class FullAttnResBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
-                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None,
-                fwp_context=None, fwp_accumulate=False):
+                past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None):
         attn_input = self.attn_res(past_hidden_states + [hidden_states])
         attn_out, past_key_value = self.attn(
             self.input_layernorm(attn_input), position_embeddings,
@@ -172,10 +172,7 @@ class FullAttnResBlock(nn.Module):
         # attn_out = hidden_states + attn_out
         past_hidden_states.append(hidden_states)
         mlp_input = self.mlp_res(past_hidden_states + [attn_out])
-        mlp_out = (self.mlp(self.post_attn_layernorm(mlp_input), fwp_context=fwp_context,
-                            fwp_accumulate=fwp_accumulate)
-                   if isinstance(self.mlp, SwiGLU)
-                   else self.mlp(self.post_attn_layernorm(mlp_input)))
+        mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
         if isinstance(mlp_out, tuple): mlp_out = mlp_out[0]  # MoE 返回 (out, logits, aux)
         # output = attn_out + mlp_out
         past_hidden_states.append(attn_out)
@@ -201,8 +198,6 @@ class BlockAttnResBlock(nn.Module):
     def __init__(self, layer_id: int, config: PreTrainedConfig):
         super().__init__()
         self.layer_id = layer_id
-        self.full_attn_res = config.full_attn_res
-        self.block_attn_res = config.block_attn_res
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
         # 模态专属 QKVO 只在 MoT（type_id=3）时构建，否则复用单套投影，避免纯文本模型白付双份注意力
@@ -212,8 +207,7 @@ class BlockAttnResBlock(nn.Module):
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         if config.type_id == 1:
             self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size,
-                                             intermediate_size=config.intermediate_size, bias=False), config=config,
-                                     fwp=True)
+                                             intermediate_size=config.intermediate_size, bias=False))
         elif config.type_id == 2:
             self.mlp = LosslessMoE(dim=config.hidden_size,
                                    intermediate_size=config.intermediate_size, num_experts=config.n_experts)
@@ -237,7 +231,7 @@ class BlockAttnResBlock(nn.Module):
     def forward(self, hidden_states, position_embeddings,
                 past_key_value=None, use_cache=False, attention_mask=None,
                 past_hidden_states=None, image_bidirectional_mask=None, modality_mask=None,
-                img_idx=None, fwp_context=None, fwp_accumulate=False):
+                img_idx=None):
         partial_block = hidden_states
         attn_input = self.attn_res(past_hidden_states, partial_block)
         # flush 决策在 trace 时按子类解析，不产生 layer_id guard
@@ -253,9 +247,6 @@ class BlockAttnResBlock(nn.Module):
             if img_idx is None and modality_mask is not None:
                 img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0]
             mlp_out = self.mlp(mlp_input, img_idx=img_idx)
-        elif isinstance(self.mlp, SwiGLU):
-            mlp_out = self.mlp(self.post_attn_layernorm(mlp_input), fwp_context=fwp_context,
-                               fwp_accumulate=fwp_accumulate)
         else:
             mlp_out = self.mlp(self.post_attn_layernorm(mlp_input))
         if isinstance(mlp_out, tuple):

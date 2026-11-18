@@ -6,7 +6,7 @@ from transformers.generation.logits_process import LogitsProcessor, LogitsProces
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 from architectures.config import RainConfig
-from components.block import BlockAttnResBlock, FlushBlockAttnResBlock
+from components.block import BlockAttnRes, BlockAttnResBlock, FlushBlockAttnResBlock
 from components.cv import ConvStem
 from components.norm import NormArgs, RMSNorm, TorchRMSNorm
 import torch.nn.functional as F
@@ -105,7 +105,7 @@ class VisionTokenBanLogitsProcessor(LogitsProcessor):
 
 
 class MiniRainVLM(nn.Module):
-    name = "MiniRain-Vision"
+    name = "MiniRain-Multi"
 
     def __init__(self, config: PreTrainedConfig):
         super().__init__()
@@ -135,6 +135,9 @@ class MiniRainVLM(nn.Module):
             for i in range(config.n_hidden_layers)
         ])
         # self.layers = nn.ModuleList([BlockAttnResBlock(i, self.config) for i in range(self.n_hidden_layers)])
+        self.final_attn_res = (BlockAttnRes(config)
+                               if config.block_size >= 2
+                               else None)
         self.text_norm = TorchRMSNorm(NormArgs(dim=self.config.hidden_size, eps=self.config.rms_norm_eps))
         # 图像
         self.patch_size = config.patch_size
@@ -145,13 +148,10 @@ class MiniRainVLM(nn.Module):
         self.img_start = self.config.img_start_token
         self.img_end = self.config.img_end_token
         self.img_row = self.config.img_row_token
-        # RoPE 表：1D（文本，挂 YaRN）+ 2D（图像，不缩放）。persistent=False 不进 checkpoint。
         cos1d, sin1d = precompute_freqs_cis_1d(
-            config.head_dim, config.max_position_embeddings,
-            config.rope_theta, config.rope_scaling)
+            config.head_dim, config.max_position_embeddings, config.rope_theta, config.rope_scaling)
         cos2d, sin2d = precompute_freqs_cis_2d(
-            config.head_dim, config.max_position_embeddings,
-            config.rope_theta, None)  # 2D 不挂 YaRN
+            config.head_dim, config.max_position_embeddings, config.rope_theta, None)
         self.register_buffer("rope_cos1d", cos1d, persistent=False)
         self.register_buffer("rope_sin1d", sin1d, persistent=False)
         self.register_buffer("rope_cos2d", cos2d, persistent=False)
@@ -210,8 +210,7 @@ class MiniRainVLM(nn.Module):
 
 
     def forward(self, input_ids, pixel_values=None, positions=None,
-                attention_mask=None, past_key_values=None, use_cache=False,
-                prompt_mask=None, fwp_prefill=None, fwp_accumulate=False, **kwargs):
+                attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
@@ -220,27 +219,6 @@ class MiniRainVLM(nn.Module):
 
         inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values)
         hidden_states = self.dropout(inputs_embeds)
-
-        # 首轮汇总完整 prompt；带 KV 的新一轮只汇总新增 token；decode 复用本轮 ΔW。
-        # 训练必须显式划分 prompt，否则整段 teacher-forcing 序列会把未来 token 泄漏给更新器。
-        fwp_context = None
-        if fwp_prefill is None:
-            fwp_prefill = start_pos == 0 or seq_length > 1
-        if self.config.fwp_rank > 0 and fwp_prefill:
-            if self.training and prompt_mask is None:
-                raise ValueError("启用 FWP 的训练前向必须传 prompt_mask，防止未来 token 泄漏")
-            if prompt_mask is not None and prompt_mask.shape != input_ids.shape:
-                expected = (batch_size, start_pos + seq_length)
-                if start_pos == 0 or prompt_mask.shape != expected:
-                    raise ValueError(f"prompt_mask 形状应为 {tuple(input_ids.shape)}，实际为 {tuple(prompt_mask.shape)}")
-            context_mask = prompt_mask if prompt_mask is not None else attention_mask
-            if context_mask is not None and context_mask.shape[1] != seq_length:
-                context_mask = context_mask[:, -seq_length:]
-            if context_mask is None:
-                context_mask = torch.ones_like(input_ids)
-            weights = context_mask.to(inputs_embeds.dtype).unsqueeze(-1)
-            fwp_context = ((inputs_embeds * weights).sum(dim=1)
-                           / weights.sum(dim=1).clamp_min(1.0))
 
         # padding 判断只做一次（避免注意力里每层 .item() 同步）；全有效时置 None 走因果快路径
         if attention_mask is not None:
@@ -255,9 +233,8 @@ class MiniRainVLM(nn.Module):
         # 只解析一次：图 mask 复用这里的 is_img_tok / is_start
         img_ids = torch.tensor([self.img_start, self.img_end, self.img_patch, self.img_row],
                                dtype=torch.long, device=input_ids.device)
-        is_img_tok = torch.isin(input_ids, img_ids)                  # [B,S] bool
+        is_img_tok = torch.isin(input_ids, img_ids)
         modality_mask = is_img_tok.long()
-        # MoTFFN 需要的图像索引在此算一次，避免每层重复 nonzero（decode 时是同步开销）
         img_idx = (modality_mask.reshape(-1) > 0).nonzero(as_tuple=True)[0]
 
         image_bidirectional_mask = None
@@ -271,10 +248,8 @@ class MiniRainVLM(nn.Module):
             pos = pos.unsqueeze(0).expand(batch_size, -1)
             positions = torch.stack([pos, pos], dim=-1)
 
-        # 每 micro-batch 只建一次，20 层复用；文本走 1D 表，图像走 2D 表
         position_embeddings = build_position_embeddings(
-            positions, is_img_tok,
-            self.rope_cos1d, self.rope_sin1d, self.rope_cos2d, self.rope_sin2d)
+            positions, is_img_tok, self.rope_cos1d, self.rope_sin1d, self.rope_cos2d, self.rope_sin2d)
         attn_modality_mask = modality_mask if img_idx.numel() > 0 else None
 
         presents, past_hidden_states = [], []
@@ -289,10 +264,10 @@ class MiniRainVLM(nn.Module):
                 image_bidirectional_mask=image_bidirectional_mask,
                 modality_mask=attn_modality_mask,
                 img_idx=img_idx,
-                fwp_context=fwp_context,
-                fwp_accumulate=fwp_accumulate,
             )
             presents.append(present)
+        if self.final_attn_res is not None:
+            hidden_states = self.final_attn_res(past_hidden_states, hidden_states)
         hidden_states = self.text_norm(hidden_states)
         aux_loss = hidden_states.new_zeros(1).squeeze()
         return hidden_states, presents, aux_loss
@@ -322,13 +297,11 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         return self.loss_fn(self.lm_head.weight, h, y)
 
     def forward(self, input_ids, pixel_values=None, positions=None, attention_mask=None,
-                past_key_values=None, use_cache=False, logits_to_keep=0, labels=None,
-                prompt_mask=None, fwp_prefill=None, fwp_accumulate=False, **kwargs):
+                past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids, pixel_values=pixel_values, positions=positions,
             attention_mask=attention_mask, past_key_values=past_key_values,
-            use_cache=use_cache, prompt_mask=prompt_mask, fwp_prefill=fwp_prefill,
-            fwp_accumulate=fwp_accumulate, **kwargs)
+            use_cache=use_cache, **kwargs)
 
         loss = None
         logits = None
@@ -345,7 +318,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
     @staticmethod
     def _left_pad_for_generation(input_ids, attention_mask, positions=None):
         """把右填充 batch 稳定转换为左填充，避免从 PAD 位置取首个生成 logits。"""
-        if attention_mask is None or input_ids.shape[0] <= 1:
+        if attention_mask is None:
             return input_ids, attention_mask, positions
         ids = input_ids.clone()
         mask = attention_mask.clone()
@@ -385,9 +358,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                  repetition_penalty=1.0, **kwargs):
         return_kv = kwargs.pop("return_kv", False)
         past_key_values = kwargs.pop("past_key_values", None)
-        fwp_accumulate = past_key_values is not None
-        if past_key_values is None:
-            self.model.reset_fwp()
         input_ids = kwargs.pop("input_ids", inputs)
         if past_key_values is None:
             input_ids, attention_mask, positions = self._left_pad_for_generation(
@@ -406,7 +376,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 if layer is not None else None
                 for layer in past_key_values
             ]
-        fwp_prefill = True
         if not use_cache and positions is not None:
             raise ValueError("use_cache=False 时 positions 需随序列增长，暂不支持带图 prompt；请改用 use_cache=True")
         # 每个样本独立维护下一个位置：图像段占用了额外的行号，不能用 past_len；[B]
@@ -427,8 +396,7 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values, use_cache=use_cache,
                 logits_to_keep=1 if past_len == 0 else 0,  # prefill 只留最后一个
-                fwp_prefill=fwp_prefill, fwp_accumulate=fwp_accumulate, **kwargs)
-            fwp_prefill = False
+                **kwargs)
             if step_positions is not None: next_pos = next_pos + 1
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
@@ -471,8 +439,8 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
         kwargs.pop("next_sequence_length", None)   # 由 past_len 统一推导，避免两套口径
         kwargs.pop("is_first_iteration", None)
         past_len = 0
-        if past_key_values and past_key_values[0] is not None:
-            past_len = past_key_values[0][0].shape[1]
+        if past_key_values:
+            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
         model_inputs = {
             "input_ids": input_ids[:, past_len:],
             "past_key_values": past_key_values,
@@ -487,8 +455,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                                             num_new_tokens=1):
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=is_encoder_decoder, num_new_tokens=num_new_tokens)
-        if "fwp_prefill" in model_kwargs:
-            model_kwargs["fwp_prefill"] = False  # 首轮新增 prompt 已汇总，后续 decode 只读快权
         positions = model_kwargs.get("positions")
         if positions is not None:
             nxt = positions[..., 0].max(dim=1).values + 1                      # [B]
@@ -504,8 +470,6 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
                     streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                     repetition_penalty=1.0, **kwargs):
         """走 HF GenerationMixin 的 generate"""
-        if kwargs.get("past_key_values") is None:
-            self.model.reset_fwp()
         input_ids = kwargs.pop("input_ids", inputs)
         if kwargs.get("past_key_values") is None:
             input_ids, attention_mask, positions = self._left_pad_for_generation(
@@ -524,6 +488,4 @@ class MiniRainVForCausalLM(PreTrainedModel, GenerationMixin):
             eos_token_id=eos_token_id, streamer=streamer, use_cache=use_cache,
             num_return_sequences=num_return_sequences, do_sample=do_sample,
             repetition_penalty=repetition_penalty, disable_compile=True,
-            **({"fwp_prefill": True,
-                "fwp_accumulate": kwargs.get("past_key_values") is not None}
-               if self.config.fwp_rank > 0 else {}), **kwargs)
+            **kwargs)

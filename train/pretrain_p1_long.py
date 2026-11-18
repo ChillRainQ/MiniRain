@@ -119,8 +119,6 @@ def parse_args():
     p.add_argument('--compile', action='store_true', help='Enable torch.compile (optional)')
     p.add_argument('--compile-recompile-limit', type=int, default=64,
                    help='Dynamo per-code compilation cache limit; multiple block/history variants share it')
-    p.add_argument('--full-attn-res', action='store_true')
-    p.add_argument('--block-attn-res', action='store_true')
     p.add_argument('--dry-run', action='store_true', help='Check dataset + model without training')
     p.add_argument('--ddp-find-unused', action=argparse.BooleanOptionalAction, default=True,
                    help='Safer for custom MoT branches; disable after all trainable params are verified')
@@ -530,7 +528,7 @@ def main():
             raise ValueError('Cannot exact-resume with changed padding; use the original mode or a new experiment')
         exact_keys = (
             'tier', 'init_checkpoint', 'hidden_size', 'layers', 'vision_ffn_scale', 'block_size',
-            'full_attn_res', 'block_attn_res', 'batch_size', 'grad_accum',
+            'batch_size', 'grad_accum',
             'seed', 'max_seq_len', 'pad_multiple', 'optimizer', 'dtype', 'epochs',
             'lr', 'muon_lr_factor', 'muon_momentum', 'weight_decay', 'warmup_ratio',
             'min_lr_ratio', 'grad_clip',

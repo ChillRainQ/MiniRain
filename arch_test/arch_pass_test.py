@@ -27,8 +27,6 @@ if __name__ == '__main__':
     parser.add_argument('--loop_start', type=int, default=0, help="Loop起始层")
     parser.add_argument('--loop_end', type=int, default=0, help="Loop结束层")
     parser.add_argument('--max_loop_iter', type=int, default=1, help="Loop最大迭代次数")
-    parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
-    parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
     parser.add_argument("--block_size", default=2, type=int, help="块大小")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true',
                         help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
@@ -47,9 +45,7 @@ if __name__ == '__main__':
                         use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
                         loop_end=args.loop_end, max_loop_iter=args.max_loop_iter,
                         vision_ffn_scale=args.vision_ffn_scale,
-                        block_size=args.block_size,
-                        block_attn_res=bool(args.use_block_attn_res),
-                        full_attn_res=bool(args.use_full_attn_res))
+                        block_size=args.block_size)
 
     model, tokenizer = init_model(config, from_weight=args.from_weight, tokenizer_path=project.TOKENIZER_PATH, model_type='v')
     prompts = [

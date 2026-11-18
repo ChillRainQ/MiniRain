@@ -14,11 +14,6 @@ import torch.nn.functional as F
 
 from architectures.config import RainConfig
 from components.norm import RMSNorm, NormArgs, TorchRMSNorm
-try:
-    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
-    _HAS_LIGER_SWIGLU = True
-except ImportError:
-    _HAS_LIGER_SWIGLU = False
 
 @dataclass
 class MLPArgs:
@@ -56,18 +51,17 @@ class MLP(MyMLP):
         return self.fc2(F.gelu(self.fc1(x)))
 
 class SwiGLU(MyMLP):
-    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False, **kwargs):
+    def __init__(self, args: MLPArgs):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
-    def forward(self, x: torch.Tensor, fwp_context: torch.Tensor | None = None,
-                batch_idx: torch.Tensor | None = None, fwp_accumulate: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 class AdaptiveSwiGLU(MyMLP):
-    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None, fwp: bool = False,
+    def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None,
                  fast_size: int = 32, initial_lr: float = 1e-1, **kwargs):
         super().__init__()
         self.gate = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
@@ -151,7 +145,7 @@ class MoTFFN(nn.Module):
     def __init__(self, n_modalities: int, args: MLPArgs, norm_args: NormArgs, config: PreTrainedConfig):
         super().__init__()
         self.n_modalities = n_modalities
-        # MoT 文本/视觉专家均使用普通 SwiGLU，不接入 FWP。
+        # 文本/视觉专家均使用普通 SwiGLU。
         self.mlp_t = SwiGLU(args)
         self.mlp_v = SwiGLU(MLPArgs(hidden_size=args.hidden_size,
                                     intermediate_size=int(args.intermediate_size // config.vision_ffn_scale),

@@ -262,7 +262,7 @@
   <line x1="1450" y1="280" x2="1450" y2="256" class="ln"/>
   <text x="1450" y="240" class="sm ctr">Output [B, T, D] → outer residual addition</text>
   <text x="1450" y="218" class="sm ctr" style="font-size:10px">y = W_down ( SiLU(W_gate x) ⊙ W_up x )</text>
-  <text x="1450" y="676" class="sm ctr" style="font-size:10px">D = 1024 · H_v = H_t / vision_ffn_scale · FWP off by default</text>
+  <text x="1450" y="676" class="sm ctr" style="font-size:10px">D = 1024 · H_v = H_t / vision_ffn_scale</text>
 
   <!-- ============ 底部标题 ============ -->
   <text x="830" y="702" class="ctr" font-style="italic" font-weight="bold" font-size="21" fill="#111">The Structure of MiniRainVLM</text>

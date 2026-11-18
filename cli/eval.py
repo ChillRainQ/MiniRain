@@ -1,84 +1,273 @@
-import argparse
-import random
-import time
-import torch
-from transformers import PreTrainedConfig, AutoTokenizer, TextStreamer
+# -*- coding: utf-8 -*-
+"""MiniRain 文本预训练模型测试：直接加载落盘权重生成文本。
 
+权重是 train.ckpt.save_state_dict 保存的裸 state_dict（fp16，如
+outputs/p1/p1_final_weights.pth），模型结构由同目录的 config.json
+或 run_config.json 的 model_config 段还原，不再依赖手写 hidden_size/layers。
+
+用法:
+    python cli/eval.py                                   # 默认 p1_long 权重
+    python cli/eval.py --ckpt p1 --prompt "机器学习是"          # 切到 P1（4k）权重
+    python cli/eval.py --ckpt outputs/p1_long                   # 也可以直接给实验目录
+    python cli/eval.py --prompt "为什么天空是蓝色的"       # 单条 prompt
+    python cli/eval.py --interactive                     # 交互式输入
+    python cli/eval.py --ckpt outputs/latest.pt          # 训练断点(latest.pt/step_*.pt)
+    python cli/eval.py --use_cache 0                     # 关 KV Cache，对比解码耗时
+    python cli/eval.py --hf_generate 0                   # 回退自定义解码循环（默认走 HF generate）
+    python cli/eval.py --prompt "机器学习是" --logits_topk 10        # 看 next-token logits
+    python cli/eval.py --prompt "机器学习是" --logits_save out.pt --logits_all 1  # 落盘全序列 logits
+"""
+import argparse
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer, TextStreamer
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import project
 from architectures.config import RainConfig
-from architectures.rain import MiniRainForCausalLM
+from architectures.rain_v import MiniRainVForCausalLM
 from train.train_util import get_model_params, setup_seed
 
+DEFAULT_CKPT = ROOT / 'outputs/p1_long/p1_long_16k_final_weights.pth'
+# 目录形式的 --ckpt 按此顺序找权重：阶段产物 > 断点 > 其它权重
+WEIGHT_PATTERNS = ('*_final_weights.pth', 'latest.pt', '*weights*.pth', '*.pth')
+DEFAULT_PROMPTS = [
+    '你有什么特长？',
+    '为什么天空是蓝色的',
+    '请用Python写一个计算斐波那契数列的函数',
+    '解释一下"光合作用"的基本过程',
+    '如果明天下雨，我应该如何出门',
+    '比较一下猫和狗作为宠物的优缺点',
+    '解释什么是机器学习',
+    '推荐一些中国的美食',
+]
 
-def model_init(config: PreTrainedConfig, args):
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    model = MiniRainForCausalLM(config)
-    moe_suffix = '_moe' if args.use_moe else ''
-    ckp = f'{args.save_dir}/{args.weight}_{config.hidden_size}_{config.n_hidden_layers}{moe_suffix}_ready.pth'
-    model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+
+def find_weight(path: Path):
+    """--ckpt 既可以是权重文件，也可以是实验目录（如 outputs/p1、outputs/p1_long）"""
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    for pattern in WEIGHT_PATTERNS:
+        found = sorted(path.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if found:
+            print(f'[Weight] {path} -> {found[0].name}')
+            return found[0]
+    raise FileNotFoundError(f'{path} 下找不到权重文件，请用 --ckpt 指定具体 .pth')
+
+
+def read_model_config(weight_path: Path, config_path: Path | None):
+    """配置来源优先级：显式 --config > 权重目录 config.json > run_config.json"""
+    candidates = ([Path(config_path)] if config_path is not None else
+                  [weight_path.parent / 'config.json', weight_path.parent / 'run_config.json'])
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        raw = json.loads(candidate.read_text(encoding='utf8'))
+        stage = raw.get('stage')  # run_config.json 记录的训练阶段，如 p1 / p1_long_16k
+        raw = raw.get('model_config', raw)  # run_config.json 只把模型段放在 model_config
+        if isinstance(raw, dict) and 'hidden_size' in raw:
+            print(f'[Config] {candidate}' + (f' (stage={stage})' if stage else ''))
+            return raw
+    raise FileNotFoundError(
+        f'找不到模型配置：请用 --config 指定 {weight_path.name} 对应的 config.json / run_config.json')
+
+
+def read_checkpoint(path: Path, config_path: Path | None):
+    """返回 (config_dict, state_dict)；兼容裸权重、latest.pt 与 state_dict 包装"""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    # 训练断点含 RNG/优化器状态，不能使用 weights_only=True（与 train/ckpt.py 一致）
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    if isinstance(ckpt, dict) and isinstance(ckpt.get('model'), dict):
+        state = ckpt['model']
+    elif isinstance(ckpt, dict) and isinstance(ckpt.get('state_dict'), dict):
+        state = ckpt['state_dict']
+    else:
+        state = ckpt  # save_state_dict 落盘的裸权重
+    if not isinstance(state, dict) or not state:
+        raise TypeError(f'{path} 不是可识别的权重文件: {type(state).__name__}')
+    config_dict = None
+    if isinstance(ckpt, dict):
+        config_dict = ckpt.get('config') or ckpt.get('model_config')
+    if config_path is not None or config_dict is None:
+        config_dict = read_model_config(path, config_path)
+    return config_dict, state
+
+
+def build_model(config_dict, state, device, dtype):
+    config = RainConfig(**config_dict)
+    # loss 只在 --ppl_text 时用到；推理环境没装 liger-kernel 时退回分块 CE
+    if config.loss_backend == 'liger':
+        try:
+            import liger_kernel  # noqa: F401
+        except ImportError:
+            print('[Warn] liger-kernel 未安装，loss 后端回退为 chunked')
+            config.loss_backend = 'chunked'
+    model = MiniRainVForCausalLM(config)
+    model.load_state_dict(state, strict=True)
     get_model_params(model, config)
-    return model.half().eval().to(args.device), tokenizer
+    # 保留转换前的表；先转 fp16 再 .float() 无法恢复丢失的精度。
+    rope_buffers = {name: buffer for name in
+                    ('rope_cos1d', 'rope_sin1d', 'rope_cos2d', 'rope_sin2d')
+                    if (buffer := getattr(model.model, name)) is not None}
+    model.to(device=device, dtype=dtype)
+    for name, buffer in rope_buffers.items():
+        setattr(model.model, name, buffer.to(device=device, dtype=torch.float32))
+    return model.eval()
+
+
+@torch.inference_mode()
+def text_loss(model, tokenizer, text, device, max_len):
+    """预训练模型的正常性检查：中文文本的 loss 应显著低于随机文本"""
+    if max_len < 2 or not text:
+        raise ValueError('PPL 需要非空文本，max_len 至少为 2')
+    # 与文本预训练的 [BOS] + 正文 + [EOS] 保持一致。
+    ids = tokenizer(tokenizer.bos_token + text + tokenizer.eos_token,
+                    return_tensors='pt', add_special_tokens=False,
+                    truncation=True, max_length=max_len)
+    input_ids = ids['input_ids'].to(device)
+    out = model(input_ids=input_ids, attention_mask=ids['attention_mask'].to(device),
+                labels=input_ids)
+    tokens = max(1, input_ids.shape[1] - 1)
+    return float(out.loss) * tokens, tokens
+
+
+@torch.inference_mode()
+def dump_logits(args, model, tokenizer, input_ids, attention_mask):
+    """一次前向取 logits：默认只算最后一个位置，--logits_all 时保留全序列"""
+    out = model(input_ids=input_ids, attention_mask=attention_mask,
+                logits_to_keep=0 if args.logits_all else 1)
+    logits = out.logits.float()
+    if args.logits_save:
+        path = Path(args.logits_save)
+        if not path.is_absolute():
+            path = ROOT / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({'input_ids': input_ids.cpu(), 'logits': logits.cpu(),
+                    'logits_to_keep': 0 if args.logits_all else 1}, path)
+        print(f'[Logits] saved {tuple(logits.shape)} -> {path}')
+    if args.logits_topk > 0:
+        last = logits[0, -1]
+        probs = last.softmax(dim=-1)
+        values, indices = probs.topk(min(args.logits_topk, probs.numel()))
+        print(f'[Logits] 末位置 top-{values.numel()}（vocab={probs.numel()}）')
+        for prob, idx in zip(values.tolist(), indices.tolist()):
+            piece = tokenizer.decode([idx])
+            print(f'  p={prob:8.5f} logit={last[idx].item():8.3f} '
+                  f'id={idx:6d} {piece!r}')
+
+
+def generate_ids(args, model, input_ids, attention_mask, streamer, eos_token_id):
+    """默认走 HF GenerationMixin（generate_hf），--hf_generate 0 时回退自定义解码循环"""
+    kwargs = dict(inputs=input_ids, attention_mask=attention_mask,
+                  max_new_tokens=args.max_new_tokens, do_sample=args.temperature > 0,
+                  use_cache=bool(args.use_cache), streamer=streamer,
+                  eos_token_id=eos_token_id)
+    if args.temperature > 0:  # HF 在 do_sample=False 时对 temperature/top_k 会告警
+        kwargs.update(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
+    if args.hf_generate:
+        return model.generate_hf(**kwargs)
+    return model.generate(**kwargs)
+
+
+def run(args, model, tokenizer):
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    print(f'[Gen] seed={args.seed} backend={"hf" if args.hf_generate else "custom"} '
+          f'use_cache={args.use_cache} temperature={args.temperature} '
+          f'top_p={args.top_p} top_k={args.top_k}')
+    prompts = ([args.prompt] if args.prompt else
+               (iter(lambda: input('[User]: '), '') if args.interactive else DEFAULT_PROMPTS))
+    for prompt in prompts:
+        setup_seed(args.seed)
+        # 预训练权重只学了过去文本续写，使用 BOS + 原文，不加对话模板
+        inputs = tokenizer(tokenizer.bos_token + prompt, return_tensors='pt',
+                           truncation=True, max_length=args.max_prompt_tokens).to(args.device)
+        if args.logits_topk > 0 or args.logits_save:
+            dump_logits(args, model, tokenizer, inputs['input_ids'], inputs['attention_mask'])
+        if not args.prompt and not args.interactive:
+            print(f'[User]: {prompt}')
+        print('[MiniRain]: ', end='')
+        st = time.time()
+        generated = generate_ids(args, model, inputs['input_ids'], inputs['attention_mask'],
+                                 streamer if args.stream else None, tokenizer.eos_token_id)
+        if not args.stream:
+            print(tokenizer.decode(generated[0][inputs['input_ids'].shape[1]:],
+                                   skip_special_tokens=True))
+        gen_tokens = generated.shape[1] - inputs['input_ids'].shape[1]
+        seconds = time.time() - st
+        if args.show_speed:
+            backend = 'hf' if args.hf_generate else 'custom'
+            print(f'\n[Speed]: {gen_tokens / seconds:.2f} tokens/s '
+                  f'(backend={backend}, use_cache={args.use_cache})\n')
+        else:
+            print()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="MiniRain 模型测试")
-    parser.add_argument('--save_dir', default='../ready', type=str, help="模型权重目录")
-    parser.add_argument('--tokenizer_path', default='../tokenizers', type=str, help="分词器目录")
-    parser.add_argument('--weight', default='rlaif', type=str,
-                        help="权重名称前缀（pretrain, full_sft, rlaif）")
-    parser.add_argument('--hidden_size', default=1152, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--inference_rope_scaling', default=False, action='store_true',
-                        help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
-    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
-    parser.add_argument('--temperature', default=0.8, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
-    parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
-    parser.add_argument('--open_thinking', default=1, type=int, help="是否开启自适应思考（0=否，1=是）")
-    parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
-    parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser = argparse.ArgumentParser(description="MiniRain 文本预训练模型测试")
+    parser.add_argument('--ckpt', default=str(DEFAULT_CKPT), type=str,
+                        help="权重文件或实验目录：裸 *_weights.pth、断点 latest.pt，或 outputs/p1 这类目录")
+    parser.add_argument('--config', default=None, type=str,
+                        help="模型配置（config.json 或 run_config.json）；默认在权重目录自动查找")
+    parser.add_argument('--tokenizer_path', default=project.TOKENIZER_PATH, type=str, help="分词器目录")
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str,
+                        help="运行设备（CPU 上回退 fp32）")
+    parser.add_argument('--prompt', default='', type=str, help="单条 prompt；为空则跑内置列表")
+    parser.add_argument('--interactive', default=0, type=int, choices=[0, 1], help="交互式输入（1=开）")
+    parser.add_argument('--max_prompt_tokens', default=4096, type=int, help="prompt 截断长度")
+    parser.add_argument('--max_new_tokens', default=256, type=int,
+                        help="最大生成长度（P1 训练上下文 4k、p1_long 为 8k/16k/32k，不要显著超过）")
+    parser.add_argument('--temperature', default=0.8, type=float, help="生成温度，0 表示贪心")
+    parser.add_argument('--top_p', default=0.95, type=float, help="nucleus 采样阈值（0-1）")
+    parser.add_argument('--top_k', default=50, type=int, help="top-k 采样（0=关闭）")
+    parser.add_argument('--hf_generate', default=1, type=int, choices=[0, 1],
+                        help="解码后端：1=HF GenerationMixin（generate_hf，默认），0=自定义解码循环")
+    parser.add_argument('--use_cache', default=1, type=int, choices=[0, 1],
+                        help="解码复用 KV Cache（1=开，默认；0=每步重算整段 prompt，仅用于速度对比）")
+    parser.add_argument('--stream', default=1, type=int, choices=[0, 1], help="流式打印（1=开）")
+    parser.add_argument('--show_speed', default=1, type=int, choices=[0, 1], help="显示 tokens/s")
+    parser.add_argument('--seed', default=42, type=int,
+                        help="随机种子；固定默认值保证可复现（每条 prompt 前重置）")
+    parser.add_argument('--logits_topk', default=0, type=int,
+                        help=">0 时打印 prompt 末位置的 next-token logits/probs（top-k）")
+    parser.add_argument('--logits_save', default='', type=str,
+                        help="将 prompt 的 logits 存为 .pt（含 input_ids）；路径相对项目根目录")
+    parser.add_argument('--logits_all', default=0, type=int, choices=[0, 1],
+                        help="存/算全序列 logits（1）还是仅末位置（0，默认）")
+    parser.add_argument('--ppl_text', default='', type=str,
+                        help="给定期望文本，打印其 loss/perplexity 验证权重是否学到位"
+                             "（建议 ≥100 字：短文本被 BOS 后的首个预测摊薄不了，PPL 会偏高）")
     args = parser.parse_args()
-    config = RainConfig(hidden_size=args.hidden_size,
-                        n_hidden_layers=args.num_hidden_layers)
 
-    model, tokenizer = model_init(config, args)
-    prompts = [
-        '你有什么特长？',
-        '为什么天空是蓝色的',
-        '请用Python写一个计算斐波那契数列的函数',
-        '解释一下"光合作用"的基本过程',
-        '如果明天下雨，我应该如何出门',
-        '比较一下猫和狗作为宠物的优缺点',
-        '解释什么是机器学习',
-        '推荐一些中国的美食'
-    ]
-    conversation = []
-    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    device = torch.device(args.device)
+    dtype = torch.float16 if device.type == 'cuda' else torch.float32
+    if device.type == 'cpu':
+        print('[Warn] CPU 上使用 fp32 推理，速度会明显低于 GPU')
+    ckpt_path = Path(args.ckpt)
+    if not ckpt_path.is_absolute():
+        # 相对路径先按项目根目录解释，再回退到 outputs/（方便直接写 --ckpt p1）
+        candidates = [ROOT / ckpt_path, ROOT / 'outputs' / ckpt_path]
+        ckpt_path = next((p for p in candidates if p.exists()), candidates[0])
+    ckpt_path = find_weight(ckpt_path)
+    config_dict, state = read_checkpoint(ckpt_path, args.config)
+    model = build_model(config_dict, state, device, dtype)
+    del state
+    print(f'[Model] type={model.config.type} hidden={model.config.hidden_size} '
+          f'layers={model.config.n_hidden_layers} vocab={model.config.vocab_size} '
+          f'rope_table={model.config.max_position_embeddings} dtype={dtype} device={device}')
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
-    for prompt in prompt_iter:
-        setup_seed(random.randint(0, 31415926))
-        if input_mode == 0: print(f'💬: {prompt}')
-        conversation = conversation[-args.historys:] if args.historys else []
-        conversation.append({"role": "user", "content": prompt})
-        if 'pretrain' in args.weight:
-            inputs = tokenizer.bos_token + prompt
-        else:
-            inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True,
-                                                   open_thinking=bool(args.open_thinking))
-
-        inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
-
-        print('🧠: ', end='')
-        st = time.time()
-        generated_ids = model.generate(
-            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
-            max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
-            pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-            top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
-        )
-        response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
-        conversation.append({"role": "assistant", "content": response})
-        gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
-        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
+    if args.ppl_text:
+        loss, tokens = text_loss(model, tokenizer, args.ppl_text, device, args.max_prompt_tokens)
+        mean_loss = loss / tokens
+        print(f'[PPL] tokens={tokens} loss={mean_loss:.4f} ppl={math.exp(mean_loss):.2f}')
+    run(args, model, tokenizer)

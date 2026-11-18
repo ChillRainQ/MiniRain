@@ -161,8 +161,6 @@ if __name__ == "__main__":
     parser.add_argument('--loop_start', type=int, default=0, help="Loop起始层")
     parser.add_argument('--loop_end', type=int, default=0, help="Loop结束层")
     parser.add_argument('--max_loop_iter', type=int, default=1, help="Loop最大迭代次数")
-    parser.add_argument("--use_block_attn_res", action="store_true", help="是否使用块注意力残差")
-    parser.add_argument("--use_full_attn_res", action="store_true", help="是否使用全注意力残差")
     parser.add_argument("--block_size", default=2, type=int, help="块大小")
 
     args = parser.parse_args()
@@ -172,9 +170,7 @@ if __name__ == "__main__":
                         use_bounce=bool(args.use_bounce), loop_start=args.loop_start,
                         loop_end=args.loop_end, max_loop_iter=args.max_loop_iter,
                         block_size=args.block_size,
-                        model_type=args.model_type,
-                        block_attn_res=bool(args.use_block_attn_res),
-                        full_attn_res=bool(args.use_full_attn_res))
+                        model_type=args.model_type)
     model = MiniRainVForCausalLM(config).cuda().bfloat16()
     batch = col([{"image": torch.rand(3, 64, 64), "text": "一只狗在草地上跑"},
                  {"image": torch.rand(3, 80, 48), "text": "测试"}])  # 不同尺寸，顺便测广播

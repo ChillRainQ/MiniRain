@@ -46,8 +46,6 @@ BASE_CFG = dict(
     vision_ffn_scale=4,
     block_size=4,
     model_type="v",
-    block_attn_res=False,
-    full_attn_res=False,
 )
 
 
