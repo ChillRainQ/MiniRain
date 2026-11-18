@@ -116,7 +116,7 @@ def accumulated_step(model, training, batches, optimizer, scaler, grad_clip,
 
 
 def main():
-    p = argparse.ArgumentParser(description='MiniRain 纯文本训练性能基准（3 GDN : 1 GQA）')
+    p = argparse.ArgumentParser(description='MiniRain 纯文本训练性能基准（全 GQA）')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--dtype', choices=list(DTYPES), default='bf16')
     p.add_argument('--iters', type=int, default=10, help='计时的完整累积更新步数')
@@ -156,7 +156,7 @@ def main():
         p.error('block-size 须为 0 或正偶数，FFN 维度须为正')
     device = torch.device(args.device)
     if device.type != 'cuda' or not torch.cuda.is_available():
-        p.error('真实 FLA GDN 训练基准需要 CUDA')
+        p.error('训练性能基准需要 CUDA')
     directory = Path(__file__).resolve().parent / 'txt'
     directory.mkdir(parents=True, exist_ok=True)
     stem = f'train_bench_{time.strftime("%Y%m%d_%H%M%S")}_{time.time_ns() % 1000000}'

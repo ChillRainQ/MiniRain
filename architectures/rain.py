@@ -271,7 +271,7 @@ class MiniRainForCausalLM(PreTrainedModel, GenerationMixin):
                     temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2,
                     streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                     repetition_penalty=1.0, **kwargs):
-        """HF decoding over the same mixed recurrent/KV cache as generate()."""
+        """HF decoding over the same per-layer KV cache as generate()."""
         input_ids = kwargs.pop('input_ids', inputs)
         if kwargs.get('past_key_values') is None:
             input_ids, attention_mask = self._left_pad_for_generation(input_ids, attention_mask)

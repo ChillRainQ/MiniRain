@@ -5,7 +5,7 @@ from transformers import PreTrainedConfig
 from components.mlp import SwiGLU, FusedSwiGLU, LosslessMoE, MoTFFN, AdaptiveSwiGLU
 from components.mlp import MLPArgs
 from components.norm import NormArgs
-from components.attention import AttentionArgs, MoTGroupQueryAttention, GatedDeltaNetAttention
+from components.attention import AttentionArgs, MoTGroupQueryAttention
 from components.attention import GroupQueryAttention
 import torch.nn as nn
 
@@ -199,7 +199,7 @@ class BlockAttnResMiniRainBlock(nn.Module):
         self.layer_id = layer_id
         self.block_size = config.block_size
         self.layer_number = config.n_hidden_layers
-        self.attn = GroupQueryAttention(AttentionArgs(config)) if (self.layer_id + 1) % 4 == 0 else GatedDeltaNetAttention(AttentionArgs(config))
+        self.attn = GroupQueryAttention(AttentionArgs(config))
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.mlp = FusedSwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,

@@ -220,7 +220,7 @@ def run(args, resolved):
             return
         device = torch.device(settings['device'])
         if device.type != 'cuda' or not torch.cuda.is_available():
-            raise ValueError('Real GDN/FLA training requires CUDA; use --dry-run for CPU validation')
+            raise ValueError('Training requires CUDA; use --dry-run for CPU validation')
         torch.cuda.set_device(device)
         print(f'[Device] selected={device}; current={torch.cuda.current_device()}; '
               f'name={torch.cuda.get_device_name(device)}', flush=True)

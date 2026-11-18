@@ -10,8 +10,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fla.layers import GatedDeltaNet as FLAGatedDeltaNet
-from fla.models.utils import Cache
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -178,10 +176,11 @@ class GroupQueryAttention(nn.Module):
         kv_len = xk.size(-2)
         dropout_p = self.dropout if self.training else 0.0
 
-        # 始终显式展开 KV 头，不再依赖 SDPA 后端的原生 GQA 支持。
-        # 缓存已在上方保存，因此这里不会增大 KV Cache。
-        xk = self._repeat_kv(xk, self.n_rep)
-        xv = self._repeat_kv(xv, self.n_rep)
+        # SDPA accepts grouped KV heads directly. Only the manual attention
+        # fallback needs expansion; the cache always retains the KV head count.
+        if not self.flash:
+            xk = self._repeat_kv(xk, self.n_rep)
+            xv = self._repeat_kv(xv, self.n_rep)
 
         # padding 可见性统一转 bool：单 token 解码只需屏蔽 KV 侧（可广播到 [B,H,1,KV]），
         # 多 token 需要「右下对齐因果 + padding」的显式 bool mask。
@@ -210,6 +209,7 @@ class GroupQueryAttention(nn.Module):
                     xv,
                     dropout_p=dropout_p,
                     attn_mask=attn_mask,
+                    enable_gqa=self.n_rep > 1,
                 )
             else:
                 scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -228,22 +228,25 @@ class GroupQueryAttention(nn.Module):
             if pad_mask is not None:
                 # 因果与 padding 已并入 pad_mask，交给 SDPA 处理，避免整型 mask 与手写路径
                 output = F.scaled_dot_product_attention(
-                    xq, xk, xv, dropout_p=dropout_p, attn_mask=pad_mask
+                    xq, xk, xv, dropout_p=dropout_p, attn_mask=pad_mask,
+                    enable_gqa=self.n_rep > 1,
                 )
             elif past_key_value is None:
                 output = F.scaled_dot_product_attention(
-                    xq, xk, xv, dropout_p=dropout_p, is_causal=self.is_causal
+                    xq, xk, xv, dropout_p=dropout_p, is_causal=self.is_causal,
+                    enable_gqa=self.n_rep > 1,
                 )
             elif seq_len == 1:
                 # 单 token 解码可见全部历史 KV，不能启用因果遮挡。
                 output = F.scaled_dot_product_attention(
-                    xq, xk, xv, dropout_p=dropout_p
+                    xq, xk, xv, dropout_p=dropout_p, enable_gqa=self.n_rep > 1,
                 )
             else:
                 # 多 token 续写：SDPA 的 is_causal 左对齐，需显式右下对齐因果 mask。
                 allow = self._causal_mask(seq_len, kv_len, xq.device)
                 output = F.scaled_dot_product_attention(
-                    xq, xk, xv, dropout_p=dropout_p, attn_mask=allow
+                    xq, xk, xv, dropout_p=dropout_p, attn_mask=allow,
+                    enable_gqa=self.n_rep > 1,
                 )
 
         else:
@@ -462,6 +465,7 @@ class MoTAttention(nn.Module):
 class GatedDeltaNetAttention(nn.Module):
     def __init__(self, args: AttentionArgs):
         super().__init__()
+        from fla.layers import GatedDeltaNet as FLAGatedDeltaNet
         config = args.config
 
         self.gdn = FLAGatedDeltaNet(
@@ -488,6 +492,7 @@ class GatedDeltaNetAttention(nn.Module):
         modality_mask=None,
     ):
         # GDN 不使用 RoPE，保留参数只是兼容现有 Block。
+        from fla.models.utils import Cache
         if use_cache and past_key_value is None:
             past_key_value = Cache()
         elif past_key_value is not None and len(past_key_value):

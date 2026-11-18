@@ -10,30 +10,24 @@ import torch
 
 from architectures.config import RainConfig
 from architectures.rain import MiniRainForCausalLM
-from components.attention import GatedDeltaNetAttention, GroupQueryAttention
+from components.attention import GroupQueryAttention
 
 
 def estimate_flops(model, seq_len):
     """Leading logical FLOPs, MAC=2; training ~3x forward, without recomputation.
 
-    Includes all Linear projections (including tied LM head), short convolutions,
-    causal GQA and recurrent-equivalent GDN. Excludes norms, nonlinearities,
+    Includes all Linear projections (including tied LM head) and causal GQA.
+    Excludes norms, nonlinearities,
     AttnRes aggregation, CE, optimizer and chunk-kernel/padding overhead.
     This is an analytical estimate, not a profiler measurement.
     """
     linear = 2 * sum(m.weight.numel() for m in model.modules() if isinstance(m, torch.nn.Linear))
-    conv = recurrent = attention = 0
+    attention = 0
     for layer in model.model.layers:
-        if isinstance(layer.attn, GatedDeltaNetAttention):
-            gdn = layer.attn.gdn
-            conv += 2 * sum(getattr(gdn, name).weight.numel()
-                            for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'))
-            # State decay + prediction + rank-one update + readout: (1+2+2+2) HKV.
-            recurrent += 7 * gdn.num_heads * gdn.head_k_dim * gdn.head_v_dim
-        elif isinstance(layer.attn, GroupQueryAttention):
+        if isinstance(layer.attn, GroupQueryAttention):
             attention += 2 * model.config.hidden_size * (seq_len + 1)
-    forward = linear + conv + recurrent + attention
-    return dict(linear=linear, short_conv=conv, gdn_recurrent_equivalent=recurrent,
+    forward = linear + attention
+    return dict(linear=linear,
                 causal_gqa=attention, forward_per_token=forward,
                 training_per_token_estimate=3 * forward)
 
@@ -73,12 +67,12 @@ def main():
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    gqa_layers = config.n_hidden_layers // 4
+    gqa_layers = sum(isinstance(layer.attn, GroupQueryAttention) for layer in model.model.layers)
     print(f'Model Type: {model.name} ({type(model).__name__})')
     print(f'Architecture: layers={config.n_hidden_layers}, hidden={config.hidden_size}, '
           f'FFN={config.intermediate_size}, heads={config.n_attn_heads}, '
           f'kv_heads={config.n_key_value_heads}, block_size={config.block_size}')
-    print(f'Attention Layers: GDN={config.n_hidden_layers - gqa_layers}, GQA={gqa_layers}')
+    print(f'Attention Layers: GQA={gqa_layers}')
     # parameters() 会去重，绑定的 embedding/lm_head 仅计一次。
     print(f'[ScalingLaw] Model Params: {total / 1e6:.2f}M ({total:,})')
     print(f'[ScalingLaw] Trainable Params: {trainable / 1e6:.2f}M ({trainable:,})')
