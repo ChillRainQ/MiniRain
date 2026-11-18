@@ -112,3 +112,19 @@ batch = collator([{"image": img_tensor, "text": "描述这张图"}])
 gen = model.generate(inputs=ids, max_new_tokens=64, do_sample=False)
 ```
 
+## 编译全量文本语料
+
+```bash
+uv run scripts/compile_pretrain_text.py --data-dir data/ultradata --output-dir data/pretrain_all --max-length 8192
+```
+
+递归编译全部 JSONL 文本，输出一对 `pretrain_text.bin` / `pretrain_text.idx` 和 `manifest.json`，不再按阶段分配配额。超长文档切块保留全部正文；详细参数及读取方式见[编译说明](docs/pretrain_text_compilation.md)。
+
+## 纯文本预训练
+
+```bash
+uv run train/pretrain.py --config pretrain.json --gpu 1
+```
+
+模型结构读取 `minirain.json`，训练和数据设置读取根目录 `pretrain.json`，结果默认保存到 `exp/pretrain_text_001/`。支持 Muon/AdamW、梯度累计、compile、本地曲线报告和断点续训，详见[预训练说明](docs/pretrain.md)。
+

@@ -44,7 +44,7 @@ def main():
     parser.add_argument('--hidden_size', default=1024, type=int, help="隐藏层维度")
     parser.add_argument('--n_attn_heads', default=8, type=int)
     parser.add_argument('--n_key_value_heads', default=4, type=int)
-    parser.add_argument('--intermediate_size', default=None, type=int, help="默认按当前模型的 pi 倍规则取整")
+    parser.add_argument('--intermediate_size', default=None, type=int, help="默认按 hidden_size 的3倍向上取整到64的倍数")
     parser.add_argument('--seq_len', default=4096, type=int, help="FLOPs 估算的完整序列长度")
     parser.add_argument('--json_output', type=Path, default=None)
     parser.add_argument('--num_hidden_layers', default=24, type=int, help="Transformer 层数量")

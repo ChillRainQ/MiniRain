@@ -8,7 +8,7 @@ model_type: dict[int, str] = {
 }
 
 class RainConfig(PretrainedConfig):
-    def __init__(self, hidden_size=768, n_hidden_layers=8,
+    def __init__(self, hidden_size=1024, n_hidden_layers=24,
                  use_moe=False, use_mot=False, use_adaptive=False, **kwargs):
         requested_rope_scaling = kwargs.get('rope_scaling', kwargs.get('rope_parameters'))
         requested_rope_scaling = dict(requested_rope_scaling) if requested_rope_scaling is not None else None
@@ -42,8 +42,9 @@ class RainConfig(PretrainedConfig):
         self.head_dim: int = int(kwargs.get("head_dim", self.hidden_size // self.n_attn_heads))
         self.hidden_act: str = kwargs.get("hidden_act", 'silu')
         self.norm_type: str = kwargs.get("norm_type", "rms")
-        self.max_position_embeddings: int = int(kwargs.get("max_position_embeddings", 32768))
-        self.intermediate_size: int = int(kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64))
+        self.max_position_embeddings: int = int(kwargs.get("max_position_embeddings", 65536))
+        # Dense SwiGLU: 3x expansion, rounded up to a multiple of 64.
+        self.intermediate_size: int = int(kwargs.get("intermediate_size", math.ceil(hidden_size * 3 / 64) * 64))
         # MOE config
         self.use_moe = use_moe
         self.use_mot = use_mot
@@ -60,12 +61,12 @@ class RainConfig(PretrainedConfig):
         self.rms_norm_eps: float = float(kwargs.get("rms_norm_eps", 1e-6))
         self.rope_theta: float = float(kwargs.get("rope_theta", 1e6))
         self.tie_word_embeddings: bool = bool(kwargs.get("tie_word_embeddings", True))
-        self.inference_rope_scaling: bool = bool(kwargs.get("inference_rope_scaling", False))
+        self.inference_rope_scaling: bool = bool(kwargs.get("inference_rope_scaling", True))
         self.rope_scaling = requested_rope_scaling if requested_rope_scaling is not None else ({
             "beta_fast": 32,
             "beta_slow": 1,
             "factor": 8,
-            "original_max_position_embeddings": 4096,
+            "original_max_position_embeddings": 8192,
             "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None)

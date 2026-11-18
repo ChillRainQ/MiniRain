@@ -1,0 +1,35 @@
+{
+  "model_config": "minirain.json",
+  "data": {
+    "bin": "data/pretrain_all/pretrain_text.bin",
+    "idx": "data/pretrain_all/pretrain_text.idx",
+    "max_length": 8192
+  },
+  "training": {
+    "device": "cuda:1",
+    "output_dir": "exp/pretrain_text_001",
+    "batch_size": 1,
+    "grad_accum": 8,
+    "epochs": 1,
+    "max_steps": 0,
+    "optimizer": "muon_adamw",
+    "lr": 0.0005,
+    "muon_lr_factor": 30.0,
+    "muon_momentum": 0.95,
+    "weight_decay": 0.1,
+    "warmup_ratio": 0.02,
+    "min_lr_ratio": 0.1,
+    "grad_clip": 1.0,
+    "dtype": "bf16",
+    "loss_backend": "auto",
+    "loss_chunks": 32,
+    "compile": true,
+    "compile_dynamic": false,
+    "compile_recompile_limit": 64,
+    "num_workers": 4,
+    "seed": 42,
+    "log_every": 8,
+    "save_every": 1000,
+    "keep_checkpoints": 5
+  }
+}

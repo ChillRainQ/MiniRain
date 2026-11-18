@@ -74,6 +74,7 @@ class PretrainBinDataset(Dataset):
     MiniRain pretraining BIN dataset.
 
     Supports:
+      - Unified all-text BIN/IDX and manifest
       - Original document BIN/IDX
       - Sequence Packed BIN/IDX
 
@@ -204,9 +205,9 @@ class PretrainBinDataset(Dataset):
             # Original document mode must match
             # the original manifest exactly.
             if not self.packed:
-                stage_meta = (
-                    manifest["stages"][self.stage]
-                )
+                stage_meta = (manifest["dataset"]
+                              if manifest.get("layout") == "unified_text"
+                              else manifest["stages"][self.stage])
 
                 if (
                     int(stage_meta["records"])

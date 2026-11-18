@@ -1,0 +1,25 @@
+{
+  "architectures": ["MiniRainForCausalLM"],
+  "hidden_size": 1024,
+  "n_hidden_layers": 24,
+  "n_attn_heads": 8,
+  "n_key_value_heads": 4,
+  "intermediate_size": 3072,
+  "vocab_size": 16384,
+  "tie_word_embeddings": true,
+  "block_size": 4,
+  "max_position_embeddings": 65536,
+  "inference_rope_scaling": true,
+  "rope_scaling": {
+    "type": "yarn",
+    "factor": 8,
+    "original_max_position_embeddings": 8192,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "attention_factor": 1.0
+  },
+  "dropout": 0.0,
+  "use_moe": false,
+  "use_mot": false,
+  "use_adaptive": false
+}
