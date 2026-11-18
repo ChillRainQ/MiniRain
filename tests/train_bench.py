@@ -61,7 +61,8 @@ def build_optimizer(model, args):
     if args.optimizer == 'none':
         return None
     if args.optimizer == 'adamw':
-        return torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+        return torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                                 weight_decay=0.01, fused=True)
     try:
         from muon import SingleDeviceMuonWithAuxAdam
     except ImportError as exc:
@@ -105,6 +106,8 @@ def main():
     p.add_argument('--loss-backend', choices=['native', 'auto', 'liger', 'chunked'], default='native',
                    help='默认模型原生 CE；其余是显式替代路径，比较吞吐时须保持一致')
     p.add_argument('--loss-chunks', type=int, default=32)
+    p.add_argument('--attention-mask', choices=['none', 'ones'], default='none',
+                   help='无 padding 合成数据默认不传 mask；ones 用于对照旧版变长路径')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--mode', choices=['default', 'max-autotune'], default='default')
     p.add_argument('--seed', type=int, default=42)
@@ -155,10 +158,11 @@ def main():
     scaler = torch.amp.GradScaler('cuda', enabled=args.dtype == 'fp16')
     ids = torch.randint(100, config.vocab_size, (args.train_batch, args.train_seq), device=device)
     ids[:, 0] = config.bos_token_id
-    mask, labels = torch.ones_like(ids), ids.clone()
+    mask = torch.ones_like(ids) if args.attention_mask == 'ones' else None
+    labels = ids.clone()
     if not args.quiet:
         print(f'[bench] MiniRain {args.train_batch}x{args.train_seq}, optimizer={args.optimizer}, '
-              f'loss={args.loss_backend}, compile={args.compile}; warmup={args.warmup}', flush=True)
+              f'loss={args.loss_backend}, mask={args.attention_mask}, compile={args.compile}; warmup={args.warmup}', flush=True)
 
     def step(profile=None):
         def stage(name, operation):
@@ -215,6 +219,8 @@ def main():
     ms = elapsed / args.iters * 1000
     result = dict(args=vars(args), model_class=type(model).__name__,
                   parameters=sum(p.numel() for p in model.parameters()), config=config.to_dict(),
+                  optimizer_implementation=('torch.optim.AdamW(fused=True)' if args.optimizer == 'adamw'
+                                            else args.optimizer),
                   device=torch.cuda.get_device_name(device), torch_version=torch.__version__,
                   warmup_seconds=warmup_seconds, milliseconds_per_step=ms,
                   tokens_per_second=args.train_batch * args.train_seq * 1000 / ms,
