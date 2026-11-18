@@ -14,7 +14,7 @@
   },
   "training": {
     "device": "cuda:2",
-    "output_dir": "exp/pretrain_text_003",
+    "output_dir": "exp/pretrain_text_004",
     "batch_size": 1,
     "grad_accum": 8,
     "epochs": 1,
