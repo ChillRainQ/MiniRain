@@ -69,6 +69,10 @@ class MiniRainModel(nn.Module):
         super().__init__()
         if config.type_id != 1:
             raise ValueError('MiniRain is a dense text model; disable use_mot/use_moe/use_adaptive')
+        if config.n_hidden_layers <= 0:
+            raise ValueError('n_hidden_layers must be positive')
+        if config.block_size < 0 or config.block_size % 2:
+            raise ValueError('block_size must be zero or a positive even number of sublayers')
         if config.head_dim <= 0 or config.head_dim % 2:
             raise ValueError('1D RoPE requires a positive, even head_dim')
         self.config = config
@@ -139,6 +143,19 @@ class MiniRainForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed.weight = self.lm_head.weight
         self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, MiniRainModel):
+            # HF materializes non-persistent buffers as empty tensors when
+            # loading from meta. Rebuild RoPE instead of using uninitialized data.
+            with torch.device(module.freqs_cos.device):
+                cos, sin = precompute_freqs_cis(
+                    self.config.head_dim, self.config.max_position_embeddings,
+                    self.config.rope_theta, self.config.rope_scaling)
+            module.freqs_cos.copy_(cos)
+            module.freqs_sin.copy_(sin)
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None,
                 use_cache=False, logits_to_keep=0, labels=None, **kwargs):

@@ -10,6 +10,8 @@ model_type: dict[int, str] = {
 class RainConfig(PretrainedConfig):
     def __init__(self, hidden_size=768, n_hidden_layers=8,
                  use_moe=False, use_mot=False, use_adaptive=False, **kwargs):
+        requested_rope_scaling = kwargs.get('rope_scaling', kwargs.get('rope_parameters'))
+        requested_rope_scaling = dict(requested_rope_scaling) if requested_rope_scaling is not None else None
         # 兼容早期配置：旧版只序列化 type_id，没有持久化 use_mot/use_moe。
         # 必须在 super().__init__ 前读取，否则重新加载 MoT 配置会静默退化成 Dense。
         saved_type_id = int(kwargs.get("type_id", 0) or 0)
@@ -33,8 +35,8 @@ class RainConfig(PretrainedConfig):
         self.type: str = model_type[self.type_id]
         self.bos_token_id: int = int(kwargs.get("bos_token_id", 1))
         self.eos_token_id: int = int(kwargs.get("eos_token_id", 2))
-        self.n_dropout: float = float(kwargs.get("dropout", 0.0))
-        self.flash_attn: bool = True
+        self.n_dropout: float = float(kwargs.get("dropout", kwargs.get("n_dropout", 0.0)))
+        self.flash_attn: bool = bool(kwargs.get("flash_attn", True))
         self.n_attn_heads: int = int(kwargs.get("n_attn_heads", 8))
         self.n_key_value_heads: int = kwargs.get("n_key_value_heads", 4)
         self.head_dim: int = int(kwargs.get("head_dim", self.hidden_size // self.n_attn_heads))
@@ -59,14 +61,14 @@ class RainConfig(PretrainedConfig):
         self.rope_theta: float = float(kwargs.get("rope_theta", 1e6))
         self.tie_word_embeddings: bool = bool(kwargs.get("tie_word_embeddings", True))
         self.inference_rope_scaling: bool = bool(kwargs.get("inference_rope_scaling", False))
-        self.rope_scaling = {
+        self.rope_scaling = requested_rope_scaling if requested_rope_scaling is not None else ({
             "beta_fast": 32,
             "beta_slow": 1,
             "factor": 8,
             "original_max_position_embeddings": 4096,
             "attention_factor": 1.0,
             "type": "yarn"
-        } if self.inference_rope_scaling else None
+        } if self.inference_rope_scaling else None)
         # attn_res
         self.block_size = int(kwargs.get("block_size", 0))
         # 聚合段梯度检查点：反向重算 norm/加权和，省掉 stack 缓冲的持有（长上下文训练省显存）
