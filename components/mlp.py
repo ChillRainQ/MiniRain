@@ -60,6 +60,18 @@ class SwiGLU(MyMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
+class FusedSwiGLU(SwiGLU):
+    """One gate/up GEMM, retaining separate parameters and Muon updates.
+
+    Concatenation is differentiable. A single packed Parameter would change
+    Muon's orthogonalization from two matrices to one, so keep the old keys.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = F.linear(x, torch.cat([self.gate.weight, self.up.weight], dim=0)).chunk(2, dim=-1)
+        # Inductor can fuse this elementwise expression, including strided views.
+        return self.down(F.silu(gate) * up)
+
+
 class AdaptiveSwiGLU(MyMLP):
     def __init__(self, args: MLPArgs, config: PreTrainedConfig | None = None,
                  fast_size: int = 32, initial_lr: float = 1e-1, **kwargs):

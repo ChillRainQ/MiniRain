@@ -2,7 +2,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedConfig
 
-from components.mlp import SwiGLU, LosslessMoE, MoTFFN, AdaptiveSwiGLU
+from components.mlp import SwiGLU, FusedSwiGLU, LosslessMoE, MoTFFN, AdaptiveSwiGLU
 from components.mlp import MLPArgs
 from components.norm import NormArgs
 from components.attention import AttentionArgs, MoTGroupQueryAttention, GatedDeltaNetAttention
@@ -10,6 +10,94 @@ from components.attention import GroupQueryAttention
 import torch.nn as nn
 
 from components.norm import RMSNorm, TorchRMSNorm
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+
+
+# CUDA FP32 BlockAttnRes kernels; unsupported cases use the reference below.
+if triton is not None:
+    @triton.jit
+    def _forward(V, W, Q, Y, R: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
+                 EPS: tl.constexpr, BD: tl.constexpr, BN: tl.constexpr):
+        row = tl.program_id(0)
+        d = tl.arange(0, BD)
+        n = tl.arange(0, BN)
+        x = tl.load(V + (n[:, None] * R + row) * D + d[None, :],
+                    (n[:, None] < N) & (d[None, :] < D), 0).to(tl.float32)
+        w = tl.load(W + d, d < D, 0).to(tl.float32)
+        q = tl.load(Q + d, d < D, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x*x, 1) / D + EPS)
+        logits = tl.sum(x * w[None, :] * q[None, :], 1) * inv
+        logits = tl.where(n < N, logits, -float('inf'))
+        p = tl.exp(logits - tl.max(logits, 0))
+        p = p / tl.sum(p, 0)
+        y = tl.sum(p[:, None] * x, 0)
+        tl.store(Y + row * D + d, y, d < D)
+
+
+    @triton.jit
+    def _backward(V, W, Q, DY, DX, DP, R: tl.constexpr, D: tl.constexpr,
+                  N: tl.constexpr, EPS: tl.constexpr, BD: tl.constexpr, BN: tl.constexpr):
+        row = tl.program_id(0)
+        d = tl.arange(0, BD)
+        n = tl.arange(0, BN)
+        mask = (n[:, None] < N) & (d[None, :] < D)
+        x = tl.load(V + (n[:, None] * R + row) * D + d[None, :], mask, 0).to(tl.float32)
+        w = tl.load(W + d, d < D, 0).to(tl.float32)
+        q = tl.load(Q + d, d < D, 0).to(tl.float32)
+        g = tl.load(DY + row * D + d, d < D, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x*x, 1) / D + EPS)
+        dot = tl.sum(x * w[None, :] * q[None, :], 1)
+        logits = tl.where(n < N, dot * inv, -float('inf'))
+        p = tl.exp(logits - tl.max(logits, 0))
+        p = p / tl.sum(p, 0)
+        dp = tl.sum(x * g[None, :], 1)
+        ds = p * (dp - tl.sum(p * dp, 0))
+        dx = p[:, None] * g[None, :] + ds[:, None] * (
+            inv[:, None] * w[None, :] * q[None, :] -
+            (dot * inv * inv * inv / D)[:, None] * x)
+        tl.store(DX + (n[:, None] * R + row) * D + d[None, :], dx, mask)
+        dwq = tl.sum((ds * inv)[:, None] * x, 0)
+        tl.store(DP + row * D + d, dwq, d < D)
+
+
+    class _FusedAttnRes(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, values, weight, query, eps):
+            n, rows, dim = values.shape
+            output = torch.empty((rows, dim), device=values.device, dtype=values.dtype)
+            _forward[(rows,)](values, weight, query, output, rows, dim, n, eps,
+                              triton.next_power_of_2(dim), triton.next_power_of_2(n), num_warps=4)
+            ctx.save_for_backward(values, weight, query)
+            ctx.eps = eps
+            return output
+
+        @staticmethod
+        @torch.autograd.function.once_differentiable
+        def backward(ctx, grad_output):
+            values, weight, query = ctx.saved_tensors
+            n, rows, dim = values.shape
+            dx = torch.empty_like(values)
+            partial = torch.empty((rows, dim), device=values.device, dtype=torch.float32)
+            _backward[(rows,)](values, weight, query, grad_output.contiguous(), dx, partial,
+                               rows, dim, n, ctx.eps, triton.next_power_of_2(dim),
+                               triton.next_power_of_2(n), num_warps=4)
+            # Reduce per-token parameter gradients without atomic contention.
+            combined = partial.sum(0)
+            return dx, combined * query, combined * weight, None
+
+
+    def fused_attn_res(values, weight, query, eps):
+        shape = values.shape[1:]
+        result = _FusedAttnRes.apply(values.reshape(values.shape[0], -1, values.shape[-1]),
+                                    weight, query, eps)
+        return result.reshape(shape)
+
+else:
+    fused_attn_res = None
 
 class FullAttnRes(nn.Module):
     """
@@ -50,6 +138,12 @@ class BlockAttnRes(nn.Module):
         DDP 会判为未使用参数。
         """
         V = torch.stack(hs, dim=0)                                        # [N, B, T, D]
+        if (fused_attn_res is not None and V.is_cuda and V.dtype == torch.float32
+                and self.attn_res_norm.weight.dtype == torch.float32
+                and self.attn_res_query.dtype == torch.float32
+                and V.shape[0] <= 16 and V.shape[-1] <= 2048):
+            return fused_attn_res(V, self.attn_res_norm.weight, self.attn_res_query,
+                                  self.attn_res_norm.eps)
         logits = (self.attn_res_norm(V) * self.attn_res_query).sum(dim=-1)  # [N, B, T]
         alpha = torch.softmax(logits.float(), dim=0).to(V.dtype)
         return (alpha.unsqueeze(-1) * V).sum(dim=0)
@@ -108,7 +202,7 @@ class BlockAttnResMiniRainBlock(nn.Module):
         self.attn = GroupQueryAttention(AttentionArgs(config)) if (self.layer_id + 1) % 4 == 0 else GatedDeltaNetAttention(AttentionArgs(config))
         self.input_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attn_layernorm = TorchRMSNorm(NormArgs(dim=config.hidden_size, eps=config.rms_norm_eps))
-        self.mlp = SwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
+        self.mlp = FusedSwiGLU(MLPArgs(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
                                          bias=False))
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)

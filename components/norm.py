@@ -3,14 +3,22 @@ import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
-
+HAS_TRITON = False
 try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-    print("triton is available")
+    from fla.modules.layernorm import rms_norm as _fused_rms_norm
+    print("fused_rms is available")
 except ImportError:
-    HAS_TRITON = False
+    _fused_rms_norm = None
+    try:
+        import triton
+        import triton.language as tl
+
+        HAS_TRITON = True
+        print("triton is available")
+    except ImportError:
+        HAS_TRITON = False
+
+
 
 
 if HAS_TRITON:
@@ -73,6 +81,10 @@ class TorchRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The raw Triton kernel has no autograd rule. A frozen input can still
         # require gradients for this module's trainable scale parameter.
+        if (_fused_rms_norm is not None and x.is_cuda and torch.is_grad_enabled()
+                and x.dtype in (torch.float32, torch.bfloat16, torch.float16)
+                and self.weight.device == x.device and x.shape[-1] == self.dim):
+            return _fused_rms_norm(x, self.weight, None, eps=self.eps)
         if (HAS_TRITON and x.is_cuda and not torch.is_grad_enabled()
                 and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
                 and x.shape[-1] == self.dim
