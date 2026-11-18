@@ -53,8 +53,10 @@ class TrainingLoss(torch.nn.Module):
     def external_loss(self, hidden, labels):
         # Fused loss/custom backward already owns its kernels; avoid tracing
         # backend chunk loops and scalar extraction through Dynamo.
-        return self.loss_fn(self.model.lm_head.weight, hidden[:, :-1].contiguous(),
-                            labels[:, 1:].contiguous())
+        # Liger expects [tokens, hidden] and [tokens], not batched tensors.
+        shifted_hidden = hidden[:, :-1, :].reshape(-1, hidden.size(-1)).contiguous()
+        shifted_labels = labels[:, 1:].reshape(-1).contiguous()
+        return self.loss_fn(self.model.lm_head.weight, shifted_hidden, shifted_labels)
 
 
 def build_optimizer(model, args):
@@ -103,8 +105,8 @@ def main():
     p.add_argument('--lr', type=float, default=5e-4)
     p.add_argument('--muon-lr-factor', type=float, default=30.)
     p.add_argument('--grad-clip', type=float, default=1.)
-    p.add_argument('--loss-backend', choices=['native', 'auto', 'liger', 'chunked'], default='native',
-                   help='默认模型原生 CE；其余是显式替代路径，比较吞吐时须保持一致')
+    p.add_argument('--loss-backend', choices=['native', 'auto', 'liger', 'chunked'], default='auto',
+                   help='默认 auto：优先 Liger，未安装则用分块 CE；native 为模型原生 CE')
     p.add_argument('--loss-chunks', type=int, default=32)
     p.add_argument('--attention-mask', choices=['none', 'ones'], default='none',
                    help='无 padding 合成数据默认不传 mask；ones 用于对照旧版变长路径')
