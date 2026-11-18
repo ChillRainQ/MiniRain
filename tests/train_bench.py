@@ -4,6 +4,7 @@ uv run tests/train_bench.py --device cuda:1 --train-batch 1 --train-seq 4096
 uv run tests/train_bench.py --no-compile --optimizer adamw
 """
 import argparse
+import atexit
 from contextlib import nullcontext
 import json
 from pathlib import Path
@@ -20,6 +21,22 @@ from train.train_util import get_muon_params, get_adamw_params
 DTYPES = dict(bf16=torch.bfloat16, fp16=torch.float16, fp32=torch.float32)
 
 
+class Tee:
+    def __init__(self, stream, logfile, echo):
+        self.stream, self.logfile, self.echo = stream, logfile, echo
+
+    def write(self, text):
+        self.logfile.write(text)
+        if self.echo:
+            self.stream.write(text)
+        return len(text)
+
+    def flush(self):
+        self.logfile.flush()
+        if self.echo:
+            self.stream.flush()
+
+
 class TrainingLoss(torch.nn.Module):
     def __init__(self, model, backend, chunks):
         super().__init__()
@@ -30,6 +47,12 @@ class TrainingLoss(torch.nn.Module):
         if self.loss_fn is None:
             return self.model(ids, attention_mask=mask, labels=labels, use_cache=False).loss
         hidden, _, _ = self.model.model(ids, attention_mask=mask, use_cache=False)
+        return self.external_loss(hidden, labels)
+
+    @torch.compiler.disable
+    def external_loss(self, hidden, labels):
+        # Fused loss/custom backward already owns its kernels; avoid tracing
+        # backend chunk loops and scalar extraction through Dynamo.
         return self.loss_fn(self.model.lm_head.weight, hidden[:, :-1].contiguous(),
                             labels[:, 1:].contiguous())
 
@@ -85,8 +108,12 @@ def main():
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--mode', choices=['default', 'max-autotune'], default='default')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--profile-iters', type=int, default=0,
+                   help='另跑同步分阶段诊断，不计入正式吞吐；0 关闭')
     p.add_argument('--quiet', action='store_true', help='仅输出结果文件路径')
     args = p.parse_args()
+    if args.profile_iters < 0:
+        p.error('--profile-iters 须为非负数')
     if min(args.iters, args.warmup, args.train_batch, args.layers, args.loss_chunks) < 1 or args.train_seq < 2:
         p.error('iters/warmup/batch/layers/chunks 须为正，seq 至少为 2')
     if args.heads < 1 or args.kv_heads < 1 or args.heads % args.kv_heads or args.hidden <= 0 or args.hidden % (2 * args.heads):
@@ -96,6 +123,20 @@ def main():
     device = torch.device(args.device)
     if device.type != 'cuda' or not torch.cuda.is_available():
         p.error('真实 FLA GDN 训练基准需要 CUDA')
+    directory = Path(__file__).resolve().parent / 'txt'
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f'train_bench_{time.strftime("%Y%m%d_%H%M%S")}_{time.time_ns() % 1000000}'
+    path = directory / (stem + '.json')
+    txt_path = directory / (stem + '.txt')
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    logfile = txt_path.open('w', encoding='utf-8', buffering=1)
+    sys.stdout = Tee(original_stdout, logfile, not args.quiet)
+    sys.stderr = Tee(original_stderr, logfile, not args.quiet)
+    def restore_streams():
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        logfile.close()
+    atexit.register(restore_streams)
+    print(f'[log] {txt_path}', flush=True)
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -119,18 +160,33 @@ def main():
         print(f'[bench] MiniRain {args.train_batch}x{args.train_seq}, optimizer={args.optimizer}, '
               f'loss={args.loss_backend}, compile={args.compile}; warmup={args.warmup}', flush=True)
 
-    def step():
-        model.zero_grad(set_to_none=True)
-        context = torch.autocast('cuda', dtype=DTYPES[args.dtype]) if args.dtype != 'fp32' else nullcontext()
-        with context:
-            loss = training(ids, mask, labels)
-        scaler.scale(loss).backward()
+    def step(profile=None):
+        def stage(name, operation):
+            if profile is None:
+                return operation()
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            value = operation()
+            torch.cuda.synchronize(device)
+            profile[name] = profile.get(name, 0.) + (time.perf_counter() - start) * 1000
+            return value
+        stage('zero_grad', lambda: model.zero_grad(set_to_none=True))
+        def forward():
+            context = torch.autocast('cuda', dtype=DTYPES[args.dtype]) if args.dtype != 'fp32' else nullcontext()
+            with context:
+                return training(ids, mask, labels)
+        loss = stage('forward_loss', forward)
+        stage('backward', lambda: scaler.scale(loss).backward())
         if optimizer is not None:
-            scaler.unscale_(optimizer)
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            def clip():
+                scaler.unscale_(optimizer)
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            stage('unscale_clip', clip)
+            def update():
+                scaler.step(optimizer)
+                scaler.update()
+            stage('optimizer', update)
         return loss.detach()
 
     torch.cuda.synchronize(device)
@@ -166,9 +222,15 @@ def main():
                   peak_allocated_mib=peak_allocated, peak_reserved_mib=peak_reserved,
                   resident_allocated_mib=torch.cuda.memory_allocated(device) / 2**20,
                   final_loss=loss.item(), gradients_finite=True)
-    directory = Path(__file__).resolve().parent / 'txt'
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f'train_bench_{time.strftime("%Y%m%d_%H%M%S")}_{time.time_ns() % 1000000}.json'
+    if args.profile_iters:
+        profile = {}
+        for _ in range(args.profile_iters):
+            diagnostic_loss = step(profile)
+        check_gradients(model)
+        if not torch.isfinite(diagnostic_loss):
+            raise RuntimeError('Nonfinite diagnostic loss')
+        result['synchronized_phase_ms'] = {name: value / args.profile_iters for name, value in profile.items()}
+        print(f'[profile: separate synchronized diagnostic] {result["synchronized_phase_ms"]}')
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     if not args.quiet:
         print(f'MiniRain ({result["parameters"]:,} params), {result["device"]}, {args.dtype}, compile={args.compile}')
@@ -176,6 +238,9 @@ def main():
         print(f'{ms:.2f} ms/step | {result["tokens_per_second"]:,.0f} input tok/s | '
               f'peak allocated={peak_allocated:.1f} MiB | peak reserved={peak_reserved:.1f} MiB | loss={loss.item():.4f}')
     print(f'[result] {path}')
+    print(f'[log] {txt_path}')
+    if args.quiet:
+        original_stdout.write(f'[result] {path}\n[log] {txt_path}\n')
 
 
 if __name__ == '__main__':

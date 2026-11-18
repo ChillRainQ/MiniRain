@@ -6,8 +6,10 @@ import torch.nn.functional as F
 try:
     from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
     _HAS_LIGER = True
+    print("[loss] 检测到 liger-kernel，将使用 Liger Fused Linear CE")
 except ImportError:
     _HAS_LIGER = False
+    print("[loss] 未检测到 liger-kernel，将使用 PyTorch 分块 CE")
 
 
 class _ChunkedCE(torch.autograd.Function):
