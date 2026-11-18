@@ -1,13 +1,13 @@
 {
   "model_config": "minirain.json",
   "data": {
-    "bin": "data/pretrain_all/pretrain_text.bin",
-    "idx": "data/pretrain_all/pretrain_text.idx",
+    "bin": "data/pretrain_all/packed/pretrain_text_packed.bin",
+    "idx": "data/pretrain_all/packed/pretrain_text_packed.idx",
     "max_length": 8192
   },
   "validation": {
-    "bin": "data/pretrain_all/val_text.bin",
-    "idx": "data/pretrain_all/val_text.idx",
+    "bin": "data/pretrain_all/packed/val_text_packed.bin",
+    "idx": "data/pretrain_all/packed/val_text_packed.idx",
     "every": 1000,
     "max_batches": 64,
     "batch_size": 1

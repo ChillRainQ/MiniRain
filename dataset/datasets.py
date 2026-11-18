@@ -195,12 +195,25 @@ class PretrainBinDataset(Dataset):
             self.bin_path.parent / "manifest.json"
         )
 
+        unified_packed = False
         if manifest_path.is_file():
             manifest = json.loads(
                 manifest_path.read_text(
                     encoding="utf-8"
                 )
             )
+
+            unified_packed = manifest.get('layout') == 'unified_text_packed'
+            if unified_packed:
+                candidates = [manifest['dataset'],manifest.get('validation',{})]
+                meta = next((item for item in candidates
+                             if item.get('bin') == self.bin_path.name
+                             and item.get('idx') == self.idx_path.name),None)
+                if (not self.packed or meta is None or
+                        int(meta['records']) != self.num_records or
+                        int(meta['stored_tokens']) != len(self.tokens) or
+                        int(meta['sequence_length']) != self.max_length):
+                    raise RuntimeError('Unified packed manifest does not match BIN/IDX or sequence length')
 
             # Original document mode must match
             # the original manifest exactly.
@@ -281,7 +294,7 @@ class PretrainBinDataset(Dataset):
         # Validate packed manifest if present
         # ---------------------------------------
 
-        if self.packed:
+        if self.packed and not unified_packed:
             candidates = [
                 self.bin_path.parent
                 / f"{self.stage}_packed_manifest.json",
