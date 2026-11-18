@@ -7,7 +7,7 @@
   "intermediate_size": 3072,
   "vocab_size": 16384,
   "tie_word_embeddings": true,
-  "block_size": 4,
+  "block_size": 6,
   "max_position_embeddings": 65536,
   "inference_rope_scaling": true,
   "rope_scaling": {
