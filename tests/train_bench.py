@@ -140,6 +140,10 @@ def main():
     p.add_argument('--attention-mask', choices=['none', 'ones'], default='none',
                    help='无 padding 合成数据默认不传 mask；ones 用于对照旧版变长路径')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--compile-dynamic', choices=['false', 'true'], default=None,
+                   help='显式选择 torch.compile dynamic=False/True；不传则保持 PyTorch 默认')
+    p.add_argument('--fp8-scale-interval', type=int, default=32)
+    p.add_argument('--fp8-check-every', type=int, default=100)
     p.add_argument('--mode', choices=['default', 'max-autotune'], default='default')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--profile-iters', type=int, default=0,
@@ -147,9 +151,9 @@ def main():
     p.add_argument('--quiet', action='store_true', help='仅输出结果文件路径')
     args = p.parse_args()
     requested_compile = args.compile
-    if args.dtype == 'fp8':
-        # MVP uses eager custom autograd and strict checks with scalar reads.
-        args.compile = False
+    compile_dynamic = None if args.compile_dynamic is None else args.compile_dynamic == 'true'
+    if min(args.fp8_scale_interval, args.fp8_check_every) < 1:
+        p.error('FP8 scale/check intervals must be positive')
     if args.profile_iters < 0:
         p.error('--profile-iters 须为非负数')
     if min(args.iters, args.warmup, args.train_batch, args.grad_accum, args.layers, args.loss_chunks) < 1 or args.train_seq < 2:
@@ -176,8 +180,8 @@ def main():
     atexit.register(restore_streams)
     print(f'[log] {txt_path}', flush=True)
     if args.dtype == 'fp8':
-        print('[fp8] Experimental eager-only scaled_mm; BF16 autocast, FP32 masters; '
-              f'requested compile={requested_compile}, effective compile=False')
+        print(f'[fp8] GPU delayed scales interval={args.fp8_scale_interval}; '
+              f'periodic finite check={args.fp8_check_every}; compile={args.compile}, dynamic={compile_dynamic}')
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -205,6 +209,7 @@ def main():
         mask = torch.ones_like(ids) if args.attention_mask == 'ones' else None
         batches.append((ids, mask, ids.clone()))
     fp8_info = None
+    fp8_controller = None
     if args.dtype == 'fp8':
         from fp8_linear import enable_fp8, probe_backend
         backend = probe_backend(device)
@@ -216,7 +221,16 @@ def main():
                     values.append(training(ids, mask, labels).float())
             return torch.stack(values)
         reference = initial_losses()
-        fp8_info = enable_fp8(model)
+        fp8_info = enable_fp8(model, args.fp8_scale_interval, args.fp8_check_every)
+        fp8_controller = fp8_info.pop('_controller')
+        # Untimed BF16 calibration includes backward, so gradient scales are
+        # initialized correctly (including grad_accum normalization).
+        accumulated_step(model, training, batches, None,
+                         torch.amp.GradScaler('cuda', enabled=False), 0.,
+                         lambda: torch.autocast('cuda', dtype=torch.bfloat16))
+        fp8_controller.finish_calibration()
+        fp8_controller.check_now(model=model)
+        model.zero_grad(set_to_none=True)
         actual = initial_losses()
         if not torch.isfinite(reference).all() or not torch.isfinite(actual).all():
             raise FloatingPointError('Nonfinite loss during BF16/FP8 comparison')
@@ -235,7 +249,9 @@ def main():
     optimizer = build_optimizer(model, args)
     if args.compile:
         torch._dynamo.config.recompile_limit = max(64, torch._dynamo.config.recompile_limit)
-        training = torch.compile(training, mode=args.mode)
+        if args.dtype == 'fp8':
+            torch._dynamo.utils.counters.clear()
+        training = torch.compile(training, mode=args.mode, dynamic=compile_dynamic)
     scaler = torch.amp.GradScaler('cuda', enabled=args.dtype == 'fp16')
     if not args.quiet:
         print(f'[bench] MiniRain {args.train_batch}x{args.train_seq}, optimizer={args.optimizer}, '
@@ -254,8 +270,11 @@ def main():
             return value
         def autocast_context():
             return torch.autocast('cuda', dtype=DTYPES[args.dtype]) if args.dtype != 'fp32' else nullcontext()
-        return accumulated_step(model, training, batches, optimizer, scaler,
+        loss = accumulated_step(model, training, batches, optimizer, scaler,
                                 args.grad_clip, autocast_context, stage)
+        if fp8_controller is not None:
+            fp8_controller.after_step(loss, model)
+        return loss
 
     torch.cuda.synchronize(device)
     start = time.perf_counter()
@@ -263,11 +282,12 @@ def main():
         loss = step()
     torch.cuda.synchronize(device)
     warmup_seconds = time.perf_counter() - start
-    if not torch.isfinite(loss):
-        raise RuntimeError('Nonfinite warmup loss')
-    check_gradients(model)
-    if args.dtype == 'fp8' and any(not torch.isfinite(p).all() for p in model.parameters()):
-        raise FloatingPointError('Nonfinite FP32 master parameters after warmup')
+    if fp8_controller is not None:
+        fp8_controller.check_now(loss, model)
+    else:
+        if not torch.isfinite(loss):
+            raise RuntimeError('Nonfinite warmup loss')
+        check_gradients(model)
     model.zero_grad(set_to_none=True)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -276,17 +296,18 @@ def main():
         loss = step()
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
-    if not torch.isfinite(loss):
-        raise RuntimeError('Nonfinite measured loss')
     # 在计时之后检查，不给性能数字加入逐参数同步开销。
     peak_allocated = torch.cuda.max_memory_allocated(device) / 2**20
     peak_reserved = torch.cuda.max_memory_reserved(device) / 2**20
-    check_gradients(model)
-    if args.dtype == 'fp8' and any(not torch.isfinite(p).all() for p in model.parameters()):
-        raise FloatingPointError('Nonfinite FP32 master parameters after measured updates')
+    if fp8_controller is not None:
+        fp8_controller.check_now(loss, model)
+    else:
+        if not torch.isfinite(loss):
+            raise RuntimeError('Nonfinite measured loss')
+        check_gradients(model)
     ms = elapsed / args.iters * 1000
     result = dict(args=vars(args), model_class=type(model).__name__,
-                  requested_compile=requested_compile, fp8=fp8_info,
+                  requested_compile=requested_compile, compile_dynamic=compile_dynamic, fp8=fp8_info,
                   parameters=sum(p.numel() for p in model.parameters()), config=config.to_dict(),
                   optimizer_implementation=('torch.optim.AdamW(fused=True)' if args.optimizer == 'adamw'
                                             else args.optimizer),
@@ -312,6 +333,12 @@ def main():
         result['synchronized_phase_ms'] = {name: value / args.profile_iters for name, value in profile.items()}
         result['profile_unit'] = 'accumulated_update_step'
         print(f'[profile: separate synchronized diagnostic] {result["synchronized_phase_ms"]}')
+    if fp8_controller is not None:
+        fp8_info['stats'] = fp8_controller.report()
+        if args.compile:
+            result['fp8_dynamo'] = dict(
+                stats=dict(torch._dynamo.utils.counters['stats']),
+                graph_breaks=dict(torch._dynamo.utils.counters['graph_break']))
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     if not args.quiet:
         print(f'MiniRain ({result["parameters"]:,} params), {result["device"]}, {args.dtype}, compile={args.compile}')
