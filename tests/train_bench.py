@@ -18,7 +18,7 @@ from architectures.rain import MiniRainForCausalLM
 from losses.loss import get_loss_fn
 from train.train_util import get_muon_params, get_adamw_params
 
-DTYPES = dict(bf16=torch.bfloat16, fp16=torch.float16, fp32=torch.float32, fp8=torch.bfloat16)
+DTYPES = dict(bf16=torch.bfloat16, fp16=torch.float16, fp32=torch.float32)
 
 
 class Tee:
@@ -146,10 +146,6 @@ def main():
                    help='另跑同步分阶段诊断，不计入正式吞吐；0 关闭')
     p.add_argument('--quiet', action='store_true', help='仅输出结果文件路径')
     args = p.parse_args()
-    requested_compile = args.compile
-    if args.dtype == 'fp8':
-        # MVP uses eager custom autograd and strict checks with scalar reads.
-        args.compile = False
     if args.profile_iters < 0:
         p.error('--profile-iters 须为非负数')
     if min(args.iters, args.warmup, args.train_batch, args.grad_accum, args.layers, args.loss_chunks) < 1 or args.train_seq < 2:
@@ -175,9 +171,6 @@ def main():
         logfile.close()
     atexit.register(restore_streams)
     print(f'[log] {txt_path}', flush=True)
-    if args.dtype == 'fp8':
-        print('[fp8] Experimental eager-only scaled_mm; BF16 autocast, FP32 masters; '
-              f'requested compile={requested_compile}, effective compile=False')
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -188,55 +181,18 @@ def main():
                         max_position_embeddings=args.train_seq, **extra)
     # FP32 主权重 + autocast，与混合精度训练一致。
     model = MiniRainForCausalLM(config).to(device).train()
-    if args.dtype == 'fp8':
-        from losses.loss import _HAS_LIGER
-    if args.dtype == 'fp8' and (args.loss_backend == 'chunked' or
-                                (args.loss_backend == 'auto' and not _HAS_LIGER)):
-        # The fallback chunked loss explicitly computes its logits in FP32.
-        # Keep the MVP LM head in BF16 autocast instead of quantizing it.
-        # Installed Liger remains selected by auto as usual.
-        print(f'[fp8] loss backend {args.loss_backend} -> native (BF16 logits, FP32 CE reduction)')
-        args.loss_backend = 'native'
+    optimizer = build_optimizer(model, args)
     training = TrainingLoss(model, args.loss_backend, args.loss_chunks).train()
+    if args.compile:
+        torch._dynamo.config.recompile_limit = max(64, torch._dynamo.config.recompile_limit)
+        training = torch.compile(training, mode=args.mode)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.dtype == 'fp16')
     batches = []
     for _ in range(args.grad_accum):
         ids = torch.randint(100, config.vocab_size, (args.train_batch, args.train_seq), device=device)
         ids[:, 0] = config.bos_token_id
         mask = torch.ones_like(ids) if args.attention_mask == 'ones' else None
         batches.append((ids, mask, ids.clone()))
-    fp8_info = None
-    if args.dtype == 'fp8':
-        from fp8_linear import enable_fp8, probe_backend
-        backend = probe_backend(device)
-        @torch.no_grad()
-        def initial_losses():
-            values = []
-            for ids, mask, labels in batches:
-                with torch.autocast('cuda', dtype=torch.bfloat16):
-                    values.append(training(ids, mask, labels).float())
-            return torch.stack(values)
-        reference = initial_losses()
-        fp8_info = enable_fp8(model)
-        actual = initial_losses()
-        if not torch.isfinite(reference).all() or not torch.isfinite(actual).all():
-            raise FloatingPointError('Nonfinite loss during BF16/FP8 comparison')
-        fp8_info['backend'] = backend
-        fp8_info['precision'] = dict(master_parameters='float32', linear_gemm='float8_e4m3fn',
-                                     gemm_outputs='bfloat16', attention_norm_embedding='unchanged',
-                                     lm_head='bf16_autocast; not quantized', loss_reduction='float32')
-        fp8_info['initial_loss_comparison'] = dict(
-            bf16_loss=reference.mean().item(), fp8_loss=actual.mean().item(),
-            absolute_difference=(actual.mean()-reference.mean()).abs().item(),
-            relative_difference=((actual.mean()-reference.mean()).abs()/reference.mean().abs().clamp_min(1e-12)).item(),
-            max_microbatch_absolute_difference=(actual-reference).abs().max().item(),
-            compared_microbatches=len(batches), same_weights_and_inputs=True)
-        print(f'[fp8 vs bf16] {fp8_info["initial_loss_comparison"]}', flush=True)
-        print(f'[fp8] converted={len(fp8_info["converted"])}, BF16 exceptions={fp8_info["bf16_linears"]}')
-    optimizer = build_optimizer(model, args)
-    if args.compile:
-        torch._dynamo.config.recompile_limit = max(64, torch._dynamo.config.recompile_limit)
-        training = torch.compile(training, mode=args.mode)
-    scaler = torch.amp.GradScaler('cuda', enabled=args.dtype == 'fp16')
     if not args.quiet:
         print(f'[bench] MiniRain {args.train_batch}x{args.train_seq}, optimizer={args.optimizer}, '
               f'accum={args.grad_accum}, effective_batch={args.train_batch * args.grad_accum}, '
@@ -266,8 +222,6 @@ def main():
     if not torch.isfinite(loss):
         raise RuntimeError('Nonfinite warmup loss')
     check_gradients(model)
-    if args.dtype == 'fp8' and any(not torch.isfinite(p).all() for p in model.parameters()):
-        raise FloatingPointError('Nonfinite FP32 master parameters after warmup')
     model.zero_grad(set_to_none=True)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -282,11 +236,8 @@ def main():
     peak_allocated = torch.cuda.max_memory_allocated(device) / 2**20
     peak_reserved = torch.cuda.max_memory_reserved(device) / 2**20
     check_gradients(model)
-    if args.dtype == 'fp8' and any(not torch.isfinite(p).all() for p in model.parameters()):
-        raise FloatingPointError('Nonfinite FP32 master parameters after measured updates')
     ms = elapsed / args.iters * 1000
     result = dict(args=vars(args), model_class=type(model).__name__,
-                  requested_compile=requested_compile, fp8=fp8_info,
                   parameters=sum(p.numel() for p in model.parameters()), config=config.to_dict(),
                   optimizer_implementation=('torch.optim.AdamW(fused=True)' if args.optimizer == 'adamw'
                                             else args.optimizer),
