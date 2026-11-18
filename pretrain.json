@@ -5,6 +5,13 @@
     "idx": "data/pretrain_all/pretrain_text.idx",
     "max_length": 8192
   },
+  "validation": {
+    "bin": "data/pretrain_all/val_text.bin",
+    "idx": "data/pretrain_all/val_text.idx",
+    "every": 1000,
+    "max_batches": 64,
+    "batch_size": 1
+  },
   "training": {
     "device": "cuda:1",
     "output_dir": "exp/pretrain_text_001",

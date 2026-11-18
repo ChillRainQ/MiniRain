@@ -12,7 +12,8 @@ class TrainingMetrics:
     FIELDS = ('step', 'epoch', 'next_batch', 'loss', 'lr', 'muon_lr',
               'grad_norm', 'grad_scale', 'tokens_seen', 'step_tokens',
               'tokens_per_sec', 'step_seconds', 'elapsed_seconds', 'eta_seconds',
-              'cuda_allocated_mb_rank0', 'cuda_peak_mb_rank0')
+              'cuda_allocated_mb_rank0', 'cuda_peak_mb_rank0',
+              'val_loss', 'val_perplexity', 'val_tokens', 'val_records', 'val_seconds')
 
     def __init__(self, output_dir, *, resume_step=None, metadata=None, config_dir=None):
         self.directory = Path(output_dir)
@@ -69,11 +70,13 @@ class TrainingMetrics:
         os.replace(csv_path.with_suffix('.csv.tmp'), csv_path)
         summary = {'status': status, 'logged_steps': len(records),
                    'last': records[-1] if records else None,
-                   'best_loss': min((r['loss'] for r in records), default=None)}
+                   'best_loss': min((r['loss'] for r in records), default=None),
+                   'best_val_loss': min((r['val_loss'] for r in records
+                                         if r.get('val_loss') is not None), default=None)}
         self._atomic_text('summary.json', json.dumps(summary, ensure_ascii=False, indent=2,
                                                     allow_nan=False))
         charts = []
-        for key in ('loss', 'lr', 'muon_lr', 'grad_norm', 'tokens_per_sec',
+        for key in ('loss', 'val_loss', 'val_perplexity', 'lr', 'muon_lr', 'grad_norm', 'tokens_per_sec',
                     'step_seconds', 'tokens_seen', 'cuda_peak_mb_rank0'):
             points = [(r['step'], r[key]) for r in records
                       if isinstance(r.get(key), (int, float)) and math.isfinite(r[key])]

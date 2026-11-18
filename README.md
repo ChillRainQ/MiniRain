@@ -115,10 +115,10 @@ gen = model.generate(inputs=ids, max_new_tokens=64, do_sample=False)
 ## 编译全量文本语料
 
 ```bash
-uv run scripts/compile_pretrain_text.py --data-dir data/ultradata --output-dir data/pretrain_all --max-length 8192
+uv run scripts/compile_pretrain_text.py --data-dir data/ultradata --output-dir data/pretrain_all --max-length 8192 --val-ratio 0.001 --val-seed 42
 ```
 
-递归编译全部 JSONL 文本，输出一对 `pretrain_text.bin` / `pretrain_text.idx` 和 `manifest.json`，不再按阶段分配配额。超长文档切块保留全部正文；详细参数及读取方式见[编译说明](docs/pretrain_text_compilation.md)。
+递归编译全部 JSONL 文本，训练数据输出 `pretrain_text.bin/.idx`，默认按文档等概率留出约 0.1% 到独立的 `val_text.bin/.idx`，并保存 `manifest.json`。不再按阶段分配配额，超长文档切块保留全部正文且不跨训练/验证集；详细参数及读取方式见[编译说明](docs/pretrain_text_compilation.md)。
 
 ## 纯文本预训练
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile every JSONL text into one uint16 BIN / uint64 IDX pair.
+"""Compile JSONL text into training and held-out uint16 BIN / uint64 IDX pairs.
 
 No stage quotas. Split long documents without discarding tails. Each record
 has BOS/EOS and at most --max-length tokens; padding is not stored.
@@ -8,6 +8,7 @@ from array import array
 import argparse
 from datetime import datetime, timezone
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -21,6 +22,13 @@ DEFAULT_DATA_DIR = ROOT / 'data/ultradata'
 DEFAULT_TOKENIZER = ROOT / 'minirain_tokenizer'
 DEFAULT_OUTPUT_DIR = ROOT / 'data/pretrain_all'
 OUTPUT_NAMES = ('pretrain_text.bin', 'pretrain_text.idx', 'manifest.json')
+VAL_NAMES = ('val_text.bin', 'val_text.idx')
+
+
+def is_validation(text, ratio, seed):
+    """Content hashing keeps exact duplicates and every document chunk together."""
+    digest = hashlib.blake2b(str(seed).encode() + b'\0' + text.encode('utf-8'), digest_size=8).digest()
+    return int.from_bytes(digest, 'big') < int(ratio * (1 << 64))
 
 
 def discover_sources(data_dir):
@@ -34,9 +42,9 @@ def discover_sources(data_dir):
 
 
 class BinWriter:
-    def __init__(self, output_dir, flush_tokens):
-        self.bin_tmp = output_dir / 'pretrain_text.bin.tmp'
-        self.idx_tmp = output_dir / 'pretrain_text.idx.tmp'
+    def __init__(self, output_dir, flush_tokens, prefix='pretrain_text'):
+        self.bin_tmp = output_dir / f'{prefix}.bin.tmp'
+        self.idx_tmp = output_dir / f'{prefix}.idx.tmp'
         self.bin_file = self.bin_tmp.open('xb')
         try:
             self.idx_file = self.idx_tmp.open('xb')
@@ -81,9 +89,11 @@ class BinWriter:
 def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
                    max_length=8192, batch_size=128, flush_tokens=1_000_000,
                    text_field='text', skip_invalid=False, overwrite=False,
-                   log_every=100_000):
+                   log_every=100_000, val_ratio=0.001, val_seed=42):
     if max_length < 3 or min(batch_size, flush_tokens, log_every) <= 0:
         raise ValueError('max_length must be >= 3; batch/flush/log sizes must be positive')
+    if not 0 <= val_ratio < 1 or type(val_seed) is not int or val_seed < 0:
+        raise ValueError('val_ratio must be in [0, 1); val_seed must be a nonnegative integer')
     if sys.byteorder != 'little' or array('H').itemsize != 2 or array('Q').itemsize != 8:
         raise RuntimeError('Requires little-endian uint16 / uint64 arrays')
     special = {f'{name}_token_id': getattr(tokenizer, f'{name}_token_id')
@@ -96,24 +106,32 @@ def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
     data_dir, output_dir = Path(data_dir).resolve(), Path(output_dir).resolve()
     sources = discover_sources(data_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing = [name for name in OUTPUT_NAMES if (output_dir / name).exists()]
+    names = (*OUTPUT_NAMES, *VAL_NAMES)
+    existing = [name for name in names if (output_dir / name).exists()]
     if existing and not overwrite:
         raise FileExistsError(f'Output already exists; use --overwrite: {existing}')
-    temporary = [output_dir / (name + '.tmp') for name in OUTPUT_NAMES]
+    if not val_ratio and any((output_dir / name).exists() for name in VAL_NAMES):
+        raise ValueError('Use a new output directory when disabling an existing validation split')
+    temporary = [output_dir / (name + '.tmp') for name in names]
     if any(path.exists() for path in temporary):
         raise FileExistsError('Compiler temporary files exist; inspect them before retrying')
     writer = BinWriter(output_dir, flush_tokens)
+    writers = {'train': writer}
+    split_stats = {split: dict(documents=0, text_tokens=0) for split in ('train', 'validation')}
     start = time.monotonic()
     stats = {}
     total_documents = total_text_tokens = 0
     next_log = log_every
     max_body = max_length - 2
     try:
+        if val_ratio:
+            writers['validation'] = BinWriter(output_dir, flush_tokens, prefix='val_text')
         for file_index, source in enumerate(sources, 1):
             name = source.relative_to(data_dir).as_posix()
             print(f'[{file_index}/{len(sources)}] {name}', flush=True)
             current = dict(lines_read=0, documents=0, records=0, text_tokens=0,
-                           split_documents=0, empty_text=0, blank_lines=0, invalid_records=0)
+                           split_documents=0, empty_text=0, blank_lines=0, invalid_records=0,
+                           train_documents=0, validation_documents=0)
             batch = []
 
             def process_batch():
@@ -123,11 +141,16 @@ def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
                 encoded = tokenizer(batch, add_special_tokens=False, truncation=False,
                                     padding=False, return_attention_mask=False,
                                     return_token_type_ids=False)['input_ids']
-                for body in encoded:
+                for text, body in zip(batch, encoded):
+                    split = 'validation' if val_ratio and is_validation(text, val_ratio, val_seed) else 'train'
+                    destination = writers[split]
                     chunks = max(1, (len(body) + max_body - 1) // max_body)
                     for chunk in range(chunks):
-                        writer.add(body[chunk*max_body:(chunk+1)*max_body],
+                        destination.add(body[chunk*max_body:(chunk+1)*max_body],
                                    special['bos_token_id'], special['eos_token_id'])
+                    split_stats[split]['documents'] += 1
+                    split_stats[split]['text_tokens'] += len(body)
+                    current['train_documents' if split == 'train' else 'validation_documents'] += 1
                     current['documents'] += 1
                     current['records'] += chunks
                     current['text_tokens'] += len(body)
@@ -137,7 +160,8 @@ def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
                 batch.clear()
                 if total_documents >= next_log:
                     elapsed = time.monotonic() - start
-                    print(f'  documents={total_documents:,} records={writer.records:,} '
+                    print(f'  documents={total_documents:,} train_records={writer.records:,} '
+                          f'val_records={writers["validation"].records if val_ratio else 0:,} '
                           f'text_tokens={total_text_tokens:,} '
                           f'{total_text_tokens/max(elapsed, 1e-6):,.0f} tok/s '
                           f'elapsed={elapsed/60:.1f} min', flush=True)
@@ -169,10 +193,20 @@ def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
             stats[name] = current
             print(f'  documents={current["documents"]:,} records={current["records"]:,} '
                   f'text_tokens={current["text_tokens"]:,} '
+                  f'val_documents={current["validation_documents"]:,} '
                   f'invalid={current["invalid_records"]:,} empty={current["empty_text"]:,}', flush=True)
         if writer.records == 0:
             raise ValueError('No nonempty text records found; no dataset published')
-        writer.finalize()
+        if val_ratio and writers['validation'].records == 0:
+            raise ValueError('Validation split is empty; increase --val-ratio or set --val-ratio 0')
+        for destination in writers.values():
+            destination.finalize()
+        def metadata(split, prefix):
+            destination = writers[split]
+            return dict(bin=f'{prefix}.bin', idx=f'{prefix}.idx',
+                documents=split_stats[split]['documents'], records=destination.records,
+                actual_text_tokens=split_stats[split]['text_tokens'], stored_tokens=destination.stored_tokens,
+                bin_bytes=destination.stored_tokens*2, idx_bytes=(destination.records+1)*8)
         manifest = dict(
             project='MiniRain', layout='unified_text',
             updated_at=datetime.now(timezone.utc).isoformat(),
@@ -182,27 +216,37 @@ def compile_corpus(data_dir, output_dir, tokenizer, *, tokenizer_dir=None,
             format=dict(bin='uint16 little-endian', idx='uint64 little-endian',
                         offset_count='records + 1', offset_unit='tokens', padding='not stored',
                         document_concatenation=False, long_documents='split_without_truncation'),
-            dataset=dict(bin=OUTPUT_NAMES[0], idx=OUTPUT_NAMES[1], documents=total_documents,
-                         records=writer.records, actual_text_tokens=total_text_tokens,
-                         stored_tokens=writer.stored_tokens, bin_bytes=writer.stored_tokens*2,
-                         idx_bytes=(writer.records+1)*8),
+            dataset=metadata('train', 'pretrain_text'),
+            split=dict(validation_ratio=val_ratio, seed=val_seed,
+                       algorithm='blake2b-64(seed + NUL + UTF8 text)', unit='source document',
+                       exact_duplicates_same_split=True),
+            totals=dict(documents=total_documents, text_tokens=total_text_tokens),
             text_field=text_field, skip_invalid=skip_invalid, sources=stats)
-        if writer.bin_tmp.stat().st_size != writer.stored_tokens*2 or writer.idx_tmp.stat().st_size != (writer.records+1)*8:
-            raise RuntimeError('BIN/IDX size validation failed')
+        if val_ratio:
+            manifest['validation'] = metadata('validation', 'val_text')
+        for destination in writers.values():
+            if destination.bin_tmp.stat().st_size != destination.stored_tokens*2 or destination.idx_tmp.stat().st_size != (destination.records+1)*8:
+                raise RuntimeError('BIN/IDX size validation failed')
         with temporary[2].open('x', encoding='utf-8') as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
         # Finish processing before publication; publish manifest last.
-        for temporary_path, name in zip(temporary, OUTPUT_NAMES):
-            os.replace(temporary_path, output_dir / name)
+        for destination in writers.values():
+            for path in (destination.bin_tmp, destination.idx_tmp):
+                os.replace(path, path.with_suffix(''))
+        os.replace(temporary[2], output_dir / 'manifest.json')
     except BaseException:
-        writer.abort()
+        for destination in writers.values():
+            destination.abort()
         temporary[2].unlink(missing_ok=True)
         raise
-    print(f'[DONE] documents={total_documents:,} records={writer.records:,} '
-          f'text_tokens={total_text_tokens:,} stored_tokens={writer.stored_tokens:,}\n'
+    print(f'[DONE] documents={total_documents:,} train_records={writer.records:,} '
+          f'val_records={writers["validation"].records if val_ratio else 0:,} '
+          f'text_tokens={total_text_tokens:,}\n'
           f'BIN: {output_dir / OUTPUT_NAMES[0]}\nIDX: {output_dir / OUTPUT_NAMES[1]}', flush=True)
+    if val_ratio:
+        print(f'VAL BIN: {output_dir / VAL_NAMES[0]}\nVAL IDX: {output_dir / VAL_NAMES[1]}', flush=True)
     return manifest
 
 
@@ -218,12 +262,18 @@ def main():
     parser.add_argument('--text-field', default='text')
     parser.add_argument('--skip-invalid', action='store_true', help='Skip malformed/non-text rows and count them')
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--val-ratio', type=float, default=0.001,
+                        help='Document validation fraction; default 0.1%%, 0 disables validation')
+    parser.add_argument('--val-seed', type=int, default=42, help='Deterministic document-content split seed')
     parser.add_argument('--dry-run', action='store_true', help='List sources without tokenization or writes')
     args = parser.parse_args()
     if args.max_length < 3 or min(args.batch_size, args.flush_tokens, args.log_every) <= 0:
         parser.error('max-length must be >= 3; batch/flush/log sizes must be positive')
+    if not 0 <= args.val_ratio < 1 or args.val_seed < 0:
+        parser.error('val-ratio must be in [0, 1); val-seed must be nonnegative')
     sources = discover_sources(args.data_dir)
-    print(f'Source files: {len(sources)}; output: {args.output_dir.resolve()}', flush=True)
+    print(f'Source files: {len(sources)}; output: {args.output_dir.resolve()}; '
+          f'validation={args.val_ratio:.3%}; seed={args.val_seed}', flush=True)
     if args.dry_run:
         for source in sources:
             print(source)
@@ -236,7 +286,8 @@ def main():
                    tokenizer_dir=args.tokenizer.resolve(), max_length=args.max_length,
                    batch_size=args.batch_size, flush_tokens=args.flush_tokens,
                    text_field=args.text_field, skip_invalid=args.skip_invalid,
-                   overwrite=args.overwrite, log_every=args.log_every)
+                   overwrite=args.overwrite, log_every=args.log_every,
+                   val_ratio=args.val_ratio, val_seed=args.val_seed)
 
 
 if __name__ == '__main__':

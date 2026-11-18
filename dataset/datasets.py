@@ -205,9 +205,15 @@ class PretrainBinDataset(Dataset):
             # Original document mode must match
             # the original manifest exactly.
             if not self.packed:
-                stage_meta = (manifest["dataset"]
-                              if manifest.get("layout") == "unified_text"
-                              else manifest["stages"][self.stage])
+                if manifest.get("layout") == "unified_text":
+                    candidates = [manifest['dataset'], manifest.get('validation', {})]
+                    stage_meta = next((meta for meta in candidates
+                                       if meta.get('bin') == self.bin_path.name
+                                       and meta.get('idx') == self.idx_path.name), None)
+                    if stage_meta is None:
+                        raise ValueError('BIN/IDX names do not match a manifest split')
+                else:
+                    stage_meta = manifest["stages"][self.stage]
 
                 if (
                     int(stage_meta["records"])
