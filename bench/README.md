@@ -1,5 +1,19 @@
 # MiniRain 预训练评估
 
+## lm-eval 内置任务
+
+通用入口直接加载 MiniRain `.pt` 或最终权重，也可传实验目录。对比中文故事续写判断和两项基础能力任务：
+
+```bash
+uv run --extra chid bench/lm_eval_pretrain.py --device cuda:1 \
+  --ckpt exp/pretrain_text_004/pretrain/step_00011000.pt \
+         exp/pretrain_text_004/pretrain/step_00017000.pt \
+  --tasks xstorycloze_zh cmmlu_elementary_chinese cmmlu_elementary_commonsense \
+  --output outputs/evaluation/004_base_bench.json
+```
+
+`--tasks` 可换成 `lambada_openai` 或其他 `lm-eval` 任务名。默认零样本，首次运行需要访问任务数据源。可用 `--limit 64` 先试跑每个任务，正式对比时去掉。加 `--log-samples` 可以把逐题结果也写入 JSON。
+
 ## CLUE ChID（lm-eval）
 
 从 [CLUE ChID 数据包](https://storage.googleapis.com/cluebenchmark/tasks/chid_public.zip) 解压 `dev.json` 和 `dev_answer.json` 到 `data/chid/`，或用 `--data-dir` 指向已有的解压目录。使用项目中已有的 `lm-eval`，从仓库根目录运行：
