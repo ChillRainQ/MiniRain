@@ -37,6 +37,6 @@
     "seed": 42,
     "log_every": 8,
     "save_every": 1000,
-    "keep_checkpoints": 5
+    "keep_checkpoints": 30
   }
 }
