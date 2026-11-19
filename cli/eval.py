@@ -1,21 +1,18 @@
 # -*- coding: utf-8 -*-
 """MiniRain 文本预训练模型测试：直接加载落盘权重生成文本。
 
-权重是 train.ckpt.save_state_dict 保存的裸 state_dict（fp16，如
-outputs/p1/p1_final_weights.pth），模型结构由同目录的 config.json
-或 run_config.json 的 model_config 段还原，不再依赖手写 hidden_size/layers。
+支持当前纯文本 MiniRain 的 final_weights.pth 裸权重及 latest.pt/step_*.pt
+训练断点。实验目录内自动查找 pretrain/ 权重，配置优先使用断点内保存的
+config，裸权重从阶段目录或实验根目录的 model_config.json 还原。
 
 用法:
-    python cli/eval.py                                   # 默认 p1_long 权重
-    python cli/eval.py --ckpt p1 --prompt "机器学习是"          # 切到 P1（4k）权重
-    python cli/eval.py --ckpt outputs/p1_long                   # 也可以直接给实验目录
-    python cli/eval.py --prompt "为什么天空是蓝色的"       # 单条 prompt
-    python cli/eval.py --interactive                     # 交互式输入
-    python cli/eval.py --ckpt outputs/latest.pt          # 训练断点(latest.pt/step_*.pt)
-    python cli/eval.py --use_cache 0                     # 关 KV Cache，对比解码耗时
-    python cli/eval.py --hf_generate 0                   # 回退自定义解码循环（默认走 HF generate）
-    python cli/eval.py --prompt "机器学习是" --logits_topk 10        # 看 next-token logits
-    python cli/eval.py --prompt "机器学习是" --logits_save out.pt --logits_all 1  # 落盘全序列 logits
+    python cli/eval.py --ckpt pretrain_text_004 --device cuda:1 --prompt "机器学习是"
+    python cli/eval.py --ckpt exp/pretrain_text_004/pretrain/latest.pt
+    python cli/eval.py --ckpt pretrain_text_004 --interactive 1
+    python cli/eval.py --ckpt pretrain_text_004 --use_cache 0
+    python cli/eval.py --ckpt pretrain_text_004 --hf_generate 0
+    python cli/eval.py --ckpt pretrain_text_004 --prompt "机器学习是" --logits_topk 10
+    python cli/eval.py --ckpt pretrain_text_004 --prompt "机器学习是" --logits_save out.pt --logits_all 1
 """
 import argparse
 import json
@@ -32,12 +29,11 @@ sys.path.insert(0, str(ROOT))
 
 import project
 from architectures.config import RainConfig
-from architectures.rain_v import MiniRainVForCausalLM
+from architectures.rain import MiniRainForCausalLM
 from train.train_util import get_model_params, setup_seed
 
-DEFAULT_CKPT = ROOT / 'outputs/p1_long/p1_long_16k_final_weights.pth'
 # 目录形式的 --ckpt 按此顺序找权重：阶段产物 > 断点 > 其它权重
-WEIGHT_PATTERNS = ('*_final_weights.pth', 'latest.pt', '*weights*.pth', '*.pth')
+WEIGHT_PATTERNS = ('final_weights.pth', '*_final_weights.pth', 'latest.pt', 'step_*.pt', '*weights*.pth', '*.pth')
 DEFAULT_PROMPTS = [
     '你有什么特长？',
     '为什么天空是蓝色的',
@@ -51,29 +47,36 @@ DEFAULT_PROMPTS = [
 
 
 def find_weight(path: Path):
-    """--ckpt 既可以是权重文件，也可以是实验目录（如 outputs/p1、outputs/p1_long）"""
+    """Resolve weights from an explicit file or an experiment directory."""
     if path.is_file():
         return path
     if not path.is_dir():
         raise FileNotFoundError(path)
     for pattern in WEIGHT_PATTERNS:
-        found = sorted(path.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        found = sorted([p for directory in (path / 'pretrain', path) for p in directory.glob(pattern) if p.is_file()],
+                       key=lambda p: p.stat().st_mtime, reverse=True)
         if found:
             print(f'[Weight] {path} -> {found[0].name}')
             return found[0]
-    raise FileNotFoundError(f'{path} 下找不到权重文件，请用 --ckpt 指定具体 .pth')
+    raise FileNotFoundError(f'{path} 及其 pretrain/ 下找不到权重，请用 --ckpt 指定 .pt 或 .pth 文件')
 
 
 def read_model_config(weight_path: Path, config_path: Path | None):
-    """配置来源优先级：显式 --config > 权重目录 config.json > run_config.json"""
+    """查找模型配置；支持实验根目录、阶段目录和训练 JSON 引用。"""
     candidates = ([Path(config_path)] if config_path is not None else
-                  [weight_path.parent / 'config.json', weight_path.parent / 'run_config.json'])
+                  [directory / name for directory in (weight_path.parent, weight_path.parent.parent)
+                   for name in ('model_config.json', 'config.json', 'run_config.json', 'training_config.json')])
     for candidate in candidates:
         if not candidate.is_file():
             continue
         raw = json.loads(candidate.read_text(encoding='utf8'))
         stage = raw.get('stage')  # run_config.json 记录的训练阶段，如 p1 / p1_long_16k
-        raw = raw.get('model_config', raw)  # run_config.json 只把模型段放在 model_config
+        raw = raw.get('model_config', raw)
+        if isinstance(raw, str):
+            referenced = Path(raw)
+            if not referenced.is_absolute():
+                referenced = candidate.parent / referenced
+            raw = json.loads(referenced.read_text(encoding='utf8'))
         if isinstance(raw, dict) and 'hidden_size' in raw:
             print(f'[Config] {candidate}' + (f' (stage={stage})' if stage else ''))
             return raw
@@ -105,19 +108,14 @@ def read_checkpoint(path: Path, config_path: Path | None):
 
 def build_model(config_dict, state, device, dtype):
     config = RainConfig(**config_dict)
-    # loss 只在 --ppl_text 时用到；推理环境没装 liger-kernel 时退回分块 CE
-    if config.loss_backend == 'liger':
-        try:
-            import liger_kernel  # noqa: F401
-        except ImportError:
-            print('[Warn] liger-kernel 未安装，loss 后端回退为 chunked')
-            config.loss_backend = 'chunked'
-    model = MiniRainVForCausalLM(config)
+    if any('.attn.gdn.' in key for key in state):
+        raise ValueError('该权重使用旧 GDN/GQA 混合结构，不能加载到当前全 GQA MiniRain')
+    model = MiniRainForCausalLM(config)
     model.load_state_dict(state, strict=True)
     get_model_params(model, config)
     # 保留转换前的表；先转 fp16 再 .float() 无法恢复丢失的精度。
     rope_buffers = {name: buffer for name in
-                    ('rope_cos1d', 'rope_sin1d', 'rope_cos2d', 'rope_sin2d')
+                    ('freqs_cos', 'freqs_sin')
                     if (buffer := getattr(model.model, name)) is not None}
     model.to(device=device, dtype=dtype)
     for name, buffer in rope_buffers.items():
@@ -214,18 +212,20 @@ def run(args, model, tokenizer):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="MiniRain 文本预训练模型测试")
-    parser.add_argument('--ckpt', default=str(DEFAULT_CKPT), type=str,
-                        help="权重文件或实验目录：裸 *_weights.pth、断点 latest.pt，或 outputs/p1 这类目录")
+    parser.add_argument('--ckpt', required=True, type=str,
+                        help="指定纯文本权重、训练断点或实验目录")
     parser.add_argument('--config', default=None, type=str,
-                        help="模型配置（config.json 或 run_config.json）；默认在权重目录自动查找")
+                        help="模型或训练 JSON；默认从检查点或实验目录 model_config.json 读取")
     parser.add_argument('--tokenizer_path', default=project.TOKENIZER_PATH, type=str, help="分词器目录")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str,
                         help="运行设备（CPU 上回退 fp32）")
+    parser.add_argument('--dtype', choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                        help='CUDA 推理精度，默认与预训练一致为 bf16；CPU 使用 fp32')
     parser.add_argument('--prompt', default='', type=str, help="单条 prompt；为空则跑内置列表")
     parser.add_argument('--interactive', default=0, type=int, choices=[0, 1], help="交互式输入（1=开）")
     parser.add_argument('--max_prompt_tokens', default=4096, type=int, help="prompt 截断长度")
     parser.add_argument('--max_new_tokens', default=256, type=int,
-                        help="最大生成长度（P1 训练上下文 4k、p1_long 为 8k/16k/32k，不要显著超过）")
+                        help="最大生成长度；prompt 与生成长度之和须在模型上下文范围内")
     parser.add_argument('--temperature', default=0.8, type=float, help="生成温度，0 表示贪心")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus 采样阈值（0-1）")
     parser.add_argument('--top_k', default=50, type=int, help="top-k 采样（0=关闭）")
@@ -249,13 +249,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    dtype = torch.float16 if device.type == 'cuda' else torch.float32
+    dtype = dict(bf16=torch.bfloat16, fp16=torch.float16, fp32=torch.float32)[args.dtype] if device.type == 'cuda' else torch.float32
     if device.type == 'cpu':
         print('[Warn] CPU 上使用 fp32 推理，速度会明显低于 GPU')
     ckpt_path = Path(args.ckpt)
     if not ckpt_path.is_absolute():
-        # 相对路径先按项目根目录解释，再回退到 outputs/（方便直接写 --ckpt p1）
-        candidates = [ROOT / ckpt_path, ROOT / 'outputs' / ckpt_path]
+        # Accept project-relative paths and short experiment names.
+        candidates = [ROOT / ckpt_path, ROOT / 'exp' / ckpt_path, ROOT / 'outputs' / ckpt_path]
         ckpt_path = next((p for p in candidates if p.exists()), candidates[0])
     ckpt_path = find_weight(ckpt_path)
     config_dict, state = read_checkpoint(ckpt_path, args.config)
