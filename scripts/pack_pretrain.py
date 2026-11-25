@@ -153,7 +153,8 @@ def pack_corpus(data_dir, output_dir=None, seq_len=8192, *, overwrite=False):
         old = json.loads((output_dir/'manifest.json').read_text(encoding='utf-8'))
         if 'validation' in old:
             raise ValueError('Use a new output directory when removing validation')
-    manifest = {key:original[key] for key in ('project','tokenizer_dir','vocab_size','special_tokens','split') if key in original}
+    manifest = {key:original[key] for key in ('project','tokenizer_dir','vocab_size','special_tokens','split','shuffle')
+                if key in original}
     manifest.update(layout='unified_text_packed',max_length=seq_len,
         updated_at=datetime.now(timezone.utc).isoformat(),source_dir=str(data_dir),
         source_manifest_sha256=hashlib.sha256(source_manifest.read_bytes()).hexdigest(),

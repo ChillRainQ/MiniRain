@@ -243,7 +243,7 @@ def run(args, resolved):
         resume_path = directory / 'latest.pt' if args.resume == 'auto' else Path(args.resume).resolve() if args.resume else None
         signature = data_signature(data)
         # Device/output placement may change; mathematical training settings may not.
-        contract = dict(model=config.to_dict(), data=signature,
+        contract = dict(model=config.to_dict(), data=signature, data_order='sequential',
                         training={k: v for k, v in settings.items()
                                   if k not in ('device', 'output_dir', 'num_workers', 'log_every', 'save_every', 'keep_checkpoints')},
                         total_steps=total_steps,
@@ -255,6 +255,9 @@ def run(args, resolved):
                 raise FileNotFoundError(resume_path)
             old_contract = checkpoint.get('contract', {})
             old_contract.setdefault('validation', None)
+            # Replay pre-shuffle-format runs in their original order.
+            if old_contract.setdefault('data_order', 'legacy_random') == 'legacy_random':
+                contract['data_order'] = 'legacy_random'
             if old_contract != contract:
                 raise ValueError('Resume requires unchanged model/data/optimizer/batch/LR schedule settings')
             model.load_state_dict(checkpoint['model'], strict=True)
@@ -286,14 +289,20 @@ def run(args, resolved):
         warmup = round(total_steps * settings['warmup_ratio'])
         dtype = dict(bf16=torch.bfloat16, fp16=torch.float16, fp32=torch.float32)[settings['dtype']]
         print(f'[Run] {experiment}; micro_batch={settings["batch_size"]}; accum={settings["grad_accum"]}; '
-              f'updates/epoch={steps_per_epoch:,}; total_updates={total_steps:,}; resume_step={global_step:,}', flush=True)
+              f'updates/epoch={steps_per_epoch:,}; total_updates={total_steps:,}; resume_step={global_step:,}; '
+              f'data_order={contract["data_order"]}', flush=True)
         try:
             for epoch in range(epoch_start, settings['epochs']):
                 if global_step >= total_steps:
                     break
-                sampler = RandomSampler(data, generator=torch.Generator().manual_seed(settings['seed'] + epoch))
                 offset = next_batch if epoch == epoch_start else 0
-                loader = DataLoader(data, batch_sampler=SkipBatchSampler(sampler, settings['batch_size'], offset),
+                if contract['data_order'] == 'legacy_random':
+                    sampler = RandomSampler(data, generator=torch.Generator().manual_seed(settings['seed'] + epoch))
+                    batch_sampler = SkipBatchSampler(sampler, settings['batch_size'], offset)
+                else:
+                    remaining = range(offset * settings['batch_size'], len(data))
+                    batch_sampler = SkipBatchSampler(remaining, settings['batch_size'])
+                loader = DataLoader(data, batch_sampler=batch_sampler,
                     collate_fn=TextCollate(data.pad_id, data.max_length), num_workers=settings['num_workers'],
                     pin_memory=True, generator=torch.Generator().manual_seed(settings['seed'] + epoch))
                 iterator = iter(loader)

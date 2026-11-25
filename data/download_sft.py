@@ -1,4 +1,4 @@
-"""Stream UltraData SFT JSONL from HF Mirror under a local byte budget."""
+"""Download UltraData SFT from HF Mirror or generate local identity examples."""
 
 import argparse
 from decimal import Decimal, InvalidOperation
@@ -87,6 +87,74 @@ def write_group(session, shard_urls, output, budget):
     return size, rows
 
 
+def generate_identity(target, budget):
+    name, version, developer = "RainPocket", "V1", "Chill_Rain"
+    topics = (
+        (
+            (f"我叫 {name}。", f"我的模型名称是 {name}。", f"I’m {name}.", f"My model name is {name}."),
+            ("你叫什么名字？", "你的模型名字是什么？", "请告诉我你的名称。", "我该怎么称呼你？"),
+            ("What is your name?", "What should I call you?", "Tell me your model name.", "What are you called?"),
+        ),
+        (
+            (f"我的版本是 {version}。", f"当前是 {name} {version}。",
+             f"My version is {version}.", f"This is {name} {version}."),
+            ("你是什么版本？", "你的版本号是多少？", "这是什么版本的模型？", "请告诉我当前的版本。"),
+            ("What version are you?", "What is your model version?",
+             "Which release am I talking to?", "Tell me your version."),
+        ),
+        (
+            (f"我的开发者是 {developer}。", f"我是由 {developer} 开发的。",
+             f"My developer is {developer}.", f"I was developed by {developer}."),
+            ("谁开发了你？", "你的开发者是谁？", "你是由谁做出来的？", "请告诉我这个模型的开发者。"),
+            ("Who developed you?", "Who is your developer?", "Who made this model?", "Name your developer."),
+        ),
+        (
+            (f"我是 {name} {version}，由 {developer} 开发。",
+             f"我是 {developer} 开发的 {name}，当前版本是 {version}。",
+             f"I’m {name} {version}, developed by {developer}.",
+             f"I’m {name}, version {version}. My developer is {developer}."),
+            ("你是谁？", "简单介绍一下自己。", "请介绍你的名称、版本和开发者。", "你好，能说一下你的模型信息吗？"),
+            ("Who are you?", "Introduce yourself briefly.",
+             "What is your name, version, and developer?", "Tell me a bit about this model."),
+        ),
+    )
+    conversations = []
+    for (short_zh, long_zh, short_en, long_en), questions_zh, questions_en in topics:
+        for questions, answers in ((questions_zh, (short_zh, long_zh)),
+                                    (questions_en, (short_en, long_en))):
+            conversations.extend((question, answers[index % len(answers)])
+                                 for index, question in enumerate(questions))
+    conversations.extend((
+        ("你叫什么名字？", f"我叫 {name}。", "这个模型是谁开发的？", f"开发者是 {developer}。"),
+        ("谁开发了你？", f"我的开发者是 {developer}。", "那现在是什么版本？", f"当前版本是 {version}。"),
+        ("What is your name?", f"I’m {name}.", "And which version is this?", f"This is version {version}."),
+        ("Which version are you?", f"My version is {version}.", "Who developed it?", f"It was developed by {developer}."),
+    ))
+    payload = "".join(
+        json.dumps({"messages": [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": text}
+            for index, text in enumerate(conversation)
+        ]}, ensure_ascii=False) + "\n"
+        for conversation in conversations
+    ).encode("utf-8")
+    if budget is not None and len(payload) > budget:
+        raise ValueError(f"Identity dataset needs {len(payload):,} bytes. Increase --gb or omit it for self.")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".self-", dir=target.parent) as temporary:
+        staging = Path(temporary) / "output"
+        staging.mkdir()
+        (staging / "identity.jsonl").write_bytes(payload)
+        manifest = dict(
+            dataset="self", name=name, version=version, developer=developer,
+            budget_bytes=budget, bytes=len(payload),
+            files=[dict(path="identity.jsonl", bytes=len(payload), rows=len(conversations))],
+        )
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        staging.rename(target)
+    print(f"[Generated] {len(conversations):,} rows, {len(payload):,} bytes -> {target}", flush=True)
+
+
 def download(state, budget, target, token):
     from huggingface_hub import HfApi, hf_hub_url
     import requests
@@ -139,12 +207,20 @@ def download(state, budget, target, token):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state", required=True, choices=REPOS)
-    parser.add_argument("--gb", required=True, type=budget_bytes, help="maximum local JSONL size in decimal GB")
+    parser.add_argument("--state", required=True, choices=(*REPOS, "self"))
+    parser.add_argument("--gb", type=budget_bytes, help="maximum JSONL size in decimal GB; optional for self")
     args = parser.parse_args()
+    if args.state != "self" and args.gb is None:
+        parser.error("--gb is required for 2605 and 2609")
     target = OUTPUT / args.state
     if target.exists():
         parser.exit(1, f"Output already exists: {target}\n")
+    if args.state == "self":
+        try:
+            generate_identity(target, args.gb)
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"Identity generation failed: {error}\n")
+        return
     token = None
     if args.state == "2605":
         token = os.environ.get("HF_MIRROR_TOKEN", "").strip()
