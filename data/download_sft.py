@@ -119,16 +119,26 @@ def generate_identity(target, budget):
         ),
     )
     conversations = []
+    forms_zh = ("{}", "请简短回答：{}", "我想确认一下，{}", "请直接告诉我：{}",
+                "用一句话回答：{}", "你好，想问一下，{}")
+    forms_en = ("{}", "A quick question: {}", "Could you confirm this? {}", "Please answer directly: {}",
+                "Answer in one sentence: {}", "Hi, I wanted to ask: {}")
     for (short_zh, long_zh, short_en, long_en), questions_zh, questions_en in topics:
-        for questions, answers in ((questions_zh, (short_zh, long_zh)),
-                                    (questions_en, (short_en, long_en))):
-            conversations.extend((question, answers[index % len(answers)])
-                                 for index, question in enumerate(questions))
+        for questions, answers, forms in ((questions_zh, (short_zh, long_zh), forms_zh),
+                                          (questions_en, (short_en, long_en), forms_en)):
+            conversations.extend((form.format(question), answers[(index + style) % len(answers)])
+                                 for index, question in enumerate(questions)
+                                 for style, form in enumerate(forms))
     conversations.extend((
         ("你叫什么名字？", f"我叫 {name}。", "这个模型是谁开发的？", f"开发者是 {developer}。"),
         ("谁开发了你？", f"我的开发者是 {developer}。", "那现在是什么版本？", f"当前版本是 {version}。"),
         ("What is your name?", f"I’m {name}.", "And which version is this?", f"This is version {version}."),
         ("Which version are you?", f"My version is {version}.", "Who developed it?", f"It was developed by {developer}."),
+        ("你是 V1 吗？", f"是的，我的版本是 {version}。", "模型全名是什么？", f"我是 {name} {version}。"),
+        ("简单介绍一下自己。", f"我是 {name} {version}，由 {developer} 开发。",
+         "单独说一下开发者名字。", developer),
+        ("Who made you?", f"I was developed by {developer}.", "What is the model called?", name),
+        ("What model is this?", f"This is {name} {version}.", "Please confirm the developer.", developer),
     ))
     payload = "".join(
         json.dumps({"messages": [
@@ -139,6 +149,10 @@ def generate_identity(target, budget):
     ).encode("utf-8")
     if budget is not None and len(payload) > budget:
         raise ValueError(f"Identity dataset needs {len(payload):,} bytes. Increase --gb or omit it for self.")
+    if target.exists():
+        old_manifest = target / "manifest.json"
+        if not old_manifest.is_file() or json.loads(old_manifest.read_text(encoding="utf-8")).get("dataset") != "self":
+            raise ValueError(f"Output is not a generated identity dataset: {target}")
 
     target.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".self-", dir=target.parent) as temporary:
@@ -151,7 +165,11 @@ def generate_identity(target, budget):
             files=[dict(path="identity.jsonl", bytes=len(payload), rows=len(conversations))],
         )
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        staging.rename(target)
+        if target.exists():
+            for name in ("identity.jsonl", "manifest.json"):
+                (staging / name).replace(target / name)
+        else:
+            staging.rename(target)
     print(f"[Generated] {len(conversations):,} rows, {len(payload):,} bytes -> {target}", flush=True)
 
 
@@ -213,7 +231,7 @@ def main():
     if args.state != "self" and args.gb is None:
         parser.error("--gb is required for 2605 and 2609")
     target = OUTPUT / args.state
-    if target.exists():
+    if target.exists() and args.state != "self":
         parser.exit(1, f"Output already exists: {target}\n")
     if args.state == "self":
         try:
