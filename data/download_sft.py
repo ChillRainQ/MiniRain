@@ -2,10 +2,13 @@
 
 import argparse
 from decimal import Decimal, InvalidOperation
+from getpass import GetPassWarning, getpass
 import json
 import os
 from pathlib import Path, PurePosixPath
+import sys
 from tempfile import TemporaryDirectory
+import warnings
 
 
 GB = 1_000_000_000
@@ -142,11 +145,20 @@ def main():
     target = OUTPUT / args.state
     if target.exists():
         parser.exit(1, f"Output already exists: {target}\n")
-    token = os.environ.get("HF_MIRROR_TOKEN")
-    if args.state == "2605" and not token:
-        parser.exit(1, "2605 requires access approval on Hugging Face and HF_MIRROR_TOKEN for HF Mirror.\n")
+    token = None
+    if args.state == "2605":
+        token = os.environ.get("HF_MIRROR_TOKEN", "").strip()
+        if not token and sys.stdin.isatty():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", GetPassWarning)
+                    token = getpass("Hugging Face token for hf-mirror.com: ").strip()
+            except (EOFError, KeyboardInterrupt, GetPassWarning):
+                parser.exit(1, "\nToken input cancelled or hidden input unavailable.\n")
+        if not token:
+            parser.exit(1, "No Hugging Face token received. Run in a terminal or set HF_MIRROR_TOKEN.\n")
     try:
-        download(args.state, args.gb, target, token if args.state == "2605" else None)
+        download(args.state, args.gb, target, token)
     except Exception as error:
         response = getattr(error, "response", None)
         status = getattr(response, "status_code", None)
