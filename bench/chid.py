@@ -1,9 +1,11 @@
 """Evaluate MiniRain checkpoints on CLUE ChID with lm-eval."""
 
 import argparse
+import ast
 import json
 import re
 import sys
+from functools import partial
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,10 +59,51 @@ def load_chid(data_dir, **_):
     return DatasetDict(validation=Dataset.from_list(documents))
 
 
-def make_task(data_dir):
+def load_original_test(path, **_):
+    """Fill each original-ChID blank independently and remove other blanks."""
+    documents = []
+    with Path(path).open(encoding='utf-8-sig') as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                row = ast.literal_eval(line)
+            parts = row['content'].split('#idiom#')
+            answers, candidates = row['groundTruth'], row['candidates']
+            if len(parts) - 1 != len(answers) or len(answers) != len(candidates):
+                raise ValueError(f'{path}:{line_number}: inconsistent blank, answer and candidate counts')
+            for index, (answer, choices) in enumerate(zip(answers, candidates)):
+                left = ''.join(parts[:index + 1])
+                right = ''.join(parts[index + 1:])
+                documents.append(dict(id=f'{line_number}:{index}', prefix='',
+                                      choices=[left + idiom + right for idiom in choices],
+                                      answer=choices.index(answer)))
+    if not documents:
+        raise ValueError(f'No ChID blanks found in {path}')
+    return DatasetDict(test=Dataset.from_list(documents))
+
+
+def score_passage_perplexity(doc, results, *, tokenizer):
+    scores = []
+    for passage, (logprob, _) in zip(doc['choices'], results, strict=True):
+        tokens = tokenizer.encode(passage, add_special_tokens=False)
+        # Match lm-eval's empty-context path if the passage already begins with BOS.
+        length = len(tokens) - int(tokens[0] == tokenizer.bos_token_id)
+        scores.append(logprob / length)
+    return {'acc': int(max(range(len(scores)), key=scores.__getitem__) == doc['answer'])}
+
+
+def make_task(data_dir, original_test=None, tokenizer=None):
+    config = dict(task='minirain_chid_dev', custom_dataset=load_chid,
+                  dataset_kwargs=dict(data_dir=str(data_dir)), validation_split='validation')
+    if original_test is not None:
+        config = dict(task='minirain_chid_original_test', custom_dataset=load_original_test,
+                      dataset_kwargs=dict(path=str(original_test)), test_split='test',
+                      process_results=partial(score_passage_perplexity, tokenizer=tokenizer))
     return ConfigurableTask(config=dict(
-        task='minirain_chid_dev', custom_dataset=load_chid,
-        dataset_kwargs=dict(data_dir=str(data_dir)), validation_split='validation',
+        **config,
         output_type='multiple_choice', doc_to_text='prefix', doc_to_choice='choices',
         doc_to_target='answer', target_delimiter='', num_fewshot=0,
         metric_list=[dict(metric='acc', aggregation='mean', higher_is_better=True)],
@@ -71,6 +114,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ckpt', required=True, nargs='+', type=Path)
     parser.add_argument('--data-dir', type=Path, default=ROOT / 'data/chid')
+    parser.add_argument('--original-test', type=Path, help='Original ChID test_data.txt with embedded answers')
     parser.add_argument('--tokenizer', default=TOKENIZER_PATH)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch-size', type=int, default=4)
@@ -79,12 +123,14 @@ def main():
     args = parser.parse_args()
     if args.batch_size < 1 or (args.limit is not None and args.limit < 1):
         parser.error('--batch-size and --limit must be positive')
-    for filename in ('dev.json', 'dev_answer.json'):
-        if not (args.data_dir / filename).is_file():
-            parser.error(f'Missing {args.data_dir / filename}; see bench/README.md for the CLUE ChID download')
+    data_paths = ([args.original_test] if args.original_test is not None else
+                  [args.data_dir / filename for filename in ('dev.json', 'dev_answer.json')])
+    for path in data_paths:
+        if not path.is_file():
+            parser.error(f'Missing {path}; see bench/README.md for the ChID download')
 
-    task = make_task(args.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    task = make_task(args.data_dir, args.original_test, tokenizer)
     device = torch.device(args.device)
     dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
     reports = []
@@ -108,8 +154,11 @@ def main():
         del harness, model
 
     if args.output is not None:
-        report = dict(dataset=str(args.data_dir.resolve()), limit=args.limit, num_fewshot=0,
-                      scoring='conditional loglikelihood of candidate plus right context', checkpoints=reports)
+        dataset_path = args.original_test if args.original_test is not None else args.data_dir
+        scoring = ('per-token loglikelihood of the filled passage' if args.original_test is not None else
+                   'conditional loglikelihood of candidate plus right context')
+        report = dict(dataset=str(dataset_path.resolve()), limit=args.limit, num_fewshot=0,
+                      scoring=scoring, checkpoints=reports)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 

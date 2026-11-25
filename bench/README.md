@@ -27,6 +27,8 @@ uv run --extra chid bench/chid.py --device cuda:1 \
 
 可加 `--limit 64` 冒烟测试。默认跑完 dev 的所有空格。每个空格由 `lm-eval` 独立评分，比较候选成语及其后文在给定前文下的总对数概率。前文和候选分别分词，BOS 加在前文前，避免不同候选改变前文的分词结果。其他空格保留为占位符，不使用正确答案，也不做跨空格唯一匹配。报告的 `acc` 适合按此协议对比同系列检查点。
 
+评估 [ChID 原始论文测试集](https://huggingface.co/datasets/thu-coai/chid/blob/main/original/test_data.txt)时，下载 `original/test_data.txt` 并传给 `--original-test`。文件包含答案。输出任务名为 `minirain_chid_original_test`，按 CPM 论文的方法逐空填入候选、移除其他占位符，并选择整段 token PPL 最低的成语。
+
 ## 中文自由续写诊断
 
 在仓库根目录指定要评估的检查点。训练中途可以使用具体的 `step_*.pt` 做可复现的对照，也可以传实验目录，由脚本按现有 eval 规则选权重。
