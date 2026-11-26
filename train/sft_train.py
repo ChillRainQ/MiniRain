@@ -86,7 +86,7 @@ from architectures.config import RainConfig
 from architectures.rain import MiniRainForCausalLM
 from cli.eval import find_weight, read_checkpoint
 from dataset.datasets import SftBinDataset
-from train.ckpt import load_ckpt_path, save_exp, save_rolling_ckpt, save_state_dict
+from train.ckpt import load_ckpt_path, save_rolling_ckpt, save_state_dict
 from train.metrics import TrainingMetrics
 from train.pretrain import restore_rng, rng_state, validation_indices
 from train.text_training import TextTrainingLoss, build_optimizer
@@ -261,8 +261,6 @@ def run(args):
             step, tokens_seen = checkpoint["step"], checkpoint["tokens_seen"]
             restore_rng(checkpoint["rng"])
             del checkpoint
-        else:
-            save_exp(output.name, output_dir=stage_dir)
         stage_dir.mkdir(parents=True, exist_ok=True)
         if args.resume and resume_path.parent != stage_dir and not (stage_dir / "train.jsonl").exists():
             old_log = output / "train.jsonl"
