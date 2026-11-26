@@ -25,7 +25,7 @@ from scripts.compile_pretrain_text import shuffled_rows
 MIX = {"no_think": 60, "think": 25, "agent": 15}
 AGENT_SOURCES = ("Tool_Use", "Search_Agent", "General_Agent")
 MAX_AGENT_CALLS = 4
-DEFAULT_SEQUENCE_LENGTH = 16_384
+DEFAULT_SEQUENCE_LENGTH = 4_096
 IDENTITY_ROWS = 200
 
 
@@ -104,12 +104,12 @@ def encode(row, tokenizer, template, group, seq_length):
                                             return_dict=True, tokenize=True,
                                             return_assistant_tokens_mask=True, truncation=False)
     ids, mask = encoded["input_ids"], encoded["assistant_masks"]
-    if len(ids) > seq_length:
-        return None, "too_long"
+    truncated = len(ids) > seq_length
+    ids, mask = ids[:seq_length], mask[:seq_length]
     targets = sum(mask[1:])
     if not targets:
-        return None, "no_targets"
-    return (ids, mask, targets), None
+        return None, "no_targets_after_truncation" if truncated else "no_targets"
+    return (ids, mask, targets, truncated), None
 
 
 def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
@@ -150,7 +150,7 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
     quotas["self"] = self_tokens
     data_budget = tokens - self_tokens
     stats = {group: dict(rows=0, input_tokens=0, supervised_tokens=0, target_tokens=cap,
-                         rows_over_8k=0, max_input_length=0, skipped={})
+                         truncated_rows=0, rows_over_8k=0, max_input_length=0, skipped={})
              for group, cap in quotas.items()}
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -159,7 +159,7 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
         staging.mkdir()
         with (staging / "input_ids.bin").open("wb") as inputs, (staging / "loss_mask.bin").open("wb") as masks:
             def write(group, item):
-                ids, mask, target_count = item
+                ids, mask, target_count, truncated = item
                 input_row = np.full(seq_length, tokenizer.pad_token_id, dtype="<u2")
                 mask_row = np.zeros(seq_length, dtype="u1")
                 input_row[:len(ids)] = ids
@@ -170,6 +170,7 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
                 stats[group]["rows"] += 1
                 stats[group]["input_tokens"] += len(ids)
                 stats[group]["supervised_tokens"] += target_count
+                stats[group]["truncated_rows"] += int(truncated)
                 stats[group]["rows_over_8k"] += int(len(ids) > 8192)
                 stats[group]["max_input_length"] = max(stats[group]["max_input_length"], len(ids))
 
@@ -220,6 +221,7 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
             supervised_tokens=supervised_tokens, supervised_token_shortfall=tokens - supervised_tokens,
             exhausted_groups=exhausted,
             input_tokens=sum(group["input_tokens"] for group in stats.values()),
+            truncated_rows=sum(group["truncated_rows"] for group in stats.values()),
             rows_over_8k=sum(group["rows_over_8k"] for group in stats.values()),
             max_input_length=max(group["max_input_length"] for group in stats.values()),
             padded_positions=rows * seq_length - sum(group["input_tokens"] for group in stats.values()),
@@ -235,18 +237,21 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/sft")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/sft/compiled")
+    parser.add_argument("--output-dir", type=Path, help="compiled output directory (default data/sft/compiled_4k_trunc at 4096 tokens)")
     parser.add_argument("--tokenizer", type=Path, default=ROOT / "minirain_tokenizer")
     parser.add_argument("--tokens", type=token_budget, default=200_000_000, help="supervised token cap (default 200M)")
     parser.add_argument("--seq-length", type=int, default=DEFAULT_SEQUENCE_LENGTH,
-                        help="fixed padded sequence length (default 16384)")
+                        help="truncate or right-pad to this length (default %(default)s)")
     parser.add_argument("--seed", type=int, default=42, help="document shuffle seed")
     args = parser.parse_args()
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = ROOT / "data/sft" / ("compiled_4k_trunc" if args.seq_length == DEFAULT_SEQUENCE_LENGTH else "compiled")
     tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer.resolve()), use_fast=True, local_files_only=True)
     try:
-        compile_sft(args.data_dir, args.output_dir, tokenizer,
+        compile_sft(args.data_dir, output_dir, tokenizer,
                     tokens=args.tokens, seq_length=args.seq_length, seed=args.seed)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"SFT compile failed: {exc}\n")

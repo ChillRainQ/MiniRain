@@ -22,11 +22,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=Path, help="Base weights or pretraining experiment")
     parser.add_argument("--model-config", type=Path, help="Override the base model JSON")
-    parser.add_argument("--data-dir", type=Path, default=ROOT / "data/sft/compiled_16k")
+    parser.add_argument("--data-dir", type=Path, default=ROOT / "data/sft/compiled_4k_trunc")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "exp/rainpocket_v1_sft")
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA device index")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
@@ -36,7 +36,8 @@ def parse_args():
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--loss-backend", choices=("auto", "liger", "chunked", "native"), default="auto")
     parser.add_argument("--loss-chunks", type=int, default=32)
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                        help="Compile attention and FFN modules with dynamic sequence lengths")
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Recompute Transformer blocks on backward to reduce activation memory")
     parser.add_argument("--checkpoint-min-length", type=int, default=8193,
@@ -86,7 +87,7 @@ from architectures.config import RainConfig
 from architectures.rain import MiniRainForCausalLM
 from cli.eval import find_weight, read_checkpoint
 from dataset.datasets import SftBinDataset
-from train.ckpt import load_ckpt_path, save_rolling_ckpt, save_state_dict
+from train.ckpt import load_ckpt_path, save_exp, save_rolling_ckpt, save_state_dict
 from train.metrics import TrainingMetrics
 from train.pretrain import restore_rng, rng_state, validation_indices
 from train.text_training import TextTrainingLoss, build_optimizer
@@ -120,17 +121,19 @@ def checkpoint_rain_layer(layer, hidden, position_embeddings, *, past_hidden_sta
     return checkpoint(recompute, hidden, position_embeddings, *past_hidden_states, use_reentrant=False)
 
 
+def compile_sft_layers(model):
+    for layer in model.model.layers:
+        layer.attn.compile(dynamic=True)
+        layer.mlp.compile(dynamic=True)
+
+
 class SftMetrics(TrainingMetrics):
     FIELDS = TrainingMetrics.FIELDS + ("input_tokens", "input_tokens_per_sec", "max_seq_length")
 
 
 def move_batch(ids, labels, data, device):
-    # Trim the common right-padding tail before taking the batch to CUDA.
     valid = ids.ne(data.pad_token_id) | labels.ne(-100)
-    end = int(valid.any(dim=0).nonzero()[-1, 0]) + 1
-    end = min(data.max_length, math.ceil(end / 128) * 128)
-    return (ids[:, :end].to(device, non_blocking=True),
-            labels[:, :end].to(device, non_blocking=True), int(valid.sum()))
+    return (ids.to(device, non_blocking=True), labels.to(device, non_blocking=True), int(valid.sum()))
 
 
 @torch.no_grad()
@@ -221,6 +224,9 @@ def run(args):
         model.load_state_dict(state, strict=True)
         del state
         model.to(device).train()
+        if args.compile:
+            compile_sft_layers(model)
+            print("[SFT] Compile enabled for GQA and SwiGLU", flush=True)
         if args.activation_checkpointing:
             for index, layer in enumerate(model.model.layers):
                 model.model.layers[index] = checkpoint_wrapper(
@@ -229,9 +235,6 @@ def run(args):
         optimizer = build_optimizer(model, dict(optimizer="adamw", lr=args.lr, weight_decay=args.weight_decay))
         scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
         loss_fn = SftTrainingLoss(model, args.loss_backend, args.loss_chunks)
-        val_loss_fn = loss_fn
-        if args.compile:
-            loss_fn = torch.compile(loss_fn, dynamic=True)
 
         data_files = {}
         for field, relative in data.manifest["files"].items():
@@ -261,12 +264,15 @@ def run(args):
             step, tokens_seen = checkpoint["step"], checkpoint["tokens_seen"]
             restore_rng(checkpoint["rng"])
             del checkpoint
+        save_exp(output.name, output_dir=output)
         stage_dir.mkdir(parents=True, exist_ok=True)
         if args.resume and resume_path.parent != stage_dir and not (stage_dir / "train.jsonl").exists():
             old_log = output / "train.jsonl"
             if old_log.is_file():
                 shutil.copyfile(old_log, stage_dir / "train.jsonl")
         config.to_json_file(stage_dir / "model_config.json", use_diff=False)
+        (stage_dir / "training_config.json").write_text(
+            json.dumps(training_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         metrics = SftMetrics(stage_dir, resume_step=step if args.resume else None,
                              metadata=dict(model_config=config.to_dict(), configuration=training_config,
                                            total_steps=total_steps, device=str(device)))
@@ -287,6 +293,7 @@ def run(args):
         try:
             for epoch in range(epoch_start, args.epochs):
                 batch_position = batch_start if epoch == epoch_start else 0
+                # The compiler already shuffled the source rows.
                 remaining = range(batch_position * args.batch_size, len(train_data))
                 loader = DataLoader(train_data, batch_sampler=SkipBatchSampler(remaining, args.batch_size),
                                     pin_memory=True, num_workers=args.num_workers,
@@ -347,7 +354,7 @@ def run(args):
                     )
                     shutdown = shutdown or (args.stop_after > 0 and updates >= args.stop_after)
                     if val_loader is not None and (step % args.val_every == 0 or step == total_steps or shutdown):
-                        record.update(evaluate_sft(model, val_loss_fn, val_loader, data, device, dtype))
+                        record.update(evaluate_sft(model, loss_fn, val_loader, data, device, dtype))
                         print(f"[SFT Val] step={step:,} loss={record['val_loss']:.6f} "
                               f"ppl={record['val_perplexity']} tokens={record['val_tokens']:,} "
                               f"rows={record['val_records']:,}", flush=True)
@@ -362,6 +369,7 @@ def run(args):
                                          next_batch=next_batch, tokens_seen=tokens_seen, rng=rng_state(),
                                          contract=contract, config=config.to_dict())
                         metrics.export(status="running")
+                        print(f"[SFT Checkpoint] {stage_dir / 'latest.pt'}", flush=True)
                     if shutdown:
                         break
                 if shutdown:
