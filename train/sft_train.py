@@ -36,11 +36,13 @@ def parse_args():
     parser.add_argument("--loss-backend", choices=("auto", "liger", "chunked", "native"), default="auto")
     parser.add_argument("--loss-chunks", type=int, default=32)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--activation-checkpointing", action="store_true",
+                        help="Recompute Transformer blocks on backward to reduce activation memory")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=8)
-    parser.add_argument("--save-every", type=int, default=1000)
-    parser.add_argument("--keep-checkpoints", type=int, default=5)
+    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--keep-checkpoints", type=int, default=30)
     parser.add_argument("--val-samples", type=int, default=128, help="Fixed held-out rows; 0 disables validation")
     parser.add_argument("--val-every", type=int, default=1000, help="Validate every N optimizer updates")
     parser.add_argument("--val-batch-size", type=int, default=1)
@@ -72,7 +74,10 @@ if __name__ == "__main__":
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.utils.data import DataLoader, Subset
+from torch.utils.checkpoint import checkpoint
 
 from architectures.config import RainConfig
 from architectures.rain import MiniRainForCausalLM
@@ -83,6 +88,33 @@ from train.metrics import TrainingMetrics
 from train.pretrain import restore_rng, rng_state, validation_indices
 from train.text_training import TextTrainingLoss, build_optimizer
 from train.train_util import SkipBatchSampler, format_training_progress, get_lr, setup_seed
+
+
+class SftTrainingLoss(TextTrainingLoss):
+    def forward(self, ids, labels):
+        hidden, _, _ = self.model.model(ids, use_cache=False)
+        return self.external_loss(hidden, labels)
+
+    @torch.compiler.disable
+    def external_loss(self, hidden, labels):
+        targets = labels[:, 1:].reshape(-1)
+        supervised = targets.ne(-100)
+        states = hidden[:, :-1].reshape(-1, hidden.size(-1))[supervised]
+        targets = targets[supervised]
+        if self.loss_fn is None:
+            return F.cross_entropy(self.model.lm_head(states).float(), targets)
+        return self.loss_fn(self.model.lm_head.weight, states, targets)
+
+
+def checkpoint_rain_layer(layer, hidden, position_embeddings, *, past_hidden_states, **kwargs):
+    if not torch.is_grad_enabled():
+        return layer(hidden, position_embeddings, past_hidden_states=past_hidden_states, **kwargs)
+
+    def recompute(hidden, position_embeddings, *history):
+        # Flush blocks append to this list. Each forward and recompute needs its own copy.
+        return layer(hidden, position_embeddings, past_hidden_states=list(history), **kwargs)
+
+    return checkpoint(recompute, hidden, position_embeddings, *past_hidden_states, use_reentrant=False)
 
 
 def move_batch(ids, labels, data, device):
@@ -175,9 +207,13 @@ def run(args):
         model.load_state_dict(state, strict=True)
         del state
         model.to(device).train()
+        if args.activation_checkpointing:
+            for index, layer in enumerate(model.model.layers):
+                model.model.layers[index] = checkpoint_wrapper(layer, checkpoint_fn=checkpoint_rain_layer)
+            print("[SFT] Activation checkpointing enabled", flush=True)
         optimizer = build_optimizer(model, dict(optimizer="adamw", lr=args.lr, weight_decay=args.weight_decay))
         scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
-        loss_fn = TextTrainingLoss(model, args.loss_backend, args.loss_chunks)
+        loss_fn = SftTrainingLoss(model, args.loss_backend, args.loss_chunks)
         val_loss_fn = loss_fn
         if args.compile:
             loss_fn = torch.compile(loss_fn, dynamic=True)
