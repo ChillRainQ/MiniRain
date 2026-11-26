@@ -66,6 +66,78 @@ class PretrainDataset(Dataset):
         return input_ids, labels
 
 
+class SftBinDataset(Dataset):
+    """Read fixed-width SFT rows written by scripts/compile_sft.py.
+
+    Each item is (input_ids, labels). Labels are aligned with input_ids so
+    the causal LM can shift them when calculating loss.
+    """
+
+    def __init__(self, data_dir):
+        super().__init__()
+        self.data_dir = Path(data_dir).resolve()
+        manifest_path = self.data_dir / "manifest.json"
+        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if self.manifest.get("layout") != "rainpocket_sft_fixed":
+            raise ValueError(f"Expected a RainPocket SFT manifest: {manifest_path}")
+
+        self.num_records = self.manifest["rows"]
+        self.max_length = self.manifest["sequence_length"]
+        self.vocab_size = self.manifest["tokenizer_vocab_size"]
+        self.pad_token_id = self.manifest["pad_token_id"]
+        self.supervised_tokens = self.manifest["supervised_tokens"]
+        if (type(self.num_records) is not int or self.num_records <= 0
+                or type(self.max_length) is not int or self.max_length < 2):
+            raise ValueError(f"Invalid SFT array shape: {manifest_path}")
+
+        self._files = []
+        self._maps = None
+        for field, dtype in (("input_ids", "<u2"), ("loss_mask", "u1")):
+            if self.manifest["dtypes"].get(field) != dtype:
+                raise ValueError(f"Invalid dtype for {field} in {manifest_path}; expected {dtype}")
+            path = self.data_dir / self.manifest["files"][field]
+            expected = self.num_records * self.max_length * np.dtype(dtype).itemsize
+            actual = path.stat().st_size
+            if actual != expected:
+                raise ValueError(f"Invalid SFT file size for {path}: expected {expected}, got {actual} bytes")
+            self._files.append((path, dtype))
+
+    def __len__(self):
+        return self.num_records
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.num_records
+        if not 0 <= index < self.num_records:
+            raise IndexError(index)
+        if self._maps is None:
+            shape = (self.num_records, self.max_length)
+            self._maps = tuple(np.memmap(path, dtype=dtype, mode="r", shape=shape)
+                               for path, dtype in self._files)
+
+        tokens, mask = self._maps
+        input_ids = torch.from_numpy(tokens[index].astype(np.int64))
+        labels = input_ids.clone()
+        labels.masked_fill_(torch.from_numpy(mask[index] == 0), -100)
+        return input_ids, labels
+
+    def __getstate__(self):
+        # Spawned DataLoader workers open the files themselves.
+        return dict(self.__dict__, _maps=None)
+
+    def close(self):
+        if self._maps is not None:
+            for mapping in self._maps:
+                mapping._mmap.close()
+            self._maps = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 
 
 
