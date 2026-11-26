@@ -204,24 +204,21 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
                         pending.remove(group)
                         if not pending:
                             break
-            short = {group: quotas[group] - stats[group]["supervised_tokens"] for group in pending
-                     if quotas[group] - stats[group]["supervised_tokens"] >= seq_length}
-            if short:
-                details = ", ".join(f"{group}: {count:,} tokens short, skipped={stats[group]['skipped']}"
-                                    for group, count in sorted(short.items()))
-                raise ValueError(f"Sources exhausted ({details}). Increase --seq-length or reduce --tokens.")
-            empty = [group for group in MIX if stats[group]["rows"] == 0]
-            if empty:
-                raise ValueError(f"No compiled rows for {', '.join(empty)}. Check input data and token budget.")
+            exhausted = {group: quotas[group] - stats[group]["supervised_tokens"] for group in sorted(pending)}
+            for group, shortfall in exhausted.items():
+                print(f"[Exhausted] {group}: {shortfall:,} supervised tokens short; "
+                      f"skipped={stats[group]['skipped']}", flush=True)
             for item in identity[identity_index:]:
                 write("self", item)
 
         rows = sum(group["rows"] for group in stats.values())
+        supervised_tokens = sum(group["supervised_tokens"] for group in stats.values())
         manifest = dict(
             layout="rainpocket_sft_fixed", sequence_length=seq_length, rows=rows, seed=seed,
             tokenizer_vocab_size=len(tokenizer), pad_token_id=tokenizer.pad_token_id,
             target_supervised_tokens=tokens,
-            supervised_tokens=sum(group["supervised_tokens"] for group in stats.values()),
+            supervised_tokens=supervised_tokens, supervised_token_shortfall=tokens - supervised_tokens,
+            exhausted_groups=exhausted,
             input_tokens=sum(group["input_tokens"] for group in stats.values()),
             rows_over_8k=sum(group["rows_over_8k"] for group in stats.values()),
             max_input_length=max(group["max_input_length"] for group in stats.values()),
