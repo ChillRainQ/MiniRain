@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import signal
 import sys
 import time
@@ -38,6 +39,8 @@ def parse_args():
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Recompute Transformer blocks on backward to reduce activation memory")
+    parser.add_argument("--checkpoint-min-length", type=int, default=8193,
+                        help="Minimum batch sequence length for activation checkpointing; 0 recomputes all")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=8)
@@ -47,7 +50,7 @@ def parse_args():
     parser.add_argument("--val-every", type=int, default=1000, help="Validate every N optimizer updates")
     parser.add_argument("--val-batch-size", type=int, default=1)
     parser.add_argument("--stop-after", type=int, default=0, help="Stop after this many updates in this invocation")
-    parser.add_argument("--resume", action="store_true", help="Resume from output-dir/latest.pt")
+    parser.add_argument("--resume", action="store_true", help="Resume from output-dir/sft/latest.pt")
     parser.add_argument("--dry-run", action="store_true", help="Validate compiled data and model on CPU")
     args = parser.parse_args()
     if args.ckpt is None and not args.resume:
@@ -55,8 +58,8 @@ def parse_args():
     if min(args.batch_size, args.grad_accum, args.epochs, args.loss_chunks,
            args.log_every, args.save_every, args.keep_checkpoints, args.val_every, args.val_batch_size) < 1:
         parser.error("batch, accumulation, epochs, loss chunks and intervals must be positive")
-    if min(args.gpu, args.num_workers, args.seed, args.stop_after, args.val_samples) < 0:
-        parser.error("gpu, workers, seed, stop-after and val-samples must be nonnegative")
+    if min(args.gpu, args.num_workers, args.seed, args.stop_after, args.val_samples, args.checkpoint_min_length) < 0:
+        parser.error("gpu, workers, seed, stop-after, val-samples and checkpoint-min-length must be nonnegative")
     if not all(math.isfinite(x) for x in (args.lr, args.grad_clip, args.weight_decay,
                                           args.warmup_ratio, args.min_lr_ratio)):
         parser.error("optimizer settings must be finite")
@@ -106,8 +109,8 @@ class SftTrainingLoss(TextTrainingLoss):
         return self.loss_fn(self.model.lm_head.weight, states, targets)
 
 
-def checkpoint_rain_layer(layer, hidden, position_embeddings, *, past_hidden_states, **kwargs):
-    if not torch.is_grad_enabled():
+def checkpoint_rain_layer(layer, hidden, position_embeddings, *, past_hidden_states, min_length=0, **kwargs):
+    if not torch.is_grad_enabled() or hidden.shape[1] < min_length:
         return layer(hidden, position_embeddings, past_hidden_states=past_hidden_states, **kwargs)
 
     def recompute(hidden, position_embeddings, *history):
@@ -117,11 +120,17 @@ def checkpoint_rain_layer(layer, hidden, position_embeddings, *, past_hidden_sta
     return checkpoint(recompute, hidden, position_embeddings, *past_hidden_states, use_reentrant=False)
 
 
+class SftMetrics(TrainingMetrics):
+    FIELDS = TrainingMetrics.FIELDS + ("input_tokens", "input_tokens_per_sec", "max_seq_length")
+
+
 def move_batch(ids, labels, data, device):
     # Trim the common right-padding tail before taking the batch to CUDA.
-    end = int((ids.ne(data.pad_token_id) | labels.ne(-100)).any(dim=0).nonzero()[-1, 0]) + 1
+    valid = ids.ne(data.pad_token_id) | labels.ne(-100)
+    end = int(valid.any(dim=0).nonzero()[-1, 0]) + 1
     end = min(data.max_length, math.ceil(end / 128) * 128)
-    return ids[:, :end].to(device, non_blocking=True), labels[:, :end].to(device, non_blocking=True)
+    return (ids[:, :end].to(device, non_blocking=True),
+            labels[:, :end].to(device, non_blocking=True), int(valid.sum()))
 
 
 @torch.no_grad()
@@ -137,7 +146,7 @@ def evaluate_sft(model, loss_fn, loader, data, device, dtype):
             count = int(labels[:, 1:].ne(-100).sum())
             if not count:
                 continue
-            ids, labels = move_batch(ids, labels, data, device)
+            ids, labels, _ = move_batch(ids, labels, data, device)
             amp = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
             with amp:
                 loss = loss_fn(ids, labels)
@@ -160,10 +169,15 @@ def run(args):
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("SFT supports one GPU")
     output = args.output_dir.resolve()
+    stage_dir = output / "sft"
     if args.resume:
-        checkpoint = load_ckpt_path(output / "latest.pt", adjust_step_for_world_size=False)
+        resume_path = stage_dir / "latest.pt"
+        if not resume_path.is_file():
+            resume_path = next((path for path in (output / "checkpoints/latest.pt", output / "latest.pt")
+                                if path.is_file()), resume_path)
+        checkpoint = load_ckpt_path(resume_path, adjust_step_for_world_size=False)
         if not checkpoint or checkpoint.get("contract", {}).get("stage") != "sft":
-            raise ValueError("Resume requires an SFT checkpoint in output-dir/latest.pt")
+            raise ValueError(f"Resume requires an SFT checkpoint: {resume_path}")
         config_values, state = checkpoint["config"], checkpoint["model"]
     else:
         checkpoint = None
@@ -193,8 +207,8 @@ def run(args):
             print(f"[Dry run] train_rows={len(train_data):,} val_rows={val_count:,} length={data.max_length:,} "
                   f"compiled_supervised_tokens={data.supervised_tokens:,} updates={total_steps:,}", flush=True)
             return
-        if checkpoint is None and output.exists() and any(output.iterdir()):
-            raise FileExistsError(f"Experiment is nonempty: {output}. Use --resume or a new output directory.")
+        if checkpoint is None and stage_dir.exists() and any(stage_dir.iterdir()):
+            raise FileExistsError(f"SFT stage is nonempty: {stage_dir}. Use --resume or a new output directory.")
         if not torch.cuda.is_available():
             raise ValueError("SFT training requires CUDA; use --dry-run for CPU validation")
         device = torch.device(f"cuda:{args.gpu}")
@@ -209,8 +223,9 @@ def run(args):
         model.to(device).train()
         if args.activation_checkpointing:
             for index, layer in enumerate(model.model.layers):
-                model.model.layers[index] = checkpoint_wrapper(layer, checkpoint_fn=checkpoint_rain_layer)
-            print("[SFT] Activation checkpointing enabled", flush=True)
+                model.model.layers[index] = checkpoint_wrapper(
+                    layer, checkpoint_fn=checkpoint_rain_layer, min_length=args.checkpoint_min_length)
+            print(f"[SFT] Activation checkpointing enabled from length {args.checkpoint_min_length:,}", flush=True)
         optimizer = build_optimizer(model, dict(optimizer="adamw", lr=args.lr, weight_decay=args.weight_decay))
         scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
         loss_fn = SftTrainingLoss(model, args.loss_backend, args.loss_chunks)
@@ -247,11 +262,16 @@ def run(args):
             restore_rng(checkpoint["rng"])
             del checkpoint
         else:
-            save_exp(output.name, output_dir=output)
-            config.to_json_file(output / "model_config.json", use_diff=False)
-        metrics = TrainingMetrics(output, resume_step=step if args.resume else None,
-                                  metadata=dict(model_config=config.to_dict(), configuration=training_config,
-                                                total_steps=total_steps, device=str(device)))
+            save_exp(output.name, output_dir=stage_dir)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        if args.resume and resume_path.parent != stage_dir and not (stage_dir / "train.jsonl").exists():
+            old_log = output / "train.jsonl"
+            if old_log.is_file():
+                shutil.copyfile(old_log, stage_dir / "train.jsonl")
+        config.to_json_file(stage_dir / "model_config.json", use_diff=False)
+        metrics = SftMetrics(stage_dir, resume_step=step if args.resume else None,
+                             metadata=dict(model_config=config.to_dict(), configuration=training_config,
+                                           total_steps=total_steps, device=str(device)))
         shutdown = False
 
         def request_stop(signum, frame):
@@ -283,10 +303,13 @@ def run(args):
                         raise ValueError("SFT accumulation group has no supervised tokens")
                     optimizer.zero_grad(set_to_none=True)
                     loss_sum = torch.zeros((), device=device)
+                    input_tokens = max_seq_length = 0
                     for (ids, labels), count in zip(batches, counts, strict=True):
                         if not count:
                             continue
-                        ids, labels = move_batch(ids, labels, data, device)
+                        ids, labels, batch_input_tokens = move_batch(ids, labels, data, device)
+                        input_tokens += batch_input_tokens
+                        max_seq_length = max(max_seq_length, ids.shape[1])
                         amp = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
                         with amp:
                             loss = loss_fn(ids, labels)
@@ -317,6 +340,8 @@ def run(args):
                         step=step, epoch=epoch, next_batch=next_batch, loss=loss_value,
                         lr=lr, grad_norm=float(norm), grad_scale=scaler.get_scale(), tokens_seen=tokens_seen,
                         step_tokens=targets, tokens_per_sec=targets / seconds, step_seconds=seconds,
+                        input_tokens=input_tokens, input_tokens_per_sec=input_tokens / seconds,
+                        max_seq_length=max_seq_length,
                         elapsed_seconds=metrics.elapsed_before + time.perf_counter() - started,
                         eta_seconds=(total_steps - step) * sum(durations) / len(durations),
                         cuda_allocated_mb_rank0=torch.cuda.memory_allocated(device) / 2**20,
@@ -330,10 +355,11 @@ def run(args):
                               f"rows={record['val_records']:,}", flush=True)
                     metrics.log(record)
                     if step == 1 or step % args.log_every == 0 or step == total_steps or shutdown:
-                        print(format_training_progress(record, total_steps, args.epochs).replace("[P1]", "[SFT]", 1),
-                              flush=True)
+                        progress = format_training_progress(record, total_steps, args.epochs).replace("[P1]", "[SFT]", 1)
+                        print(f"{progress} | {record['input_tokens_per_sec']:,.0f} input tok/s | "
+                              f"max_seq={max_seq_length:,}", flush=True)
                     if step % args.save_every == 0 or step == total_steps or shutdown:
-                        save_rolling_ckpt(output, step=step, keep=args.keep_checkpoints,
+                        save_rolling_ckpt(stage_dir, step=step, keep=args.keep_checkpoints,
                                          model=model, optimizer=optimizer, scaler=scaler, epoch=next_epoch,
                                          next_batch=next_batch, tokens_seen=tokens_seen, rng=rng_state(),
                                          contract=contract, config=config.to_dict())
@@ -343,7 +369,7 @@ def run(args):
                 if shutdown:
                     break
             if step == total_steps:
-                save_state_dict(model, output / "final_weights.pth", dtype=dtype)
+                save_state_dict(model, stage_dir / "final_weights.pth", dtype=dtype)
             metrics.export(status="completed" if step == total_steps else "stopped")
         finally:
             signal.signal(signal.SIGINT, previous_handler)
