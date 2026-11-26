@@ -41,6 +41,9 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--keep-checkpoints", type=int, default=5)
+    parser.add_argument("--val-samples", type=int, default=128, help="Fixed held-out rows; 0 disables validation")
+    parser.add_argument("--val-every", type=int, default=1000, help="Validate every N optimizer updates")
+    parser.add_argument("--val-batch-size", type=int, default=1)
     parser.add_argument("--stop-after", type=int, default=0, help="Stop after this many updates in this invocation")
     parser.add_argument("--resume", action="store_true", help="Resume from output-dir/latest.pt")
     parser.add_argument("--dry-run", action="store_true", help="Validate compiled data and model on CPU")
@@ -48,10 +51,10 @@ def parse_args():
     if args.ckpt is None and not args.resume:
         parser.error("--ckpt is required for a new SFT run")
     if min(args.batch_size, args.grad_accum, args.epochs, args.loss_chunks,
-           args.log_every, args.save_every, args.keep_checkpoints) < 1:
+           args.log_every, args.save_every, args.keep_checkpoints, args.val_every, args.val_batch_size) < 1:
         parser.error("batch, accumulation, epochs, loss chunks and intervals must be positive")
-    if min(args.gpu, args.num_workers, args.seed, args.stop_after) < 0:
-        parser.error("gpu, workers, seed and stop-after must be nonnegative")
+    if min(args.gpu, args.num_workers, args.seed, args.stop_after, args.val_samples) < 0:
+        parser.error("gpu, workers, seed, stop-after and val-samples must be nonnegative")
     if not all(math.isfinite(x) for x in (args.lr, args.grad_clip, args.weight_decay,
                                           args.warmup_ratio, args.min_lr_ratio)):
         parser.error("optimizer settings must be finite")
@@ -67,8 +70,9 @@ if __name__ == "__main__":
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from architectures.config import RainConfig
 from architectures.rain import MiniRainForCausalLM
@@ -76,9 +80,48 @@ from cli.eval import find_weight, read_checkpoint
 from dataset.datasets import SftBinDataset
 from train.ckpt import load_ckpt_path, save_exp, save_rolling_ckpt, save_state_dict
 from train.metrics import TrainingMetrics
-from train.pretrain import restore_rng, rng_state
+from train.pretrain import restore_rng, rng_state, validation_indices
 from train.text_training import TextTrainingLoss, build_optimizer
 from train.train_util import SkipBatchSampler, format_training_progress, get_lr, setup_seed
+
+
+def move_batch(ids, labels, data, device):
+    # Trim the common right-padding tail before taking the batch to CUDA.
+    end = int((ids.ne(data.pad_token_id) | labels.ne(-100)).any(dim=0).nonzero()[-1, 0]) + 1
+    end = min(data.max_length, math.ceil(end / 128) * 128)
+    return ids[:, :end].to(device, non_blocking=True), labels[:, :end].to(device, non_blocking=True)
+
+
+@torch.no_grad()
+def evaluate_sft(model, loss_fn, loader, data, device, dtype):
+    started = time.perf_counter()
+    was_training = model.training
+    state = rng_state()
+    model.eval()
+    weighted_loss = torch.zeros((), device=device, dtype=torch.float64)
+    targets = 0
+    try:
+        for ids, labels in loader:
+            count = int(labels[:, 1:].ne(-100).sum())
+            if not count:
+                continue
+            ids, labels = move_batch(ids, labels, data, device)
+            amp = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
+            with amp:
+                loss = loss_fn(ids, labels)
+            weighted_loss += loss.double() * count
+            targets += count
+        if not targets:
+            raise ValueError("SFT validation subset has no supervised tokens")
+        loss = (weighted_loss / targets).item()
+        if not math.isfinite(loss):
+            raise FloatingPointError("Nonfinite SFT validation loss")
+        return dict(val_loss=loss, val_perplexity=math.exp(loss) if loss < 700 else None,
+                    val_tokens=targets, val_records=len(loader.dataset),
+                    val_seconds=time.perf_counter() - started)
+    finally:
+        model.train(was_training)
+        restore_rng(state)
 
 
 def run(args):
@@ -103,14 +146,20 @@ def run(args):
         pad_id = getattr(config, "pad_token_id", None)
         if pad_id is not None and pad_id != data.pad_token_id:
             raise ValueError("SFT PAD token does not match the base model")
-        batches_per_epoch = math.ceil(len(data) / args.batch_size)
+        val_count = min(args.val_samples, len(data) - 1)
+        held_out = validation_indices(len(data), 1, val_count, args.seed) if val_count else []
+        train_data = Subset(data, np.delete(np.arange(len(data)), held_out)) if held_out else data
+        val_loader = (DataLoader(Subset(data, held_out), batch_size=args.val_batch_size,
+                                 shuffle=False, pin_memory=True,
+                                 generator=torch.Generator().manual_seed(args.seed)) if held_out else None)
+        batches_per_epoch = math.ceil(len(train_data) / args.batch_size)
         total_steps = args.epochs * math.ceil(batches_per_epoch / args.grad_accum)
         if args.dry_run:
             with torch.device("meta"):
                 model = MiniRainForCausalLM(config)
             model.load_state_dict(state, strict=True, assign=True)
-            print(f"[Dry run] rows={len(data):,} length={data.max_length:,} "
-                  f"supervised_tokens={data.supervised_tokens:,} updates={total_steps:,}", flush=True)
+            print(f"[Dry run] train_rows={len(train_data):,} val_rows={val_count:,} length={data.max_length:,} "
+                  f"compiled_supervised_tokens={data.supervised_tokens:,} updates={total_steps:,}", flush=True)
             return
         if checkpoint is None and output.exists() and any(output.iterdir()):
             raise FileExistsError(f"Experiment is nonempty: {output}. Use --resume or a new output directory.")
@@ -129,6 +178,7 @@ def run(args):
         optimizer = build_optimizer(model, dict(optimizer="adamw", lr=args.lr, weight_decay=args.weight_decay))
         scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
         loss_fn = TextTrainingLoss(model, args.loss_backend, args.loss_chunks)
+        val_loss_fn = loss_fn
         if args.compile:
             loss_fn = torch.compile(loss_fn, dynamic=True)
 
@@ -140,7 +190,7 @@ def run(args):
                            for key, value in vars(args).items()}
         contract = dict(
             stage="sft", total_steps=total_steps, model=config.to_dict(),
-            data_files=data_files,
+            data_files=data_files, validation_indices=held_out,
             manifest_sha256=hashlib.sha256((data.data_dir / "manifest.json").read_bytes()).hexdigest(),
             settings={key: getattr(args, key) for key in (
                 "batch_size", "grad_accum", "epochs", "lr", "warmup_ratio", "min_lr_ratio",
@@ -149,8 +199,11 @@ def run(args):
         )
         epoch_start = batch_start = step = tokens_seen = 0
         if checkpoint is not None:
-            if checkpoint["contract"] != contract:
-                raise ValueError("Resume requires the same SFT data, model and optimizer schedule")
+            saved_contract = dict(checkpoint["contract"])
+            saved_contract.setdefault("validation_indices", [])
+            if saved_contract != contract:
+                raise ValueError("Resume requires the same SFT data, validation split, model and optimizer schedule. "
+                                 "For checkpoints from before validation support, pass --val-samples 0.")
             optimizer.load_state_dict(checkpoint["optimizer"])
             scaler.load_state_dict(checkpoint["scaler"])
             epoch_start, batch_start = checkpoint["epoch"], checkpoint["next_batch"]
@@ -174,13 +227,14 @@ def run(args):
         durations = deque(maxlen=32)
         updates = 0
         warmup = round(total_steps * args.warmup_ratio)
-        print(f"[SFT] {device} {torch.cuda.get_device_name(device)} | {len(data):,} rows | "
+        print(f"[SFT] {device} {torch.cuda.get_device_name(device)} | "
+              f"{len(train_data):,} train rows | {val_count:,} val rows | "
               f"{total_steps:,} updates | resume_step={step}", flush=True)
         try:
             for epoch in range(epoch_start, args.epochs):
                 batch_position = batch_start if epoch == epoch_start else 0
-                remaining = range(batch_position * args.batch_size, len(data))
-                loader = DataLoader(data, batch_sampler=SkipBatchSampler(remaining, args.batch_size),
+                remaining = range(batch_position * args.batch_size, len(train_data))
+                loader = DataLoader(train_data, batch_sampler=SkipBatchSampler(remaining, args.batch_size),
                                     pin_memory=True, num_workers=args.num_workers,
                                     generator=torch.Generator().manual_seed(args.seed + epoch))
                 iterator = iter(loader)
@@ -196,11 +250,7 @@ def run(args):
                     for (ids, labels), count in zip(batches, counts, strict=True):
                         if not count:
                             continue
-                        # Trim the common right-padding tail before taking the batch to CUDA.
-                        end = int((ids.ne(data.pad_token_id) | labels.ne(-100)).any(dim=0).nonzero()[-1, 0]) + 1
-                        end = min(data.max_length, math.ceil(end / 128) * 128)
-                        ids = ids[:, :end].to(device, non_blocking=True)
-                        labels = labels[:, :end].to(device, non_blocking=True)
+                        ids, labels = move_batch(ids, labels, data, device)
                         amp = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
                         with amp:
                             loss = loss_fn(ids, labels)
@@ -236,8 +286,13 @@ def run(args):
                         cuda_allocated_mb_rank0=torch.cuda.memory_allocated(device) / 2**20,
                         cuda_peak_mb_rank0=torch.cuda.max_memory_allocated(device) / 2**20,
                     )
-                    metrics.log(record)
                     shutdown = shutdown or (args.stop_after > 0 and updates >= args.stop_after)
+                    if val_loader is not None and (step % args.val_every == 0 or step == total_steps or shutdown):
+                        record.update(evaluate_sft(model, val_loss_fn, val_loader, data, device, dtype))
+                        print(f"[SFT Val] step={step:,} loss={record['val_loss']:.6f} "
+                              f"ppl={record['val_perplexity']} tokens={record['val_tokens']:,} "
+                              f"rows={record['val_records']:,}", flush=True)
+                    metrics.log(record)
                     if step == 1 or step % args.log_every == 0 or step == total_steps or shutdown:
                         print(format_training_progress(record, total_steps, args.epochs).replace("[P1]", "[SFT]", 1),
                               flush=True)
