@@ -1,4 +1,4 @@
-"""Fine-tune a dense MiniRain base checkpoint on compiled RainPocket SFT data."""
+"""Fine-tune a dense MiniRain base checkpoint on RainPocket SFT data."""
 
 import argparse
 from collections import deque
@@ -19,10 +19,16 @@ sys.path.insert(0, str(ROOT))
 
 
 def parse_args():
+    from scripts.compile_sft import token_budget
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=Path, help="Base weights or pretraining experiment")
     parser.add_argument("--model-config", type=Path, help="Override the base model JSON")
-    parser.add_argument("--data-dir", type=Path, default=ROOT / "data/sft/compiled_4k_trunc")
+    parser.add_argument("--data-dir", type=Path, help="Compiled BIN directory or, with --raw-jsonl, the JSONL root")
+    parser.add_argument("--raw-jsonl", action="store_true", help="Read 2605, 2609 and self JSONL directly")
+    parser.add_argument("--tokenizer", type=Path, default=ROOT / "minirain_tokenizer", help="Tokenizer for raw JSONL")
+    parser.add_argument("--seq-length", type=int, default=768, help="Fixed sequence length for raw JSONL")
+    parser.add_argument("--tokens", type=token_budget, default=200_000_000, help="Supervised token cap for raw JSONL")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "exp/rainpocket_v1_sft")
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA device index")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -52,8 +58,12 @@ def parse_args():
     parser.add_argument("--val-batch-size", type=int, default=1)
     parser.add_argument("--stop-after", type=int, default=0, help="Stop after this many updates in this invocation")
     parser.add_argument("--resume", action="store_true", help="Resume from output-dir/sft/latest.pt")
-    parser.add_argument("--dry-run", action="store_true", help="Validate compiled data and model on CPU")
+    parser.add_argument("--dry-run", action="store_true", help="Validate SFT data and model on CPU")
     args = parser.parse_args()
+    if args.data_dir is None:
+        args.data_dir = ROOT / "data/sft"
+        if not args.raw_jsonl:
+            args.data_dir /= "compiled_4k_trunc"
     if args.ckpt is None and not args.resume:
         parser.error("--ckpt is required for a new SFT run")
     if min(args.batch_size, args.grad_accum, args.epochs, args.loss_chunks,
@@ -71,6 +81,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     parsed = parse_args()
     if not parsed.dry_run:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -181,6 +192,8 @@ def run(args):
         checkpoint = load_ckpt_path(resume_path, adjust_step_for_world_size=False)
         if not checkpoint or checkpoint.get("contract", {}).get("stage") != "sft":
             raise ValueError(f"Resume requires an SFT checkpoint: {resume_path}")
+        if (checkpoint["contract"].get("data_format") == "sft_jsonl") != args.raw_jsonl:
+            raise ValueError("Resume requires the original SFT data format; check --raw-jsonl")
         config_values, state = checkpoint["config"], checkpoint["model"]
     else:
         checkpoint = None
@@ -188,8 +201,19 @@ def run(args):
     config = RainConfig.from_dict(config_values)
     if config.type_id != 1:
         raise ValueError("SFT requires a dense MiniRain checkpoint")
+    if not args.dry_run and checkpoint is None and stage_dir.exists() and any(stage_dir.iterdir()):
+        raise FileExistsError(f"SFT stage is nonempty: {stage_dir}. Use --resume or a new output directory.")
 
-    with SftBinDataset(args.data_dir) as data:
+    if args.raw_jsonl:
+        from transformers import AutoTokenizer
+        from dataset.sft_jsonl import SftJsonlDataset
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True, local_files_only=True)
+        source = SftJsonlDataset(args.data_dir, tokenizer, tokens=args.tokens, seq_length=args.seq_length, seed=args.seed)
+    else:
+        source = SftBinDataset(args.data_dir)
+
+    with source as data:
         if data.vocab_size != config.vocab_size or data.max_length > config.max_position_embeddings:
             raise ValueError("SFT vocabulary or sequence length does not match the base model")
         pad_id = getattr(config, "pad_token_id", None)
@@ -208,10 +232,8 @@ def run(args):
                 model = MiniRainForCausalLM(config)
             model.load_state_dict(state, strict=True, assign=True)
             print(f"[Dry run] train_rows={len(train_data):,} val_rows={val_count:,} length={data.max_length:,} "
-                  f"compiled_supervised_tokens={data.supervised_tokens:,} updates={total_steps:,}", flush=True)
+                  f"supervised_tokens={data.supervised_tokens:,} updates={total_steps:,}", flush=True)
             return
-        if checkpoint is None and stage_dir.exists() and any(stage_dir.iterdir()):
-            raise FileExistsError(f"SFT stage is nonempty: {stage_dir}. Use --resume or a new output directory.")
         if not torch.cuda.is_available():
             raise ValueError("SFT training requires CUDA; use --dry-run for CPU validation")
         device = torch.device(f"cuda:{args.gpu}")
@@ -236,21 +258,30 @@ def run(args):
         scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
         loss_fn = SftTrainingLoss(model, args.loss_backend, args.loss_chunks)
 
+        if args.raw_jsonl:
+            files = {path.relative_to(data.data_dir).as_posix(): path for path in data.files}
+            manifest = json.dumps(data.manifest, sort_keys=True).encode()
+        else:
+            files = {field: data.data_dir / relative for field, relative in data.manifest["files"].items()}
+            manifest = (data.data_dir / "manifest.json").read_bytes()
         data_files = {}
-        for field, relative in data.manifest["files"].items():
-            stat = (data.data_dir / relative).stat()
+        for field, path in files.items():
+            stat = path.stat()
             data_files[field] = [stat.st_size, stat.st_mtime_ns]
         training_config = {key: str(value) if isinstance(value, Path) else value
                            for key, value in vars(args).items()}
         contract = dict(
             stage="sft", total_steps=total_steps, model=config.to_dict(),
             data_files=data_files, validation_indices=held_out,
-            manifest_sha256=hashlib.sha256((data.data_dir / "manifest.json").read_bytes()).hexdigest(),
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
             settings={key: getattr(args, key) for key in (
                 "batch_size", "grad_accum", "epochs", "lr", "warmup_ratio", "min_lr_ratio",
                 "weight_decay", "grad_clip", "dtype", "loss_backend", "loss_chunks", "seed",
             )},
         )
+        if args.raw_jsonl:
+            contract.update(data_format="sft_jsonl", template_sha256=hashlib.sha256(data.template.encode()).hexdigest(),
+                            tokenizer_sha256=hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest())
         epoch_start = batch_start = step = tokens_seen = 0
         if checkpoint is not None:
             saved_contract = dict(checkpoint["contract"])
@@ -293,8 +324,11 @@ def run(args):
         try:
             for epoch in range(epoch_start, args.epochs):
                 batch_position = batch_start if epoch == epoch_start else 0
-                # The compiler already shuffled the source rows.
-                remaining = range(batch_position * args.batch_size, len(train_data))
+                if args.raw_jsonl:
+                    order = np.random.default_rng(args.seed + epoch).permutation(len(train_data))
+                    remaining = order[batch_position * args.batch_size:]
+                else:
+                    remaining = range(batch_position * args.batch_size, len(train_data))
                 loader = DataLoader(train_data, batch_sampler=SkipBatchSampler(remaining, args.batch_size),
                                     pin_memory=True, num_workers=args.num_workers,
                                     generator=torch.Generator().manual_seed(args.seed + epoch))

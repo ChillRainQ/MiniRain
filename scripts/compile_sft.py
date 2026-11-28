@@ -112,14 +112,49 @@ def encode(row, tokenizer, template, group, seq_length):
     return (ids, mask, targets, truncated), None
 
 
-def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
-    if output_dir.exists():
-        raise FileExistsError(f"Output already exists: {output_dir}")
+def interleave_identity(path, dtype, width, corpus_rows, identity_rows):
+    """Spread the appended identity rows across the actual corpus size."""
+    row_bytes = np.dtype(dtype).itemsize * width
+    with path.open("r+b") as file:
+        file.seek(corpus_rows * row_bytes)
+        identity = file.read(identity_rows * row_bytes)
+        end = corpus_rows
+        for index in range(identity_rows - 1, -1, -1):
+            position = (2 * index + 1) * corpus_rows // (2 * identity_rows)
+            while end > position:
+                start = max(position, end - 1024)
+                file.seek(start * row_bytes)
+                block = file.read((end - start) * row_bytes)
+                file.seek((start + index + 1) * row_bytes)
+                file.write(block)
+                end = start
+            file.seek((position + index) * row_bytes)
+            file.write(identity[index * row_bytes:(index + 1) * row_bytes])
+
+
+def pad_sft_row(item, seq_length, pad_token_id):
+    ids, mask, _, _ = item
+    input_row = np.full(seq_length, pad_token_id, dtype="<u2")
+    mask_row = np.zeros(seq_length, dtype="u1")
+    input_row[:len(ids)] = ids
+    mask_row[:len(ids)] = mask
+    mask_row[0] = 0
+    return input_row, mask_row
+
+
+def record_sft_row(stats, item):
+    ids, _, target_count, truncated = item
+    stats["rows"] += 1
+    stats["input_tokens"] += len(ids)
+    stats["supervised_tokens"] += target_count
+    stats["truncated_rows"] += int(truncated)
+    stats["rows_over_8k"] += int(len(ids) > 8192)
+    stats["max_input_length"] = max(stats["max_input_length"], len(ids))
+
+
+def prepare_sft_sources(data_dir, tokenizer, template, tokens, seq_length, seed):
     if seq_length < 2 or not tokenizer.is_fast or tokenizer.pad_token_id is None:
         raise ValueError("Requires sequence length >= 2 and a fast tokenizer with PAD")
-    if len(tokenizer) > 65536 or max(tokenizer.get_vocab().values()) > 65535:
-        raise ValueError("Vocabulary does not fit uint16")
-
     folders = {"no_think": data_dir / "2605/no_think", "think": data_dir / "2605/think"}
     sources_by_group = {group: sorted(folder.rglob("*.jsonl")) for group, folder in folders.items()}
     agent_dir = data_dir / "2609"
@@ -133,7 +168,6 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
     sources = [path for paths in sources_by_group.values() for path in paths]
     source_groups = [group for group, paths in sources_by_group.items() for _ in paths]
 
-    template = assistant_mask_template(tokenizer.get_chat_template())
     identity_path = data_dir / "self/identity.jsonl"
     identity_lines = [line for line in identity_path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
     random.Random(seed).shuffle(identity_lines)
@@ -143,76 +177,91 @@ def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
     identity = [item for item, _ in identity]
     self_tokens = sum(item[2] for item in identity)
     quotas = {group: tokens * percent // 100 for group, percent in MIX.items()}
-    quotas["no_think"] += tokens - sum(quotas.values())
-    quotas["no_think"] -= self_tokens
-    if quotas["no_think"] <= 0 or min(quotas.values()) <= 0:
+    quotas["no_think"] += tokens - sum(quotas.values()) - self_tokens
+    if min(quotas.values()) <= 0:
         raise ValueError(f"--tokens is too small to fit {self_tokens:,} identity tokens plus the requested mix")
     quotas["self"] = self_tokens
-    data_budget = tokens - self_tokens
     stats = {group: dict(rows=0, input_tokens=0, supervised_tokens=0, target_tokens=cap,
                          truncated_rows=0, rows_over_8k=0, max_input_length=0, skipped={})
              for group, cap in quotas.items()}
+
+    return sources, source_groups, identity, stats
+
+
+def select_sft_rows(sources, source_groups, tokenizer, template, seq_length, seed, stats, *, write):
+    """Apply the supervised-token quotas without storing token arrays."""
+    data_budget = sum(stats[group]["target_tokens"] for group in MIX)
+    pending = set(MIX)
+    written = 0
+    next_log = 1_000_000
+    with closing(shuffled_rows(sources, seed)) as shuffled:
+        for index, offset, raw in shuffled:
+            group = source_groups[index]
+            if group not in pending or not raw.strip():
+                continue
+            try:
+                item, reason = encode(json.loads(raw), tokenizer, template, group, seq_length)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ValueError(f"{sources[index]} at byte {offset}: {exc}") from exc
+            if reason:
+                skipped = stats[group]["skipped"]
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
+            remaining = stats[group]["target_tokens"] - stats[group]["supervised_tokens"]
+            if item[2] <= remaining:
+                write(index, offset, item)
+                record_sft_row(stats[group], item)
+                written += item[2]
+                if written >= next_log:
+                    print(f"[SFT data] {written:,}/{data_budget:,} supervised corpus tokens", flush=True)
+                    next_log = (written // 1_000_000 + 1) * 1_000_000
+            if item[2] == remaining:
+                pending.remove(group)
+                if not pending:
+                    break
+    exhausted = {group: stats[group]["target_tokens"] - stats[group]["supervised_tokens"] for group in sorted(pending)}
+    for group, shortfall in exhausted.items():
+        print(f"[Exhausted] {group}: {shortfall:,} supervised tokens short; "
+              f"skipped={stats[group]['skipped']}", flush=True)
+    if not written:
+        raise ValueError("No usable corpus rows fit the sequence length and supervised-token budget")
+    return exhausted
+
+
+def compile_sft(data_dir, output_dir, tokenizer, *, tokens, seq_length, seed):
+    if output_dir.exists():
+        raise FileExistsError(f"Output already exists: {output_dir}")
+    if seq_length < 2 or not tokenizer.is_fast or tokenizer.pad_token_id is None:
+        raise ValueError("Requires sequence length >= 2 and a fast tokenizer with PAD")
+    if len(tokenizer) > 65536 or max(tokenizer.get_vocab().values()) > 65535:
+        raise ValueError("Vocabulary does not fit uint16")
+
+    template = assistant_mask_template(tokenizer.get_chat_template())
+    sources, source_groups, identity, stats = prepare_sft_sources(
+        data_dir, tokenizer, template, tokens, seq_length, seed,
+    )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".sft-", dir=output_dir.parent) as directory:
         staging = Path(directory) / "compiled"
         staging.mkdir()
         with (staging / "input_ids.bin").open("wb") as inputs, (staging / "loss_mask.bin").open("wb") as masks:
-            def write(group, item):
-                ids, mask, target_count, truncated = item
-                input_row = np.full(seq_length, tokenizer.pad_token_id, dtype="<u2")
-                mask_row = np.zeros(seq_length, dtype="u1")
-                input_row[:len(ids)] = ids
-                mask_row[:len(ids)] = mask
-                mask_row[0] = 0
+            def write(item):
+                input_row, mask_row = pad_sft_row(item, seq_length, tokenizer.pad_token_id)
                 inputs.write(input_row.tobytes())
                 masks.write(mask_row.tobytes())
-                stats[group]["rows"] += 1
-                stats[group]["input_tokens"] += len(ids)
-                stats[group]["supervised_tokens"] += target_count
-                stats[group]["truncated_rows"] += int(truncated)
-                stats[group]["rows_over_8k"] += int(len(ids) > 8192)
-                stats[group]["max_input_length"] = max(stats[group]["max_input_length"], len(ids))
 
-            pending = set(MIX)
-            written = identity_index = 0
-            next_log = 1_000_000
-            with closing(shuffled_rows(sources, seed)) as shuffled:
-                for index, offset, raw in shuffled:
-                    group = source_groups[index]
-                    if group not in pending or not raw.strip():
-                        continue
-                    try:
-                        item, reason = encode(json.loads(raw), tokenizer, template, group, seq_length)
-                    except (ValueError, TypeError, KeyError) as exc:
-                        raise ValueError(f"{sources[index]} at byte {offset}: {exc}") from exc
-                    if reason:
-                        skipped = stats[group]["skipped"]
-                        skipped[reason] = skipped.get(reason, 0) + 1
-                        continue
-                    remaining = quotas[group] - stats[group]["supervised_tokens"]
-                    if item[2] <= remaining:
-                        write(group, item)
-                        written += item[2]
-                        while (identity_index < len(identity)
-                               and 2 * written * len(identity) >= (2 * identity_index + 1) * data_budget):
-                            write("self", identity[identity_index])
-                            identity_index += 1
-                        if written >= next_log:
-                            print(f"[Compile] {written:,}/{data_budget:,} supervised corpus tokens", flush=True)
-                            next_log = (written // 1_000_000 + 1) * 1_000_000
-                    if item[2] >= remaining:
-                        pending.remove(group)
-                        if not pending:
-                            break
-            exhausted = {group: quotas[group] - stats[group]["supervised_tokens"] for group in sorted(pending)}
-            for group, shortfall in exhausted.items():
-                print(f"[Exhausted] {group}: {shortfall:,} supervised tokens short; "
-                      f"skipped={stats[group]['skipped']}", flush=True)
-            for item in identity[identity_index:]:
-                write("self", item)
+            exhausted = select_sft_rows(
+                sources, source_groups, tokenizer, template, seq_length, seed, stats,
+                write=lambda _source, _offset, item: write(item),
+            )
+            for item in identity:
+                write(item)
+                record_sft_row(stats["self"], item)
 
         rows = sum(group["rows"] for group in stats.values())
+        for filename, dtype in (("input_ids.bin", "<u2"), ("loss_mask.bin", "u1")):
+            interleave_identity(staging / filename, dtype, seq_length, rows - len(identity), len(identity))
         supervised_tokens = sum(group["supervised_tokens"] for group in stats.values())
         manifest = dict(
             layout="rainpocket_sft_fixed", sequence_length=seq_length, rows=rows, seed=seed,
