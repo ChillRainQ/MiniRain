@@ -191,10 +191,20 @@ def generate_ids(args, model, input_ids, attention_mask, streamer, eos_token_id)
 
 def encode_prompt(args, tokenizer, prompt):
     if args.mode == 'sft':
-        inputs = tokenizer.apply_chat_template(
+        prompt_text = tokenizer.apply_chat_template(
             [{'role': 'user', 'content': prompt}], add_generation_prompt=True,
-            open_thinking=args.open_thinking, tokenize=True, return_dict=True, return_tensors='pt',
+            open_thinking=args.open_thinking, tokenize=False,
         )
+        # Trailing whitespace can tokenize differently when it ends the input.
+        # Tokenize before a non-whitespace character, then discard that character's tokens.
+        inputs = tokenizer(prompt_text + 'a', add_special_tokens=False,
+                           return_offsets_mapping=True, return_tensors='pt')
+        offsets = inputs.pop('offset_mapping')[0]
+        if ((offsets[:, 0] < len(prompt_text)) & (offsets[:, 1] > len(prompt_text))).any():
+            raise ValueError('分词器无法在聊天前缀末尾对齐 token')
+        keep = offsets[:, 1] <= len(prompt_text)
+        for name in inputs:
+            inputs[name] = inputs[name][:, keep]
         length = inputs['input_ids'].shape[1]
         if length > args.max_prompt_tokens:
             raise ValueError(f'套用聊天模板后有 {length} 个 token，超过 --max_prompt_tokens={args.max_prompt_tokens}')
@@ -226,7 +236,10 @@ def run(args, model, tokenizer):
         if not args.stream:
             print(tokenizer.decode(generated[0][inputs['input_ids'].shape[1]:],
                                    skip_special_tokens=True))
-        gen_tokens = generated.shape[1] - inputs['input_ids'].shape[1]
+        new_tokens = generated[0, inputs['input_ids'].shape[1]:]
+        gen_tokens = new_tokens.numel()
+        if args.mode == 'sft' and gen_tokens == 1 and new_tokens[0].item() == tokenizer.eos_token_id:
+            print('[Gen] 首个 token 是 EOS，模型结束了回复。')
         seconds = time.time() - st
         if args.show_speed:
             backend = 'hf' if args.hf_generate else 'custom'
