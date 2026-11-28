@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""MiniRain 文本预训练模型测试：直接加载落盘权重生成文本。
+"""MiniRain 预训练与 SFT 权重评估。
 
 支持当前纯文本 MiniRain 的 final_weights.pth 裸权重及 latest.pt/step_*.pt
-训练断点。实验目录内自动查找 pretrain/ 权重，配置优先使用断点内保存的
+训练断点。实验目录内自动查找 sft/ 或 pretrain/ 权重，配置优先使用断点内保存的
 config，裸权重从阶段目录或实验根目录的 model_config.json 还原。
 
 用法:
     python cli/eval.py --ckpt pretrain_text_004 --device cuda:1 --prompt "机器学习是"
     python cli/eval.py --ckpt exp/pretrain_text_004/pretrain/latest.pt
+    python cli/eval.py --ckpt exp/rainpocket_v1_sft --prompt "你是谁？"
     python cli/eval.py --ckpt pretrain_text_004 --interactive 1
     python cli/eval.py --ckpt pretrain_text_004 --use_cache 0
     python cli/eval.py --ckpt pretrain_text_004 --hf_generate 0
@@ -46,19 +47,23 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def find_weight(path: Path):
+def find_weight(path: Path, *, prefer_sft: bool = False):
     """Resolve weights from an explicit file or an experiment directory."""
     if path.is_file():
         return path
     if not path.is_dir():
         raise FileNotFoundError(path)
-    for pattern in WEIGHT_PATTERNS:
-        found = sorted([p for directory in (path / 'pretrain', path) for p in directory.glob(pattern) if p.is_file()],
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if found:
-            print(f'[Weight] {path} -> {found[0].name}')
-            return found[0]
-    raise FileNotFoundError(f'{path} 及其 pretrain/ 下找不到权重，请用 --ckpt 指定 .pt 或 .pth 文件')
+    stages = [(path / 'pretrain', path), (path / 'sft',)]
+    if prefer_sft:
+        stages.reverse()
+    for directories in stages:
+        for pattern in WEIGHT_PATTERNS:
+            found = [p for directory in directories for p in directory.glob(pattern) if p.is_file()]
+            if found:
+                weight = max(found, key=lambda p: p.stat().st_mtime)
+                print(f'[Weight] {path} -> {weight.relative_to(path)}')
+                return weight
+    raise FileNotFoundError(f'{path} 及其 sft/、pretrain/ 下找不到权重，请用 --ckpt 指定 .pt 或 .pth 文件')
 
 
 def read_model_config(weight_path: Path, config_path: Path | None):
@@ -86,6 +91,11 @@ def read_model_config(weight_path: Path, config_path: Path | None):
 
 def read_checkpoint(path: Path, config_path: Path | None):
     """返回 (config_dict, state_dict)；兼容裸权重、latest.pt 与 state_dict 包装"""
+    config, state, _ = read_checkpoint_with_stage(path, config_path)
+    return config, state
+
+
+def read_checkpoint_with_stage(path: Path, config_path: Path | None):
     if not path.is_file():
         raise FileNotFoundError(path)
     # 训练断点含 RNG/优化器状态，不能使用 weights_only=True（与 train/ckpt.py 一致）
@@ -99,11 +109,13 @@ def read_checkpoint(path: Path, config_path: Path | None):
     if not isinstance(state, dict) or not state:
         raise TypeError(f'{path} 不是可识别的权重文件: {type(state).__name__}')
     config_dict = None
+    stage = 'sft' if path.parent.name == 'sft' else None
     if isinstance(ckpt, dict):
         config_dict = ckpt.get('config') or ckpt.get('model_config')
+        stage = ckpt.get('contract', {}).get('stage') or stage
     if config_path is not None or config_dict is None:
         config_dict = read_model_config(path, config_path)
-    return config_dict, state
+    return config_dict, state, stage
 
 
 def build_model(config_dict, state, device, dtype):
@@ -177,21 +189,35 @@ def generate_ids(args, model, input_ids, attention_mask, streamer, eos_token_id)
     return model.generate(**kwargs)
 
 
+def encode_prompt(args, tokenizer, prompt):
+    if args.mode == 'sft':
+        inputs = tokenizer.apply_chat_template(
+            [{'role': 'user', 'content': prompt}], add_generation_prompt=True,
+            open_thinking=args.open_thinking, tokenize=True, return_dict=True, return_tensors='pt',
+        )
+        length = inputs['input_ids'].shape[1]
+        if length > args.max_prompt_tokens:
+            raise ValueError(f'套用聊天模板后有 {length} 个 token，超过 --max_prompt_tokens={args.max_prompt_tokens}')
+        return inputs.to(args.device)
+    return tokenizer(tokenizer.bos_token + prompt, return_tensors='pt',
+                     truncation=True, max_length=args.max_prompt_tokens).to(args.device)
+
+
 def run(args, model, tokenizer):
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     print(f'[Gen] seed={args.seed} backend={"hf" if args.hf_generate else "custom"} '
           f'use_cache={args.use_cache} temperature={args.temperature} '
-          f'top_p={args.top_p} top_k={args.top_k}')
+          f'top_p={args.top_p} top_k={args.top_k} mode={args.mode}'
+          + (f' open_thinking={args.open_thinking}' if args.mode == 'sft' else ''))
+    interactive = args.interactive or args.mode == 'sft'
     prompts = ([args.prompt] if args.prompt else
-               (iter(lambda: input('[User]: '), '') if args.interactive else DEFAULT_PROMPTS))
+               (iter(lambda: input('[User]: '), '') if interactive else DEFAULT_PROMPTS))
     for prompt in prompts:
         setup_seed(args.seed)
-        # 预训练权重只学了过去文本续写，使用 BOS + 原文，不加对话模板
-        inputs = tokenizer(tokenizer.bos_token + prompt, return_tensors='pt',
-                           truncation=True, max_length=args.max_prompt_tokens).to(args.device)
+        inputs = encode_prompt(args, tokenizer, prompt)
         if args.logits_topk > 0 or args.logits_save:
             dump_logits(args, model, tokenizer, inputs['input_ids'], inputs['attention_mask'])
-        if not args.prompt and not args.interactive:
+        if not args.prompt and not interactive:
             print(f'[User]: {prompt}')
         print('[MiniRain]: ', end='')
         st = time.time()
@@ -211,7 +237,7 @@ def run(args, model, tokenizer):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="MiniRain 文本预训练模型测试")
+    parser = argparse.ArgumentParser(description="MiniRain 预训练与 SFT 权重评估")
     parser.add_argument('--ckpt', required=True, type=str,
                         help="指定纯文本权重、训练断点或实验目录")
     parser.add_argument('--config', default=None, type=str,
@@ -221,7 +247,10 @@ if __name__ == '__main__':
                         help="运行设备（CPU 上回退 fp32）")
     parser.add_argument('--dtype', choices=['bf16', 'fp16', 'fp32'], default='bf16',
                         help='CUDA 推理精度，默认与预训练一致为 bf16；CPU 使用 fp32')
-    parser.add_argument('--prompt', default='', type=str, help="单条 prompt；为空则跑内置列表")
+    parser.add_argument('--prompt', default='', type=str, help="单条 prompt；省略时 SFT 进入交互，预训练跑内置列表")
+    parser.add_argument('--mode', choices=['auto', 'base', 'sft'], default='auto',
+                        help="自动识别权重阶段，或手动选择续写和聊天模式")
+    parser.add_argument('--open-thinking', action='store_true', help="SFT 聊天时让模型生成思考过程")
     parser.add_argument('--interactive', default=0, type=int, choices=[0, 1], help="交互式输入（1=开）")
     parser.add_argument('--max_prompt_tokens', default=4096, type=int, help="prompt 截断长度")
     parser.add_argument('--max_new_tokens', default=256, type=int,
@@ -257,8 +286,10 @@ if __name__ == '__main__':
         # Accept project-relative paths and short experiment names.
         candidates = [ROOT / ckpt_path, ROOT / 'exp' / ckpt_path, ROOT / 'outputs' / ckpt_path]
         ckpt_path = next((p for p in candidates if p.exists()), candidates[0])
-    ckpt_path = find_weight(ckpt_path)
-    config_dict, state = read_checkpoint(ckpt_path, args.config)
+    ckpt_path = find_weight(ckpt_path, prefer_sft=args.mode != 'base')
+    config_dict, state, stage = read_checkpoint_with_stage(ckpt_path, args.config)
+    if args.mode == 'auto':
+        args.mode = 'sft' if stage == 'sft' else 'base'
     model = build_model(config_dict, state, device, dtype)
     del state
     print(f'[Model] type={model.config.type} hidden={model.config.hidden_size} '
