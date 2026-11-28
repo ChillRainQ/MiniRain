@@ -26,14 +26,14 @@ def parse_args():
     parser.add_argument("--data-dir", type=Path, help="Compiled BIN directory or, with --raw-jsonl, the JSONL root")
     parser.add_argument("--raw-jsonl", action="store_true", help="Read 2605, 2609 and self JSONL directly")
     parser.add_argument("--tokenizer", type=Path, default=ROOT / "minirain_tokenizer", help="Tokenizer for raw JSONL")
-    parser.add_argument("--seq-length", type=int, default=768, help="Fixed sequence length for raw JSONL")
-    parser.add_argument("--tokens", type=token_budget, default=1_000_000_000,
-                        help="Supervised token cap for raw JSONL (default 1B)")
+    parser.add_argument("--seq-length", type=int, default=1024, help="Fixed sequence length for raw JSONL (default 1024)")
+    parser.add_argument("--tokens", type=token_budget, default=5_000_000_000,
+                        help="Supervised token cap for raw JSONL (default 5B)")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "exp/rainpocket_v1_sft")
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA device index")
     parser.add_argument("--batch-size", type=int, help="Microbatch size (raw JSONL: 8; BIN: 4)")
     parser.add_argument("--grad-accum", type=int, help="Microbatches per update (raw JSONL: 2; BIN: 4)")
-    parser.add_argument("--epochs", type=int, help="Training epochs (raw JSONL: 2; BIN: 1)")
+    parser.add_argument("--epochs", type=int, default=1, help="Training epochs (default 1)")
     parser.add_argument("--lr", type=float, help="Peak learning rate (raw JSONL: 1e-5; BIN: 2e-5)")
     parser.add_argument("--warmup-ratio", type=float, help="Warmup fraction (raw JSONL: 0; BIN: 0.03)")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
@@ -64,8 +64,8 @@ def parse_args():
         args.data_dir = ROOT / "data/sft"
         if not args.raw_jsonl:
             args.data_dir /= "compiled_4k_trunc"
-    defaults = (8, 2, 2, 1e-5, 0.0) if args.raw_jsonl else (4, 4, 1, 2e-5, 0.03)
-    for option, default in zip(("batch_size", "grad_accum", "epochs", "lr", "warmup_ratio"), defaults, strict=True):
+    defaults = (8, 2, 1e-5, 0.0) if args.raw_jsonl else (4, 4, 2e-5, 0.03)
+    for option, default in zip(("batch_size", "grad_accum", "lr", "warmup_ratio"), defaults, strict=True):
         if getattr(args, option) is None:
             setattr(args, option, default)
     if args.ckpt is None and not args.resume:
