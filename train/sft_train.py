@@ -4,7 +4,6 @@ import argparse
 from collections import deque
 from contextlib import nullcontext
 import hashlib
-from itertools import islice
 import json
 import math
 import os
@@ -28,14 +27,15 @@ def parse_args():
     parser.add_argument("--raw-jsonl", action="store_true", help="Read 2605, 2609 and self JSONL directly")
     parser.add_argument("--tokenizer", type=Path, default=ROOT / "minirain_tokenizer", help="Tokenizer for raw JSONL")
     parser.add_argument("--seq-length", type=int, default=768, help="Fixed sequence length for raw JSONL")
-    parser.add_argument("--tokens", type=token_budget, default=200_000_000, help="Supervised token cap for raw JSONL")
+    parser.add_argument("--tokens", type=token_budget, default=1_000_000_000,
+                        help="Supervised token cap for raw JSONL (default 1B)")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "exp/rainpocket_v1_sft")
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA device index")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--batch-size", type=int, help="Microbatch size (raw JSONL: 8; BIN: 4)")
+    parser.add_argument("--grad-accum", type=int, help="Microbatches per update (raw JSONL: 2; BIN: 4)")
+    parser.add_argument("--epochs", type=int, help="Training epochs (raw JSONL: 2; BIN: 1)")
+    parser.add_argument("--lr", type=float, help="Peak learning rate (raw JSONL: 1e-5; BIN: 2e-5)")
+    parser.add_argument("--warmup-ratio", type=float, help="Warmup fraction (raw JSONL: 0; BIN: 0.03)")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -64,6 +64,10 @@ def parse_args():
         args.data_dir = ROOT / "data/sft"
         if not args.raw_jsonl:
             args.data_dir /= "compiled_4k_trunc"
+    defaults = (8, 2, 2, 1e-5, 0.0) if args.raw_jsonl else (4, 4, 1, 2e-5, 0.03)
+    for option, default in zip(("batch_size", "grad_accum", "epochs", "lr", "warmup_ratio"), defaults, strict=True):
+        if getattr(args, option) is None:
+            setattr(args, option, default)
     if args.ckpt is None and not args.resume:
         parser.error("--ckpt is required for a new SFT run")
     if min(args.batch_size, args.grad_accum, args.epochs, args.loss_chunks,
@@ -147,6 +151,15 @@ def move_batch(ids, labels, data, device):
     return (ids.to(device, non_blocking=True), labels.to(device, non_blocking=True), int(valid.sum()))
 
 
+def sft_validation_indices(data, limit, seed, *, raw_jsonl):
+    candidates = data.validation_candidates() if raw_jsonl else range(len(data))
+    count = min(limit, len(candidates) - 1)
+    if count <= 0:
+        return []
+    positions = validation_indices(len(candidates), 1, count, seed)
+    return [int(candidates[position]) for position in positions]
+
+
 @torch.no_grad()
 def evaluate_sft(model, loss_fn, loader, data, device, dtype):
     started = time.perf_counter()
@@ -219,8 +232,8 @@ def run(args):
         pad_id = getattr(config, "pad_token_id", None)
         if pad_id is not None and pad_id != data.pad_token_id:
             raise ValueError("SFT PAD token does not match the base model")
-        val_count = min(args.val_samples, len(data) - 1)
-        held_out = validation_indices(len(data), 1, val_count, args.seed) if val_count else []
+        held_out = sft_validation_indices(data, args.val_samples, args.seed, raw_jsonl=args.raw_jsonl)
+        val_count = len(held_out)
         train_data = Subset(data, np.delete(np.arange(len(data)), held_out)) if held_out else data
         val_loader = (DataLoader(Subset(data, held_out), batch_size=args.val_batch_size,
                                  shuffle=False, pin_memory=True,
@@ -318,52 +331,58 @@ def run(args):
         durations = deque(maxlen=32)
         updates = 0
         warmup = round(total_steps * args.warmup_ratio)
+        max_update_tokens = args.batch_size * args.grad_accum * (data.max_length - 1)
         print(f"[SFT] {device} {torch.cuda.get_device_name(device)} | "
               f"{len(train_data):,} train rows | {val_count:,} val rows | "
               f"{total_steps:,} updates | resume_step={step}", flush=True)
+        if args.raw_jsonl:
+            print(f"[SFT] {len(data.identity):,} self rows per epoch", flush=True)
         try:
             for epoch in range(epoch_start, args.epochs):
-                batch_position = batch_start if epoch == epoch_start else 0
+                first_batch = batch_start if epoch == epoch_start else 0
                 if args.raw_jsonl:
                     order = np.random.default_rng(args.seed + epoch).permutation(len(train_data))
-                    remaining = order[batch_position * args.batch_size:]
+                    remaining = order[first_batch * args.batch_size:]
                 else:
-                    remaining = range(batch_position * args.batch_size, len(train_data))
+                    remaining = range(first_batch * args.batch_size, len(train_data))
                 loader = DataLoader(train_data, batch_sampler=SkipBatchSampler(remaining, args.batch_size),
                                     pin_memory=True, num_workers=args.num_workers,
                                     generator=torch.Generator().manual_seed(args.seed + epoch))
-                iterator = iter(loader)
-                while batches := list(islice(iterator, args.grad_accum)):
-                    update_start = time.perf_counter()
-                    torch.cuda.reset_peak_memory_stats(device)
-                    counts = [int(labels[:, 1:].ne(-100).sum()) for _, labels in batches]
-                    targets = sum(counts)
-                    if not targets:
-                        raise ValueError("SFT accumulation group has no supervised tokens")
-                    optimizer.zero_grad(set_to_none=True)
-                    loss_sum = torch.zeros((), device=device)
-                    input_tokens = max_seq_length = 0
-                    for (ids, labels), count in zip(batches, counts, strict=True):
-                        if not count:
-                            continue
+                optimizer.zero_grad(set_to_none=True)
+                update_start = time.perf_counter()
+                torch.cuda.reset_peak_memory_stats(device)
+                loss_sum = torch.zeros((), device=device)
+                targets = input_tokens = max_seq_length = 0
+                for batch_position, (ids, labels) in enumerate(loader, start=first_batch + 1):
+                    count = int(labels[:, 1:].ne(-100).sum())
+                    if count:
                         ids, labels, batch_input_tokens = move_batch(ids, labels, data, device)
                         input_tokens += batch_input_tokens
                         max_seq_length = max(max_seq_length, ids.shape[1])
                         amp = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
                         with amp:
                             loss = loss_fn(ids, labels)
-                        scaler.scale(loss * (count / targets)).backward()
+                        scaler.scale(loss * (count / max_update_tokens)).backward()
                         loss_sum += loss.detach().float() * count
+                        targets += count
+                    if (batch_position - first_batch) % args.grad_accum and batch_position != batches_per_epoch:
+                        continue
+                    if not targets:
+                        raise ValueError("SFT accumulation group has no supervised tokens")
                     loss_value = (loss_sum / targets).item()
                     if not math.isfinite(loss_value):
                         raise FloatingPointError(f"Nonfinite SFT loss at step {step + 1}")
                     scaler.unscale_(optimizer)
+                    # Recover the mean over all supervised tokens, including a partial final group.
+                    grads = [param.grad for param in model.parameters() if param.grad is not None]
+                    torch._foreach_mul_(grads, max_update_tokens / targets)
                     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip, error_if_nonfinite=True)
                     lr = get_lr(step + 1, total_steps, args.lr, warmup_steps=warmup, min_lr_ratio=args.min_lr_ratio)
                     for group in optimizer.param_groups:
                         group["lr"] = lr
                     scaler.step(optimizer)
                     scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
                     torch.cuda.synchronize(device)
                     seconds = time.perf_counter() - update_start
                     if updates == 1:
@@ -372,7 +391,6 @@ def run(args):
                     step += 1
                     updates += 1
                     tokens_seen += targets
-                    batch_position += len(batches)
                     next_epoch, next_batch = ((epoch + 1, 0) if batch_position == batches_per_epoch
                                               else (epoch, batch_position))
                     record = dict(
@@ -406,6 +424,10 @@ def run(args):
                         print(f"[SFT Checkpoint] {stage_dir / 'latest.pt'}", flush=True)
                     if shutdown:
                         break
+                    update_start = time.perf_counter()
+                    torch.cuda.reset_peak_memory_stats(device)
+                    loss_sum.zero_()
+                    targets = input_tokens = max_seq_length = 0
                 if shutdown:
                     break
             if step == total_steps:
